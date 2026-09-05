@@ -435,162 +435,62 @@ def get_broker_accumulation(symbol, top=3, days=None):
     return final_accum, normalized
 
 def get_broker_summary(symbol):
-    # Coba net=true dulu
     params_true = {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"}
     data = arjum_get(f"/broker-summary/{symbol}", params=params_true)
-    print(f"DEBUG broker-summary net=true {symbol}: got={bool(data)} sample={str(data)[:1000] if data else 'None'}")
     
     net_value = 0
     brokers = []
     status = "NEUTRAL"
     
-    if data:
-        try:
-            raw_list = []
-            if isinstance(data, dict):
-                for k in ['data','brokers','summary','result','results']:
-                    if k in data and isinstance(data[k], list) and len(data[k])>0:
-                        raw_list = data[k]
-                        break
-                for k in ['total_net','net_buy','net_value','net','total','total_net_buy']:
-                    if k in data and isinstance(data[k], (int,float)) and data[k]!=0:
-                        net_value = float(data[k])
-                        break
-            elif isinstance(data, list):
-                raw_list = data
-
-            if raw_list:
-                # normalisasi sama kayak accumulation
-                normalized = []
-                total_net_calc = 0
-                for b in raw_list[:20]:
-                    if not isinstance(b, dict):
-                        continue
-                    code = b.get('broker_code') or b.get('broker') or b.get('code') or "??"
-                    buy_val = b.get('buy_value') or b.get('buy') or 0
-                    sell_val = b.get('sell_value') or b.get('sell') or 0
-                    buy_vol = b.get('buy_volume') or b.get('buy_vol') or 0
-                    sell_vol = b.get('sell_volume') or 0
-                    net_val = b.get('net_value') or b.get('net') or b.get('net_buy') or (float(buy_val)-float(sell_val) if buy_val or sell_val else 0)
-                    if net_val==0:
-                        net_val = b.get('value') or 0
-                    avg_price = b.get('avg_price') or b.get('avg') or 0
-                    if avg_price==0 and buy_val and buy_vol:
-                        try:
-                            avg_price = float(buy_val)/float(buy_vol) if float(buy_vol)!=0 else 0
-                        except:
-                            avg_price=0
-                    total_net_calc += float(net_val)
-                    normalized.append({
-                        "broker_code": str(code).upper(),
-                        "broker": str(code).upper(),
-                        "code": str(code).upper(),
-                        "buy_value": float(buy_val),
-                        "sell_value": float(sell_val),
-                        "buy_volume": float(buy_vol),
-                        "sell_volume": float(sell_vol),
-                        "net_value": float(net_val),
-                        "net": float(net_val),
-                        "value": float(net_val),
-                        "avg_price": float(avg_price),
-                        "avg": float(avg_price),
-                        "raw": b
-                    })
-                brokers = normalized
-                if net_value==0 and total_net_calc!=0:
-                    net_value = total_net_calc
-        except Exception as e:
-            print(f"broker-summary net=true parse error {symbol}: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # Kalau net masih 0, coba net=false (yang lu kirim)
-    if net_value == 0:
-        params_false = {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"}
-        data2 = arjum_get(f"/broker-summary/{symbol}", params=params_false)
-        print(f"DEBUG broker-summary net=false {symbol}: got={bool(data2)} sample={str(data2)[:1000] if data2 else 'None'}")
-        if data2:
-            try:
-                raw_list = []
-                if isinstance(data2, dict):
-                    for k in ['data','brokers','summary','result']:
-                        if k in data2 and isinstance(data2[k], list) and len(data2[k])>0:
-                            raw_list = data2[k]
-                            break
-                    for k in ['total_net','net_buy','net_value','net','total']:
-                        if k in data2 and isinstance(data2[k], (int,float)) and data2[k]!=0:
-                            net_value = float(data2[k])
-                            break
-                elif isinstance(data2, list):
-                    raw_list = data2
-                
-                if raw_list:
-                    normalized = []
-                    total_net_calc = 0
-                    total_buy = 0
-                    total_sell = 0
-                    for b in raw_list[:20]:
-                        if not isinstance(b, dict):
-                            continue
-                        code = b.get('broker_code') or b.get('broker') or b.get('code') or "??"
-                        buy_val = b.get('buy_value') or b.get('buy') or b.get('buy_value_idr') or 0
-                        sell_val = b.get('sell_value') or b.get('sell') or 0
-                        buy_vol = b.get('buy_volume') or b.get('buy_vol') or b.get('buy_lot') or 0
-                        sell_vol = b.get('sell_volume') or 0
-                        net_val = b.get('net_value') or b.get('net') or b.get('net_buy') or (float(buy_val)-float(sell_val) if buy_val or sell_val else 0)
-                        if net_val==0:
-                            net_val = b.get('value') or 0
-                        avg_price = b.get('avg_price') or b.get('avg') or 0
-                        if avg_price==0 and buy_val and buy_vol:
-                            try:
-                                avg_price = float(buy_val)/float(buy_vol) if float(buy_vol)!=0 else 0
-                            except:
-                                avg_price=0
-                        total_net_calc += float(net_val)
-                        total_buy += float(buy_val)
-                        total_sell += float(sell_val)
-                        normalized.append({
-                            "broker_code": str(code).upper(),
-                            "broker": str(code).upper(),
-                            "code": str(code).upper(),
-                            "buy_value": float(buy_val),
-                            "sell_value": float(sell_val),
-                            "buy_volume": float(buy_vol),
-                            "sell_volume": float(sell_vol),
-                            "net_value": float(net_val),
-                            "net": float(net_val),
-                            "value": float(net_val),
-                            "avg_price": float(avg_price),
-                            "avg": float(avg_price),
-                            "raw": b
-                        })
-                    if net_value==0 and total_net_calc!=0:
-                        net_value = total_net_calc
-                    if not brokers:
-                        brokers = normalized
-                    else:
-                        # gabung kalau net=true udah ada tapi net=false lebih lengkap
-                        if len(normalized) > len(brokers):
-                            brokers = normalized
-                    print(f"  -> net=false calculated net={total_net_calc} buy={total_buy} sell={total_sell} brokers={len(normalized)}")
-            except Exception as e:
-                print(f"broker-summary net=false parse error {symbol}: {e}")
-                import traceback
-                traceback.print_exc()
-
-    # Final fallback - no fake 5B
+    if data and isinstance(data, dict):
+        # Format baru: brokers list with bval, sval, nval
+        raw_list = data.get('brokers') or data.get('data') or []
+        if raw_list and isinstance(raw_list, list):
+            for b in raw_list[:20]:
+                if not isinstance(b, dict):
+                    continue
+                code = b.get('broker_code') or b.get('code') or '??'
+                bval = b.get('bval') or b.get('buy_value') or 0
+                sval = b.get('sval') or b.get('sell_value') or 0
+                nval = b.get('nval') or b.get('net_value') or (float(bval)-float(sval) if bval or sval else 0)
+                bvol = b.get('bvol') or b.get('buy_volume') or 0
+                svol = b.get('svol') or b.get('sell_volume') or 0
+                avg = b.get('bavg') or b.get('avg_price') or 0
+                if avg==0 and bval and bvol:
+                    try:
+                        avg = float(bval)/float(bvol)
+                    except:
+                        avg=0
+                brokers.append({
+                    "broker_code": str(code).upper(),
+                    "broker": str(code).upper(),
+                    "buy_value": float(bval),
+                    "sell_value": float(sval),
+                    "buy_volume": float(bvol),
+                    "sell_volume": float(svol),
+                    "net_value": float(nval),
+                    "avg_price": float(avg)
+                })
+            # Total net from broker_net or sum nval
+            if 'broker_net' in data:
+                try:
+                    net_value = float(data['broker_net'])
+                except:
+                    net_value = sum([x['net_value'] for x in brokers])
+            else:
+                net_value = sum([x['net_value'] for x in brokers])
+    
     if net_value == 0 and not brokers:
+        # fallback to accumulation
         acc_val, acc_brokers = get_broker_accumulation(symbol, top=3)
-        if acc_val and acc_val > 0:
+        if acc_val:
             net_value = acc_val
-            status = "ACCUM_EST" if net_value>0 else "NEUTRAL"
-            if not brokers and acc_brokers:
-                brokers = acc_brokers
-        else:
-            status = "NEUTRAL"
+            brokers = acc_brokers
+            status = "ACCUM_EST"
     else:
         status = "ACCUM" if net_value > 0 else "DISTRIB" if net_value < 0 else "NEUTRAL"
-
+    
+    print(f"DEBUG broker-summary parsed {symbol}: net={net_value:.0f} brokers={len(brokers)} sample={brokers[0] if brokers else 'empty'}")
     return float(net_value), status, brokers
 
 def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
