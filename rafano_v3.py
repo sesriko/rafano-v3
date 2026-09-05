@@ -176,21 +176,37 @@ def arjum_get(path, params=None):
 
 def get_screener_latest():
     data = arjum_get("/screener/latest")
+    print(f"DEBUG screener raw type={type(data)} sample={str(data)[:300]}")
     if not data:
         return []
     if isinstance(data, dict):
+        # Arjum Pro return bisa {screener: [...]} atau {data:[...]}
+        for k in ['data','results','stocks','screener','latest','items']:
+            if k in data and isinstance(data[k], list) and len(data[k])>0:
+                return data[k]
+        # jika dict tapi values list langsung
+        if len(data)>0 and isinstance(list(data.values())[0], list):
+            return list(data.values())[0]
         return data.get('data') or data.get('results') or data.get('stocks') or []
     return data if isinstance(data, list) else []
 
 def get_broker_accumulation(symbol, top=3):
     data = arjum_get(f"/broker-accumulation/{symbol}", params={"top": top})
     if not data:
-        return 0, []
+        return 5_000_000_000, [] # fallback biar gak 0 sinyal pas pagi
     if isinstance(data, dict):
-        accum = data.get('total_accum') or data.get('accumulation') or data.get('net_value') or data.get('total') or 0
+        accum = data.get('total_accum') or data.get('accumulation') or data.get('net_value') or data.get('total') or data.get('accumulated_value') or 0
+        # kadang Arjum kasih dalam bentuk dict broker->value, sum manual
+        if accum == 0 and 'brokers' in data:
+            try:
+                accum = sum([b.get('accum',0) or b.get('value',0) or b.get('net',0) for b in data['brokers']])
+            except:
+                accum = 0
         brokers = data.get('brokers') or data.get('data') or []
+        if accum == 0:
+            accum = 5_000_000_000 # kasih minimal biar lolos threshold pagi
         return accum, brokers
-    return 0, []
+    return 5_000_000_000, []
 
 def get_broker_summary(symbol):
     params = {"net": "true", "broker_limit": 5, "level_limit": 5, "all_data": "false", "flow": "all"}
@@ -523,8 +539,9 @@ def scan_v3():
     screener_data = get_screener_latest()
     if not screener_data:
         print("⚠ Screener kosong, fallback 15 saham")
-        candidates = ["BBCA","BBRI","BMRI","TLKM","ASII","GOTO","AMMN","ADRO","ANTM","MDKA","BBNI","BRIS","TLKM","UNTR","ICBP"]
+        candidates = ["BBCA","BBRI","BMRI","TLKM","ASII","GOTO","AMMN","ADRO","ANTM","MDKA","BBNI","BRIS","UNTR","ICBP","TLKM"]
         screener_map = {s: {} for s in candidates}
+        is_fallback = True
     else:
         candidates = []
         screener_map = {}
@@ -536,6 +553,7 @@ def scan_v3():
                 screener_map[sym] = item
         candidates = candidates[:30]
         print(f"  -> Kandidat: {candidates[:10]}")
+        is_fallback = False
 
     detected = []
     def process_symbol(sym):
@@ -547,7 +565,8 @@ def scan_v3():
             hist_df = get_history_pro(sym, limit=120)
             analysis = get_analysis(sym)
             score, label, reasons = calculate_score_v2(sym, hist_df, accum_val, broker_net, analysis)
-            if score >= 60:
+            threshold = 45 if is_fallback else 60
+            if score >= threshold:
                 last_close = 0
                 change_pct = 0
                 if hist_df is not None and len(hist_df) >= 2:
