@@ -346,22 +346,183 @@ def get_broker_accumulation(symbol, top=3, days=None):
         params["days"] = days
         params["period"] = days
     data = arjum_get(f"/broker-accumulation/{symbol}", params=params)
-    print(f"DEBUG accum {symbol} days={days}: got={bool(data)} keys={list(data.keys()) if isinstance(data, dict) else type(data)} sample={str(data)[:1000] if data else 'None'}")
     if not data:
         return 0.0, []
-    
-    # Format baru V5.2: top_buyers, top_sellers, series
-    if isinstance(data, dict) and ('top_buyers' in data or 'series' in data):
+
+    # Debug
+    if isinstance(data, dict):
+        print(f"DEBUG accum {symbol} days={days} keys={list(data.keys())} top_buyers={len(data.get('top_buyers',[]))} series={len(data.get('series',[]))} sample_series={str(data.get('series',[])[:2])[:500]}")
+
+    if isinstance(data, dict) and ('top_buyers' in data or 'series' in data or 'top_sellers' in data):
         raw_brokers = []
         accum_total = 0
-        # Prioritas top_buyers (ini yang paling akurat buat daily)
         top_buyers = data.get('top_buyers') or []
+        top_sellers = data.get('top_sellers') or []
+        series = data.get('series') or []
+
+        # Format B: series = [{"date":"2026-07-20","accum_val":45000000000}, ...] - ini timeline total akum
+        # Jika format ini, maka accum_total = last accum_val atau selisih
+        is_timeline_format = False
+        if series and isinstance(series[0], dict) and 'accum_val' in series[0] and 'date' in series[0]:
+            is_timeline_format = True
+            if series:
+                # Untuk days, hitung selisih accum_val
+                if days and len(series) >= 2:
+                    n = int(days)
+                    last_accum = float(series[-1].get('accum_val',0) or 0)
+                    # cari index n hari lalu
+                    if len(series) >= n:
+                        first_accum = float(series[-n].get('accum_val',0) or 0)
+                    else:
+                        first_accum = float(series[0].get('accum_val',0) or 0)
+                    accum_total = last_accum - first_accum
+                    # kalau negatif, tetap abs untuk total akum tapi net negatif
+                    if accum_total == 0:
+                        accum_total = last_accum
+                else:
+                    accum_total = float(series[-1].get('accum_val',0) or 0)
+                print(f"  -> Timeline format: accum_total={accum_total/1e9:.1f}B from series len={len(series)}")
+
+        # Format A: series = per broker dengan points
+        if not is_timeline_format and days and series:
+            n_days = int(days)
+            for ser in series[:20]:
+                if not isinstance(ser, dict):
+                    continue
+                # Format A check: harus ada broker_code dan points
+                if 'broker_code' not in ser or 'points' not in ser:
+                    continue
+                code = ser.get('broker_code') or '??'
+                points = ser.get('points') or []
+                if not points:
+                    continue
+                last_points = points[-n_days:] if len(points) >= n_days else points
+                sum_bval = sum([float(p.get('bval',0) or 0) for p in last_points])
+                sum_sval = sum([float(p.get('sval',0) or 0) for p in last_points])
+                sum_nval = sum([float(p.get('nval',0) or 0) for p in last_points])
+                last = last_points[-1] if last_points else {}
+                bavg = float(last.get('bavg',0) or last.get('avg',0) or 0)
+                savg = float(last.get('savg',0) or 0)
+                avg = bavg or savg or 0
+                sum_bvol = sum([float(p.get('bvol',0) or 0) for p in last_points])
+                sum_svol = sum([float(p.get('svol',0) or 0) for p in last_points])
+                if sum_bval==0 and sum_sval==0 and sum_nval==0:
+                    continue
+                raw_brokers.append({
+                    "broker_code": str(code).upper(),
+                    "broker": str(code).upper(),
+                    "buy_value": float(sum_bval),
+                    "sell_value": float(sum_sval),
+                    "buy_volume": float(sum_bvol),
+                    "sell_volume": float(sum_svol),
+                    "net_value": float(sum_nval),
+                    "avg_price": float(avg)
+                })
+                accum_total += abs(float(sum_nval)) if sum_nval!=0 else abs(float(sum_bval))
+            if raw_brokers:
+                return float(accum_total), raw_brokers
+
+        # Daily atau jika timeline format, pakai top_buyers
         if top_buyers and isinstance(top_buyers, list):
             for b in top_buyers[:20]:
                 if not isinstance(b, dict):
                     continue
                 code = b.get('broker_code') or b.get('code') or '??'
-                # nval di top_buyers = net value hari ini
+                # Support format B: hanya net_val atau net_value
+                nval = b.get('nval') or b.get('net_val') or b.get('net_value') or b.get('value') or 0
+                bval = b.get('bval') or b.get('buy_value') or (nval if float(nval or 0)>0 else 0)
+                sval = b.get('sval') or b.get('sell_value') or (abs(float(nval or 0)) if float(nval or 0)<0 else 0)
+                bvol = b.get('bvol') or b.get('buy_volume') or b.get('nvol') or 0
+                svol = b.get('svol') or b.get('sell_volume') or 0
+                avg = b.get('bavg') or b.get('avg_price') or b.get('avg') or 0
+                if avg==0 and bval and bvol:
+                    try:
+                        avg = float(bval)/float(bvol)
+                    except:
+                        avg=0
+                raw_brokers.append({
+                    "broker_code": str(code).upper(),
+                    "broker": str(code).upper(),
+                    "buy_value": float(bval),
+                    "sell_value": float(sval),
+                    "buy_volume": float(bvol),
+                    "sell_volume": float(svol),
+                    "net_value": float(nval),
+                    "avg_price": float(avg)
+                })
+                # Jika accum_total sudah dari timeline, jangan tambah lagi
+                if not is_timeline_format:
+                    accum_total += abs(float(nval))
+
+        if not raw_brokers and top_sellers:
+            for b in top_sellers[:20]:
+                if not isinstance(b, dict):
+                    continue
+                code = b.get('broker_code') or b.get('code') or '??'
+                nval = b.get('nval') or b.get('net_val') or b.get('net_value') or 0
+                bval = b.get('bval') or 0
+                sval = b.get('sval') or abs(float(nval)) if float(nval or 0)<0 else 0
+                raw_brokers.append({
+                    "broker_code": str(code).upper(),
+                    "broker": str(code).upper(),
+                    "buy_value": float(bval),
+                    "sell_value": float(sval),
+                    "buy_volume": 0,
+                    "sell_volume": 0,
+                    "net_value": float(nval),
+                    "avg_price": 0
+                })
+                if not is_timeline_format:
+                    accum_total += abs(float(nval))
+
+        # Jika masih kosong dan series timeline, pakai series untuk fallback brokers (tidak ideal tapi biar tidak kosong)
+        if not raw_brokers and is_timeline_format and accum_total!=0:
+            # buat dummy broker dari total
+            raw_brokers.append({
+                "broker_code": "ALL",
+                "broker": "ALL",
+                "buy_value": float(accum_total) if accum_total>0 else 0,
+                "sell_value": float(abs(accum_total)) if accum_total<0 else 0,
+                "buy_volume": 0,
+                "sell_volume": 0,
+                "net_value": float(accum_total),
+                "avg_price": 0
+            })
+
+        # Jika series format A tapi tanpa days
+        if not raw_brokers and series and not is_timeline_format:
+            for ser in series[:20]:
+                if not isinstance(ser, dict):
+                    continue
+                code = ser.get('broker_code') or '??'
+                points = ser.get('points') or []
+                if points and isinstance(points, list):
+                    last = points[-1]
+                    cum = float(last.get('cum_nval',0) or last.get('nval',0) or last.get('accum_val',0) or 0)
+                    bavg = float(last.get('bavg',0) or 0)
+                    savg = float(last.get('savg',0) or 0)
+                    avg = bavg or savg or 0
+                    raw_brokers.append({
+                        "broker_code": str(code).upper(),
+                        "broker": str(code).upper(),
+                        "buy_value": abs(cum) if cum>0 else 0,
+                        "sell_value": abs(cum) if cum<0 else 0,
+                        "buy_volume": 0,
+                        "sell_volume": 0,
+                        "net_value": float(cum),
+                        "avg_price": float(avg)
+                    })
+                    accum_total += abs(cum)
+
+        return float(accum_total), raw_brokers
+
+
+        # Daily: pakai top_buyers (real daily)
+        if top_buyers and isinstance(top_buyers, list):
+            for b in top_buyers[:20]:
+                if not isinstance(b, dict):
+                    continue
+                code = b.get('broker_code') or b.get('code') or '??'
                 nval = b.get('nval') or b.get('net_value') or b.get('value') or 0
                 bval = b.get('bval') or b.get('buy_value') or (nval if nval>0 else 0)
                 sval = b.get('sval') or 0
@@ -384,32 +545,56 @@ def get_broker_accumulation(symbol, top=3, days=None):
                     "avg_price": float(avg)
                 })
                 accum_total += abs(float(nval))
-        # Jika top_buyers kosong, pakai series cum_nval terakhir
+        
+        # Jika top_buyers kosong, gabung top_buyers + top_sellers atau pakai series cum_nval
         if not raw_brokers:
-            series = data.get('series') or []
-            for ser in series[:20]:
-                if not isinstance(ser, dict):
-                    continue
-                code = ser.get('broker_code') or '??'
-                points = ser.get('points') or []
-                if points and isinstance(points, list):
-                    last = points[-1]
-                    cum = float(last.get('cum_nval',0) or last.get('nval',0) or 0)
-                    bavg = float(last.get('bavg',0) or 0)
-                    savg = float(last.get('savg',0) or 0)
-                    avg = bavg or savg or 0
-                    # Untuk series, net = cum_nval
+            # coba top_sellers juga
+            all_brokers_data = top_buyers + top_sellers
+            if all_brokers_data:
+                for b in all_brokers_data[:20]:
+                    if not isinstance(b, dict):
+                        continue
+                    code = b.get('broker_code') or b.get('code') or '??'
+                    nval = b.get('nval') or b.get('net_value') or 0
+                    bval = b.get('bval') or b.get('buy_value') or 0
+                    sval = b.get('sval') or 0
+                    bvol = b.get('bvol') or 0
+                    svol = b.get('svol') or 0
+                    avg = b.get('bavg') or b.get('avg') or 0
                     raw_brokers.append({
                         "broker_code": str(code).upper(),
                         "broker": str(code).upper(),
-                        "buy_value": abs(cum) if cum>0 else 0,
-                        "sell_value": abs(cum) if cum<0 else 0,
-                        "buy_volume": 0,
-                        "sell_volume": 0,
-                        "net_value": float(cum),
+                        "buy_value": float(bval),
+                        "sell_value": float(sval),
+                        "buy_volume": float(bvol),
+                        "sell_volume": float(svol),
+                        "net_value": float(nval),
                         "avg_price": float(avg)
                     })
-                    accum_total += abs(cum)
+                    accum_total += abs(float(nval))
+            else:
+                for ser in series[:20]:
+                    if not isinstance(ser, dict):
+                        continue
+                    code = ser.get('broker_code') or '??'
+                    points = ser.get('points') or []
+                    if points and isinstance(points, list):
+                        last = points[-1]
+                        cum = float(last.get('cum_nval',0) or last.get('nval',0) or 0)
+                        bavg = float(last.get('bavg',0) or 0)
+                        savg = float(last.get('savg',0) or 0)
+                        avg = bavg or savg or 0
+                        raw_brokers.append({
+                            "broker_code": str(code).upper(),
+                            "broker": str(code).upper(),
+                            "buy_value": abs(cum) if cum>0 else 0,
+                            "sell_value": abs(cum) if cum<0 else 0,
+                            "buy_volume": 0,
+                            "sell_volume": 0,
+                            "net_value": float(cum),
+                            "avg_price": float(avg)
+                        })
+                        accum_total += abs(cum)
         return float(accum_total), raw_brokers
 
     raw_list = []
