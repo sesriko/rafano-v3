@@ -701,10 +701,28 @@ def telegram_bot_listener():
     global LAST_SIGNALS_CACHE
     offset = 0
     print("🤖 Telegram Listener V3 Running...")
+    # Hapus webhook biar getUpdates jalan (fix telegram gak respon)
+    try:
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
+        print("✅ Webhook deleted, polling mode active")
+    except Exception as e:
+        print(f"Webhook delete fail: {e}")
+    # Test token valid
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=10)
+        print(f"✅ Bot Info: {r.json().get('result',{})}")
+        if r.status_code != 200:
+            print(f"❌ TOKEN INVALID: {r.text}")
+    except Exception as e:
+        print(f"❌ Bot token error: {e}")
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
             res = requests.get(url, timeout=25)
+            if res.status_code != 200:
+                print(f"⚠ getUpdates {res.status_code}: {res.text[:200]}")
+                time.sleep(3)
+                continue
             if res.status_code == 200:
                 data = res.json()
                 for update in data.get("result", []):
@@ -726,6 +744,7 @@ def telegram_bot_listener():
                         text = msg.get("text","").strip()
                         chat_id = msg["chat"]["id"]
                         first_word = text.split()[0].lower() if text else ""
+                        print(f"📩 Pesan masuk: {text} dari chat_id={chat_id}")
                         if first_word in ["/start","/help"]:
                             help_msg = (
                                 "🤖 *RAFANO V3 PRO*\n"
@@ -749,25 +768,24 @@ def telegram_bot_listener():
                             send_reply(chat_id, "🔍 *V3 Scanning Real Accumulation...*")
                             def manual_scan(is_pro=False, target_chat=chat_id):
                                 global LAST_SIGNALS_CACHE
+                                print(f"Manual scan dipanggil is_pro={is_pro} target={target_chat}")
                                 sigs = scan_v3()
                                 LAST_SIGNALS_CACHE = {s['symbol']: s for s in sigs}
                                 filt = filter_signals_with_cooldown(sigs)
-                                broadcast_v3(filt) if target_chat == TARGET_CHAT_ID else None
-                                # kirim ke yang request
-                                if target_chat != TARGET_CHAT_ID:
-                                    # buat broadcast khusus ke user
-                                    now_str = get_now_wib().strftime('%d %b %Y %H:%M WIB')
-                                    header = f"*RAFANO V3 PRO - {now_str}*\nTotal: {len(filt)}\n\n"
-                                    # reuse broadcast logic
-                                    msg = header
-                                    kb = []
-                                    for idx, item in enumerate(filt,1):
-                                        item_str = f"{idx}. *{item['symbol']}* {item['score']}% Akum:{format_large_number(item['accum_value'],True)}\n"
-                                        kb.append([{"text": f"📈 {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
-                                        msg += item_str
-                                    send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb})
+                                # Selalu kirim ke yang request, bukan cuma TARGET_CHAT_ID
+                                now_str = get_now_wib().strftime('%d %b %Y %H:%M WIB')
+                                if not filt:
+                                    send_reply(target_chat, f"*RAFANO V3* {now_str}\n0 sinyal (weekend/market tutup, coba /c BBCA)")
+                                    return
+                                header = f"*RAFANO V3 PRO - {now_str}*\nTotal: {len(filt)}\n\n"
+                                msg = header
+                                kb = []
+                                for idx, item in enumerate(filt,1):
+                                    item_str = f"{idx}. *{item['symbol']}* {item['score']}% Akum:{format_large_number(item['accum_value'],True)}\n"
+                                    kb.append([{"text": f"📈 {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
+                                    msg += item_str
+                                send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb})
                                 if is_pro:
-                                    # auto kirim chart top 3
                                     for top in filt[:3]:
                                         process_chart_request(target_chat, top['symbol'], "1d", LAST_SIGNALS_CACHE)
                                         time.sleep(1)
