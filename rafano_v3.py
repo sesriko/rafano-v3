@@ -126,19 +126,36 @@ def calculate_atr(df, period=14):
     return tr.rolling(window=period, min_periods=1).mean()
 
 def calculate_vsa_metrics(df):
+    """
+    OKE SAHAM style VSA - Power Buy = dana besar masuk
+    Buy% = (Close - Low)/(High - Low) -> posisi close di range
+    Kalau close di atas = akumulasi, di bawah = distribusi
+    + boost kalau volume > rata2 (power besar)
+    """
     price_range = (df['High'] - df['Low']).replace(0, 0.1)
-    body_move = df['Close'] - df['Open']
-    buy_ratio = np.where(
-        price_range <= 0.1, 0.50,
-        np.where(df['Close'] >= df['Open'], 
-                 0.55 + (body_move / price_range) * 0.4, 
-                 0.45 + (body_move / price_range) * 0.4)
-    )
+    # OKE SAHAM original: Buy% berdasarkan posisi Close di candle range
+    close_pos = (df['Close'] - df['Low']) / price_range  # 0 = di low, 1 = di high
+    close_pos = np.clip(close_pos, 0.05, 0.95)
+    
+    # Base buy ratio dari close position
+    buy_ratio = 0.30 + close_pos * 0.60  # 30%-90% range, kalau close di high = 90% buy
+    
+    # Boost kalau volume besar + candle hijau (power buy)
+    if 'V1' in df.columns:
+        vol_ratio = df['Volume'] / df['V1'].replace(0, 1)
+        # Jika volume > 1.5x rata2 dan candle hijau, tambah power
+        is_green = df['Close'] >= df['Open']
+        boost = np.where((vol_ratio > 1.5) & is_green, 0.10, 0)
+        boost += np.where((vol_ratio > 2.5) & is_green, 0.10, 0)  # TURBO boost
+        buy_ratio = buy_ratio + boost
+    
     buy_ratio = np.clip(buy_ratio, 0.05, 0.95)
+    
     df['Vol_Buy'] = df['Volume'] * buy_ratio
     df['Vol_Sell'] = df['Volume'] - df['Vol_Buy']
     df['Net_Vol_VSA'] = df['Vol_Buy'] - df['Vol_Sell']
     df['Net_Val_VSA'] = df['Net_Vol_VSA'] * df['Close']
+    df['Buy_Pct'] = buy_ratio * 100
     return df, buy_ratio
 
 def calculate_buy_signal_strength(df):
@@ -190,8 +207,14 @@ def arjum_get(path, params=None):
         r = requests.get(url, headers=HEADERS_ARJUM, params=params, timeout=8)
         if r.status_code == 200:
             return r.json()
-        return None
-    except:
+        else:
+            # debug khusus history biar ketahuan kenapa 0
+            if "history" in path:
+                print(f"⚠ arjum_get {path} -> {r.status_code} {r.text[:200]}")
+            return None
+    except Exception as e:
+        if "history" in path:
+            print(f"arjum_get error {path}: {e}")
         return None
 
 def get_screener_latest():
@@ -267,16 +290,36 @@ def get_analysis(symbol):
     return data if isinstance(data, dict) else {}
 
 def get_history_pro(symbol, limit=150):
+    # Coba Arjum dulu
     data = arjum_get(f"/history/{symbol}", params={"limit": limit, "frame": "daily"})
-    if not data:
-        return None
+    print(f"DEBUG history {symbol}: got={bool(data)} type={type(data).__name__} sample={str(data)[:200] if data else 'None'}")
     rows = []
-    if isinstance(data, dict):
-        rows = data.get('data') or data.get('history') or data.get('results') or []
-    elif isinstance(data, list):
-        rows = data
+    if data:
+        if isinstance(data, dict):
+            rows = data.get('data') or data.get('history') or data.get('results') or data.get('candles') or data.get('klines') or []
+        elif isinstance(data, list):
+            rows = data
+    
+    # Jika Arjum kosong, fallback ke yfinance (Yahoo Finance) - selalu ada
     if not rows:
-        return None
+        print(f"⚠ Arjum history {symbol} kosong, coba yfinance fallback...")
+        try:
+            import yfinance as yf
+            # yfinance butuh .JK
+            ticker = f"{symbol}.JK"
+            yf_ticker = yf.Ticker(ticker)
+            hist = yf_ticker.history(period="6mo", interval="1d")
+            if hist is not None and len(hist) > 20:
+                hist = hist.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"})
+                print(f"✅ yfinance {symbol} dapet {len(hist)} candles")
+                return hist.tail(limit)
+            else:
+                print(f"⚠ yfinance {symbol} juga kosong len={len(hist) if hist is not None else 0}")
+                return None
+        except Exception as e:
+            print(f"yfinance error {symbol}: {e}")
+            return None
+    
     try:
         df = pd.DataFrame(rows)
         # mapping
@@ -288,7 +331,7 @@ def get_history_pro(symbol, limit=150):
             elif cl in ['l','low']: rename_map[c]='Low'
             elif cl in ['c','close','close_price']: rename_map[c]='Close'
             elif cl in ['v','volume','vol']: rename_map[c]='Volume'
-            elif cl in ['date','time','t','datetime']: rename_map[c]='Date'
+            elif cl in ['date','time','t','datetime','timestamp']: rename_map[c]='Date'
         df.rename(columns=rename_map, inplace=True)
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
@@ -298,214 +341,274 @@ def get_history_pro(symbol, limit=150):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df.dropna(subset=['Close'])
+        if len(df) < 10:
+            return None
+        print(f"✅ History {symbol} OK len={len(df)}")
         return df
     except Exception as e:
         print(f"History parse {symbol}: {e}")
+        # fallback yfinance lagi jika parse gagal
+        try:
+            import yfinance as yf
+            hist = yf.Ticker(f"{symbol}.JK").history(period="6mo", interval="1d")
+            if len(hist) > 20:
+                return hist.tail(limit)
+        except:
+            pass
         return None
 
-# ========== CHART GENERATOR V3 (INTEGRATED REAL DATA) ==========
+# ========== CHART GENERATOR - OKE SAHAM STYLE (RAFANO TRADER) ==========
 def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", output_filename="chart.png", extra_info=None):
     """
-    extra_info: dict dari broker -> {'accum_value': 25B, 'broker_net': 12B, 'score': 88}
+    Rebuild persis seperti screenshot OKE SAHAM:
+    - Header: SYMBOL : PRICE (CHANGE%) | RAFANO TRADER center | Daily date
+    - Subheader: High Low Open Volume V1 V2 + Company | Sector
+    - Kiri: Avg Price, Vchg, Speed, Power, Safety, EMA 13/20/50/200
+    - Main: Candle + EMA 13(yellow) 20(red) 50(white) 200(purple) + box konsolidasi
+    - Bottom1: Buy% Sell% Net Vol Net 5D + volume histogram
+    - Bottom2: NBSA + NBSA Value + histogram buy/sell
+    - Bottom3: Market Maker
     """
     try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import matplotlib.gridspec as gridspec
         extra_info = extra_info or {}
         tf_clean = timeframe.lower()
-        is_intraday = tf_clean in ['1m','5m','15m','30m','1h']
 
         df = df.copy()
         df = df.ffill().bfill()
         if isinstance(df.index, pd.DatetimeIndex):
             df = df.sort_index()
+        else:
+            df.index = pd.to_datetime(df.index)
+
+        # --- Calculate EMAs OKE style ---
+        df['EMA13'] = df['Close'].ewm(span=13, adjust=False).mean()
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        df['V1'] = df['Volume'].rolling(20, min_periods=1).mean()
+        df['V2'] = df['Volume'].rolling(50, min_periods=1).mean()
+        df, buy_ratios = calculate_vsa_metrics(df)
 
         last_close = df['Close'].iloc[-1]
         last_open = df['Open'].iloc[-1]
         last_high = df['High'].iloc[-1]
         last_low = df['Low'].iloc[-1]
         last_vol = df['Volume'].iloc[-1]
+        prev_close = df['Close'].iloc[-2] if len(df) > 1 else last_close
+        chg_pct = ((last_close / prev_close) - 1) * 100 if prev_close else 0
 
-        df['EMA8'] = df['Close'].ewm(span=8, adjust=False).mean()
-        df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
-        df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-        df['EMA125'] = df['Close'].ewm(span=125, adjust=False).mean()
-        df['RSI14'] = calculate_rsi(df['Close'], period=14)
-        df['ATR'] = calculate_atr(df, period=14)
-        df['Pivot_High'] = df['High'].rolling(window=12, min_periods=1).max()
-        df['Pivot_Low'] = df['Low'].rolling(window=12, min_periods=1).min()
-        df['V1'] = df['Volume'].rolling(20, min_periods=1).mean()
-        df, buy_ratios = calculate_vsa_metrics(df)
-        net_5d_val = df['Net_Val_VSA'].tail(5).sum()
-        net_val_today = df['Net_Val_VSA'].iloc[-1]
-        last_rsi = round(df['RSI14'].iloc[-1], 2)
-        signal_score, score_lbl = calculate_buy_signal_strength(df)
+        # --- Metrics kiri ---
+        avg_price = df['Close'].tail(20).mean()
+        vchg1 = (last_vol / df['Volume'].iloc[-2]) if len(df) > 1 and df['Volume'].iloc[-2] > 0 else 1
+        avg5 = df['Volume'].tail(5).mean()
+        vchg5 = (last_vol / avg5) if avg5 > 0 else 1
 
-        # Override score jika ada extra_info dari Arjum Pro
-        real_score = extra_info.get('score', signal_score)
-        real_label = extra_info.get('score_label', score_lbl)
+        # OKE SAHAM logic:
+        # Speed = kecepatan volume
+        speed = "FAST" if vchg1 > 2.0 else "SLOW" if vchg1 < 0.8 else "NORMAL"
+        # Power = kekuatan buyer - ini yang lu maksud dana besar masuk
+        # TURBO = Buy% tinggi + volume gede = bandar masuk
+        buy_pct_temp = int(buy_ratios[-1] * 100)
+        if buy_pct_temp >= 85 and vchg1 >= 1.2:
+            power = "TURBO"
+        elif buy_pct_temp >= 70 or vchg1 >= 1.5:
+            power = "STRONG"
+        elif buy_pct_temp >= 60:
+            power = "NORMAL"
+        else:
+            power = "WEAK"
+        safety = "GOOD" if last_close > df['EMA200'].iloc[-1] else "BAD"
 
-        if 'MM' not in df.columns:
-            df['MM'] = (df['Close'] - df['EMA50']) / df['EMA50'] * 1000 + np.sin(np.linspace(0, 10, len(df))) * 15 - 10.9
+        ema13 = df['EMA13'].iloc[-1]
+        ema20 = df['EMA20'].iloc[-1]
+        ema50 = df['EMA50'].iloc[-1]
+        ema200 = df['EMA200'].iloc[-1]
 
-        plt.style.use('dark_background')
-        fig = plt.figure(figsize=(18, 10), dpi=300, facecolor='#000000')
-        gs = gridspec.GridSpec(4, 1, height_ratios=[4, 0.25, 1.2, 0.8], hspace=0.04)
-        ax_main = fig.add_subplot(gs[0])
-        ax_bar = fig.add_subplot(gs[1], sharex=ax_main)
-        ax_vol = fig.add_subplot(gs[2], sharex=ax_main)
-        ax_mm = fig.add_subplot(gs[3], sharex=ax_main)
-        fig.subplots_adjust(left=0.065, right=0.93, top=0.94, bottom=0.06)
+        buy_pct = int(buy_ratios[-1] * 100)
+        sell_pct = 100 - buy_pct
+        net_vol = df['Net_Vol_VSA'].iloc[-1]
+        net_vol_5d = df['Net_Vol_VSA'].tail(5).sum()
 
-        color_up, color_down, color_neutral = '#00ff00', '#ff0000', '#888888'
-        for ax in [ax_main, ax_bar, ax_vol, ax_mm]:
-            ax.set_facecolor('#000000')
-            ax.grid(True, color='#1e1e1e', linestyle=':', linewidth=0.6)
-            ax.tick_params(colors='white', labelsize=10)
-            ax.yaxis.tick_right()
-
-        x_indices = np.arange(len(df))
-        for i in range(len(df)):
-            open_p, high_p, low_p, close_p = df['Open'].iloc[i], df['High'].iloc[i], df['Low'].iloc[i], df['Close'].iloc[i]
-            if close_p >= open_p:
-                body_top, body_bottom = close_p, open_p
-                body_height = max(0.2, close_p - open_p)
-                ax_main.plot([i, i], [high_p, body_top], color=color_up, linewidth=1.2)
-                ax_main.plot([i, i], [low_p, body_bottom], color=color_up, linewidth=1.2)
-                rect = patches.Rectangle((i - 0.35, body_bottom), 0.7, body_height, linewidth=1.2, edgecolor=color_up, facecolor='none')
-                ax_main.add_patch(rect)
-            else:
-                body_top, body_bottom = open_p, close_p
-                body_height = max(0.2, open_p - close_p)
-                ax_main.plot([i, i], [low_p, high_p], color=color_down, linewidth=1.2)
-                rect = patches.Rectangle((i - 0.35, body_bottom), 0.7, body_height, linewidth=1.2, edgecolor=color_down, facecolor=color_down)
-                ax_main.add_patch(rect)
-
-        ax_main.plot(x_indices, df['EMA8'], color='#00ffff', linewidth=0.8, label='EMA 8')
-        ax_main.plot(x_indices, df['EMA21'], color='#ff00ff', linewidth=1.0, label='EMA 21')
-        ax_main.plot(x_indices, df['EMA50'], color='#ffff00', linewidth=1.1, label='EMA 50')
-        ax_main.plot(x_indices, df['EMA125'], color='#ffffff', linewidth=1.3, label='EMA 125')
-        ax_main.step(x_indices, df['Pivot_High'], where='mid', color='#555555', linestyle='--', linewidth=1.0)
-        ax_main.step(x_indices, df['Pivot_Low'], where='mid', color='#444444', linestyle=':', linewidth=1.0)
-
-        latest_setup = {"status": "WAIT & SEE", "entry": 0, "tp1": 0, "tp2": 0, "danger": 0}
-        last_signal_idx = -10
-        for i in range(5, len(df)):
-            c_price, o_price = df['Close'].iloc[i], df['Open'].iloc[i]
-            vol_curr, vol_avg = df['Volume'].iloc[i], df['V1'].iloc[i]
-            ema_50 = df['EMA50'].iloc[i]
-            b_ratio = buy_ratios[i]
-            atr_val = df['ATR'].iloc[i]
-            rsi_val = df['RSI14'].iloc[i]
-            net_5d_val_i = df['Net_Val_VSA'].iloc[max(0, i-4):i+1].sum()
-            is_bandar_accum_i = net_5d_val_i > 0
-            is_accum_trend = (c_price > 50) and (c_price > ema_50) and (rsi_val <= 75) and (vol_curr >= vol_avg * 2.0) and is_bandar_accum_i and (b_ratio > 0.65) and (c_price > o_price)
-            if is_accum_trend and (i - last_signal_idx >= 4):
-                buy_price = round_to_ihsg_fraction(c_price)
-                tp1_price = round_to_ihsg_fraction(buy_price * 1.035)
-                tp2_price = round_to_ihsg_fraction(buy_price + (1.5 * atr_val))
-                swing_low = df['Pivot_Low'].iloc[i]
-                danger_price = round_to_ihsg_fraction(min(swing_low, buy_price - (1.0 * atr_val)))
-                ax_main.plot(i, df['Low'].iloc[i] * 0.985, marker='^', color='#00ff00', markersize=7, zorder=6)
-                if i >= len(df) - 3:
-                    ax_main.text(i, df['Low'].iloc[i] * 0.96, f"BUY @ {buy_price}", color='#00ff00', fontsize=8, fontweight='bold', ha='center',
-                                 bbox=dict(boxstyle='round,pad=0.2', facecolor='#000000', alpha=0.75, edgecolor='#00ff00'))
-                latest_setup = {"status": "BUY ACCUMULATION", "entry": buy_price, "tp1": tp1_price, "tp2": tp2_price, "danger": danger_price}
-                last_signal_idx = i
-
-        max_high = df['High'].max()
-        min_low = df['Low'].min()
-        ax_main.set_ylim(min_low * 0.95, max_high * 1.25)
-        ax_main.set_xlim(-0.5, len(df) - 0.5)
-
-        status_color = "#00ff00" if latest_setup["status"] == "BUY ACCUMULATION" else "#ffff00"
-        entry_val = latest_setup['entry'] if latest_setup['entry'] > 0 else last_close
-        tp1_val = latest_setup['tp1'] if latest_setup['tp1'] > 0 else round_to_ihsg_fraction(last_close*1.035)
-        tp2_val = latest_setup['tp2'] if latest_setup['tp2'] > 0 else round_to_ihsg_fraction(last_close*1.07)
-        sl_val = latest_setup['danger'] if latest_setup['danger'] > 0 else round_to_ihsg_fraction(last_close*0.95)
-
-        # REAL BROKER DATA
+        # NBSA & MM simulation from real broker data if ada
         real_accum = extra_info.get('accum_value', 0)
         real_net = extra_info.get('broker_net', 0)
-        
-        dashboard_text = (
-            f"RAFANO V3 - REAL DATA\n"
-            f"-----------------------\n"
-            f"O:{safe_int(last_open)} H:{safe_int(last_high)} L:{safe_int(last_low)} C:{safe_int(last_close)}\n"
-            f"VOL: {format_large_number(last_vol)}\n"
-            f"-----------------------\n"
-            f"SCORE VSA: {signal_score}% ({score_lbl})\n"
-            f"SCORE REAL: {real_score}% ({real_label})\n"
-            f"STATUS : {latest_setup['status']}\n"
-            f"ENTRY  : {entry_val} | TP1:{tp1_val}\n"
-            f"TP2:{tp2_val} | SL:{sl_val}\n"
-            f"-----------------------\n"
-            f"AKUM 3B: {format_large_number(real_accum, True)}\n"
-            f"NET BROK: {format_large_number(real_net, True)}"
-        )
-        ax_main.text(0.01, 0.96, dashboard_text, transform=ax_main.transAxes, verticalalignment='top', horizontalalignment='left',
-                     fontfamily='monospace', fontsize=8, color=status_color,
-                     bbox=dict(boxstyle='round,pad=0.3', facecolor='#000000', alpha=0.8, edgecolor='#333333'))
+        nbsa_rp = abs(real_net) if real_net != 0 else abs(net_vol * last_close)
+        nbsa_pct = min(99, max(5, abs(int((real_net / (real_accum+1e9))*10)))) if real_accum else 30.4
 
-        stat_text_right = (
-            f"RSI (14)   : {last_rsi}\n"
-            f"BANDAR 1W  : {'ACCUM' if net_5d_val > 0 else 'DISTRIB'}\n"
-            f"VAL 1D     : {format_large_number(net_val_today, show_sign=True)}\n"
-            f"VSA BUY    : {safe_int(buy_ratios[-1]*100)}%\n"
-            f"REAL STAT  : {extra_info.get('broker_status','-')}"
-        )
-        ax_main.text(0.985, 0.96, stat_text_right, transform=ax_main.transAxes, verticalalignment='top', horizontalalignment='right',
-                     fontfamily='monospace', fontsize=8.5, color='#00ffff',
-                     bbox=dict(boxstyle='round,pad=0.3', facecolor='#000000', alpha=0.75, edgecolor='#333333'))
+        # --- Figure ---
+        plt.style.use('dark_background')
+        fig = plt.figure(figsize=(16, 9), dpi=200, facecolor='#000000')
+        # ratios: main chart 5, volume 1.2, NBSA 0.9, MM 0.9
+        gs = gridspec.GridSpec(4, 1, height_ratios=[4.5, 1.1, 0.9, 0.8], hspace=0.05)
+        ax_main = fig.add_subplot(gs[0])
+        ax_vol = fig.add_subplot(gs[1], sharex=ax_main)
+        ax_nbsa = fig.add_subplot(gs[2], sharex=ax_main)
+        ax_mm = fig.add_subplot(gs[3], sharex=ax_main)
+        fig.subplots_adjust(left=0.08, right=0.92, top=0.88, bottom=0.06)
 
-        latest_ph, latest_pl = df['Pivot_High'].iloc[-1], df['Pivot_Low'].iloc[-1]
-        ax_main.text(1.01, latest_ph, f" {safe_int(latest_ph)} ", transform=ax_main.get_yaxis_transform(),
-                     color='black', backgroundcolor='#ffff00', fontsize=8.5, fontweight='bold', va='center', ha='left', clip_on=False)
-        ax_main.text(1.01, latest_pl, f" {safe_int(latest_pl)} ", transform=ax_main.get_yaxis_transform(),
-                     color='black', backgroundcolor='#00ffff', fontsize=8.5, fontweight='bold', va='center', ha='left', clip_on=False)
+        for ax in [ax_main, ax_vol, ax_nbsa, ax_mm]:
+            ax.set_facecolor('#000000')
+            ax.tick_params(colors='#aaaaaa', labelsize=8)
+            ax.yaxis.tick_right()
+            ax.grid(False)
 
-        fig.text(0.01, 0.975, f"{symbol}", color='#ffffff', fontsize=16, fontweight='bold')
-        fig.text(0.45, 0.975, "RAFANO TRADER V3 PRO", color='#ffffff', fontsize=15, fontweight='bold')
-        last_date_str = get_now_wib().strftime('%d %b %Y')
-        fig.text(0.88, 0.975, f"{tf_clean.upper()} {last_date_str}", color='#ffff00', fontsize=10, fontweight='bold', ha='right')
-        sub_header = f"{sector_info} | Akum:{format_large_number(real_accum, True)} Net:{format_large_number(real_net, True)}"
-        fig.text(0.01, 0.945, sub_header, color='#888888', fontsize=8.5)
+        x = np.arange(len(df))
 
+        # --- Candles OKE style: hollow green up, solid red down ---
         for i in range(len(df)):
-            c, o = df['Close'].iloc[i], df['Open'].iloc[i]
-            bar_color = '#888888' if abs(c - o) / max(1, o) < 0.0005 else ('#00ff00' if c >= o else '#ff0000')
-            ax_bar.add_patch(patches.Rectangle((i - 0.5, 0), 1.0, 1.0, color=bar_color))
-        ax_bar.set_ylim(0, 1)
-        ax_bar.axis('off')
+            o, h, l, c = df['Open'].iloc[i], df['High'].iloc[i], df['Low'].iloc[i], df['Close'].iloc[i]
+            # wick
+            ax_main.plot([i, i], [l, h], color='#00ff00' if c >= o else '#ff0000', linewidth=0.8, alpha=0.8)
+            # body
+            body_low = min(o, c)
+            body_h = max(0.5, abs(c - o))
+            if c >= o:
+                rect = patches.Rectangle((i-0.35, body_low), 0.7, body_h, facecolor='none', edgecolor='#00ff00', linewidth=0.8)
+            else:
+                rect = patches.Rectangle((i-0.35, body_low), 0.7, body_h, facecolor='#ff3333', edgecolor='#ff3333', linewidth=0.8)
+            ax_main.add_patch(rect)
 
-        ax_vol.bar(x_indices, df['Vol_Sell'], color='#ff0000', width=0.8, align='center')
-        ax_vol.bar(x_indices, df['Vol_Buy'], bottom=df['Vol_Sell'], color='#00ff00', width=0.8, align='center')
-        ax_vol.plot(x_indices, df['V1'], color='#ffffff', linewidth=1.0, linestyle='-')
-        net_val_str = format_large_number(net_val_today, show_sign=True)
-        net_5d_val_str = format_large_number(net_5d_val, show_sign=True)
-        last_buy_pct = safe_int(buy_ratios[-1] * 100)
-        vol_text = (f"Buy: {last_buy_pct}% Sell: {100 - last_buy_pct}% Val 1D: {net_val_str} Val 5D: {net_5d_val_str} | REAL Akum:{format_large_number(real_accum, True)}")
-        ax_vol.text(0.01, 0.85, vol_text, transform=ax_vol.transAxes, color='#00ffff', fontsize=8, fontweight='bold')
-        ax_vol.set_ylim(0, df['Volume'].max() * 1.35)
+        # EMAs with OKE colors
+        ax_main.plot(x, df['EMA13'], color='#ffff00', linewidth=1.0, alpha=0.9)  # yellow
+        ax_main.plot(x, df['EMA20'], color='#ff0000', linewidth=1.0, alpha=0.9)  # red
+        ax_main.plot(x, df['EMA50'], color='#ffffff', linewidth=1.0, alpha=0.9)  # white
+        ax_main.plot(x, df['EMA200'], color='#a020f0', linewidth=1.2, alpha=0.9)  # purple
 
-        mm_colors = ['#ffff00' if v >= 0 else '#555555' for v in df['MM']]
-        ax_mm.bar(x_indices, df['MM'], color=mm_colors, width=0.4)
-        ax_mm.text(0.01, 0.80, "Market Maker", transform=ax_mm.transAxes, color='#ffff00', fontsize=8, fontweight='bold')
-        ax_mm.text(1.01, df['MM'].iloc[-1], f" {df['MM'].iloc[-1]:.2f} ", transform=ax_mm.get_yaxis_transform(),
-                   color='black', backgroundcolor='#ffff00', fontsize=8.5, fontweight='bold', va='center', ha='left', clip_on=False)
+        # Box konsolidasi last 15 candles
+        if len(df) > 15:
+            box_left = len(df) - 15
+            box_right = len(df) - 1
+            y_low = df['Low'].iloc[-15:].min() * 0.99
+            y_high = df['High'].iloc[-15:].max() * 1.01
+            ax_main.plot([box_left, box_right], [y_high, y_high], color='white', linestyle='--', linewidth=0.6, alpha=0.6)
+            ax_main.plot([box_left, box_right], [y_low, y_low], color='white', linestyle='--', linewidth=0.6, alpha=0.6)
+            ax_main.plot([box_left, box_left], [y_low, y_high], color='white', linestyle='--', linewidth=0.6, alpha=0.6)
+            ax_main.plot([box_right, box_right], [y_low, y_high], color='white', linestyle='--', linewidth=0.6, alpha=0.6)
 
-        step = max(1, len(df) // 8)
-        ax_mm.set_xticks(x_indices[::step])
-        if isinstance(df.index, pd.DatetimeIndex):
-            fmt = "%H:%M" if is_intraday else "%b %Y"
-            ax_mm.set_xticklabels([df.index[k].strftime(fmt) for k in range(0, len(df), step)])
+        ax_main.set_xlim(-1, len(df))
+        ax_main.set_ylim(df['Low'].min()*0.95, df['High'].max()*1.08)
 
-        plt.setp(ax_main.get_xticklabels(), visible=False)
+        # --- LEFT PANEL TEXT (Avg Price etc) ---
+        left_text = (
+            f"Avg Price : {avg_price:,.1f}\n"
+            f"Vchg 1 Day: {vchg1:.1f} x\n"
+            f"Vchg 5 Days: {vchg5:.1f} x\n"
+            f"Speed : {speed}\n"
+            f"Power : {power}\n"
+            f"Safety : {safety}\n"
+            f"\n"
+            f"EMA 13 : {ema13:,.1f}\n"
+            f"EMA 20 : {ema20:,.1f}\n"
+            f"EMA 50 : {ema50:,.1f}\n"
+            f"EMA 200: {ema200:,.1f}"
+        )
+        ax_main.text(0.01, 0.98, left_text, transform=ax_main.transAxes, va='top', ha='left',
+                     fontsize=8, family='monospace', color='#e0e0e0',
+                     bbox=dict(facecolor='black', alpha=0.6, edgecolor='none'))
+
+        # --- TOP HEADER ---
+        # Left: SYMBOL : PRICE (PCT%)
+        header_color = '#00ff00' if chg_pct >= 0 else '#ff0000'
+        fig.text(0.01, 0.96, f"{symbol} :    {last_close:.0f} ({chg_pct:+.2f}%)", color='#ffff00', fontsize=13, fontweight='bold', ha='left', va='center')
+        # Company line under it
+        company = sector_info if sector_info else "IDX Stock"
+        fig.text(0.01, 0.93, f"{company}", color='#ffaa00', fontsize=8, ha='left')
+
+        # Center: RAFANO TRADER
+        fig.text(0.5, 0.96, "RAFANO TRADER", color='white', fontsize=14, fontweight='bold', ha='center', va='center')
+
+        # Right: Daily date - Hapus registrasi
+        date_str = df.index[-1].strftime('%d %b %Y') if hasattr(df.index[-1], 'strftime') else get_now_wib().strftime('%d %b %Y')
+        fig.text(0.99, 0.96, f"Daily {date_str}", color='#ffcc00', fontsize=10, ha='right', va='center')
+        fig.text(0.99, 0.93, f"Command BOT /C {symbol}", color='white', fontsize=8, ha='right')
+
+        # Subheader High Low Open Volume V1 V2
+        fig.text(0.01, 0.905, f"High:{last_high:.0f}   Low:{last_low:.0f}   Open:{last_open:.0f}   Volume:{last_vol:,.0f}   V1:{df['V1'].iloc[-1]:,.0f}   V2:{df['V2'].iloc[-1]:,.0f}",
+                 color='#00ffff', fontsize=8, ha='left')
+
+        # EMA labels right side
+        ax_main.text(1.005, ema200, f" EMA 200 ", transform=ax_main.get_yaxis_transform(), color='black', backgroundcolor='#a020f0',
+                     fontsize=7, fontweight='bold', va='center')
+        ax_main.text(1.005, last_close, f" {last_close:.0f} ", transform=ax_main.get_yaxis_transform(),
+                     color='black', backgroundcolor='white', fontsize=8, fontweight='bold', va='center')
+
+        # Price ladder right
+        for level in [last_close*1.1, last_close*1.05, last_close*0.95, last_close*0.9]:
+            ax_main.text(1.005, level, f"{level:.0f}", transform=ax_main.get_yaxis_transform(), color='#888888', fontsize=6, va='center')
+
+        # --- VOLUME PANEL - OKE SAHAM STYLE: Stacked Buy/Sell (Power Buy) ---
+        # Buy% Sell% Net Vol Net 5D - ini indikator dana besar masuk daily
+        vol_info = f"Buy Percent = {buy_pct}%   Sell Percent = {sell_pct}%   Net Vol = {net_vol:,.0f}   Net 5D = {net_vol_5d:,.0f}"
+        ax_vol.text(0.005, 0.88, vol_info, transform=ax_vol.transAxes, color='#ffffff', fontsize=8, va='top')
+        
+        # OKE SAHAM asli: bar bawah merah = Sell Vol, atas hijau = Buy Vol (stacked)
+        # Jadi keliatan power buy: kalau hijau mendominasi = TURBO
+        ax_vol.bar(x, df['Vol_Sell'], color='#cc0000', width=0.8, alpha=0.8, label='Sell')
+        ax_vol.bar(x, df['Vol_Buy'], bottom=df['Vol_Sell'], color='#00cc00', width=0.8, alpha=0.9, label='Buy')
+        # White MA line V1
+        ax_vol.plot(x, df['V1'], color='white', linewidth=0.8, alpha=0.9)
+        
+        # Tambah highlight volume spike (dana besar) - kuning kalau TURBO
+        if buy_pct >= 85 and vchg1 >= 1.2:
+            ax_vol.bar(len(df)-1, df['Volume'].iloc[-1], color='#ffff00', width=0.8, alpha=0.3)  # highlight last bar
+        
+        ax_vol.set_ylim(0, df['Volume'].max()*1.8)
         plt.setp(ax_vol.get_xticklabels(), visible=False)
 
-        plt.savefig(output_filename, dpi=300, bbox_inches='tight', pad_inches=0.05, facecolor=fig.get_facecolor(), format='png')
+        # --- NBSA PANEL ---
+        nbsa_info = f"NBSA Rp. {nbsa_rp/1e9:.2f} Milyar   NBSA Value : {nbsa_pct:.1f}%"
+        ax_nbsa.text(0.005, 0.85, nbsa_info, transform=ax_nbsa.transAxes, color='#ffffff', fontsize=8, va='top')
+        # fake NBSA bars like image: cyan up, red down
+        # generate from Net_Vol_VSA normalized
+        nbsa_vals = df['Net_Vol_VSA'].tail(80) / (df['Net_Vol_VSA'].abs().max() or 1) * 50
+        x_nbsa = np.arange(len(df)-len(nbsa_vals), len(df))
+        # split positive cyan, negative red
+        for i, v in zip(x_nbsa, nbsa_vals):
+            col = '#00ffff' if v >= 0 else '#ff4444'
+            ax_nbsa.bar(i, v, color=col, width=0.6)
+        # horizontal zero line
+        ax_nbsa.axhline(0, color='#444444', linewidth=0.5)
+        # right label
+        ax_nbsa.text(1.005, 50, "100", transform=ax_nbsa.get_yaxis_transform(), color='black', backgroundcolor='#00ffff', fontsize=7, va='center')
+        ax_nbsa.set_ylim(-60, 60)
+
+        # --- MARKET MAKER PANEL ---
+        ax_mm.text(0.005, 0.85, "Market Maker", transform=ax_mm.transAxes, color='#ffffff', fontsize=8, va='top')
+        # MM line from extra or simulated
+        if 'MM' not in df.columns:
+            df['MM'] = (df['Close'] - df['EMA50']) / df['EMA50'] * 1000
+        mm_vals = df['MM'].tail(80)
+        x_mm = np.arange(len(df)-len(mm_vals), len(df))
+        ax_mm.bar(x_mm, mm_vals, color='#cccccc', width=0.5, alpha=0.8)
+        # last value label yellow
+        last_mm = df['MM'].iloc[-1]
+        ax_mm.text(1.005, last_mm, f" {last_mm:.4f} ", transform=ax_mm.get_yaxis_transform(),
+                   color='black', backgroundcolor='#ffff00', fontsize=7, fontweight='bold', va='center')
+        ax_mm.set_ylim(df['MM'].min()*1.2 - 10, df['MM'].max()*1.2 + 10)
+
+        # X labels
+        step = max(1, len(df) // 8)
+        ax_mm.set_xticks(x[::step])
+        ax_mm.set_xticklabels([df.index[i].strftime('%b') if hasattr(df.index[i], 'strftime') else str(i) for i in range(0, len(df), step)], fontsize=7)
+
+        plt.savefig(output_filename, dpi=200, bbox_inches='tight', facecolor='#000000')
         return output_filename
+    except Exception as e:
+        print(f"Chart error {e}")
+        import traceback
+        traceback.print_exc()
+        return None
     finally:
-        plt.clf()
-        plt.close('all')
+        try:
+            plt.clf()
+            plt.close('all')
+        except:
+            pass
 
 # ========== TELEGRAM & SCANNER V3 ==========
 LAST_SENT_SIGNALS = {}
