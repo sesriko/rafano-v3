@@ -278,17 +278,22 @@ def is_market_open():
 def arjum_get(path, params=None):
     url = f"{ARJUM_BASE}{path}"
     try:
-        r = requests.get(url, headers=HEADERS_ARJUM, params=params, timeout=8)
+        if not ARJUM_API_KEY:
+            print(f"❌ ARJUM_API_KEY KOSONG! path={path}")
+            return None
+        r = requests.get(url, headers=HEADERS_ARJUM, params=params, timeout=12)
         if r.status_code == 200:
-            return r.json()
+            try:
+                return r.json()
+            except:
+                print(f"⚠ arjum_get {path} JSON parse fail, text={r.text[:500]}")
+                return None
         else:
-            # debug khusus history biar ketahuan kenapa 0
-            if "history" in path:
-                print(f"⚠ arjum_get {path} -> {r.status_code} {r.text[:200]}")
+            # debug untuk semua endpoint biar ketahuan kenapa fallback 5B
+            print(f"⚠ arjum_get {path} params={params} -> {r.status_code} {r.text[:500]}")
             return None
     except Exception as e:
-        if "history" in path:
-            print(f"arjum_get error {path}: {e}")
+        print(f"arjum_get error {path} params={params}: {e}")
         return None
 
 def get_screener_latest():
@@ -324,13 +329,12 @@ def get_screener_latest():
     return data if isinstance(data, list) else []
 
 def get_broker_accumulation(symbol, top=3, days=None):
-    # Endpoint: /broker-accumulation/BBCA?top=3&days=5 (coba support daily, weekly, monthly)
     params = {"top": top}
     if days:
         params["days"] = days
         params["period"] = days
     data = arjum_get(f"/broker-accumulation/{symbol}", params=params)
-    print(f"DEBUG accum {symbol} days={days}: got={bool(data)} sample={str(data)[:350] if data else 'None'}")
+    print(f"DEBUG accum {symbol} days={days}: got={bool(data)} sample={str(data)[:800] if data else 'None'}")
     if not data:
         base = 5_000_000_000
         if days == 5:
@@ -340,48 +344,304 @@ def get_broker_accumulation(symbol, top=3, days=None):
         return base, []
     accum = 0
     brokers = []
+    # Normalisasi data jadi list
+    raw_list = []
     if isinstance(data, dict):
-        accum = data.get('total_accum') or data.get('accumulation') or data.get('net_value') or data.get('total') or data.get('accumulated_value') or data.get('net_buy') or data.get('total_value') or data.get('value') or 0
-        brokers = data.get('brokers') or data.get('data') or data.get('top_brokers') or []
-        if isinstance(brokers, list) and accum==0 and len(brokers)>0:
-            try:
-                accum = sum([abs(b.get('accum',0) or b.get('value',0) or b.get('net',0) or b.get('net_value',0) or b.get('buy_value',0) or b.get('total_value',0)) for b in brokers])
-            except:
-                pass
-        if accum == 0 and isinstance(data, dict):
-            for k in ['total','total_value','sum','accumulated','accumulation_value']:
-                if k in data and isinstance(data[k], (int,float)) and data[k]!=0:
-                    accum = data[k]
+        # coba semua kemungkinan key yang isinya list broker
+        for k in ['data','brokers','top_brokers','result','results','list']:
+            if k in data and isinstance(data[k], list) and len(data[k])>0:
+                raw_list = data[k]
+                break
+        if not raw_list:
+            # kalau dict tapi isinya langsung broker dicts di values?
+            # coba ambil first list value
+            for v in data.values():
+                if isinstance(v, list) and len(v)>0 and isinstance(v[0], dict):
+                    raw_list = v
                     break
+        # total accum dari root
+        for k in ['total_accum','accumulation','net_value','total','accumulated_value','net_buy','total_value','value','total_accum_value','accum']:
+            if k in data and isinstance(data[k], (int,float)) and data[k]!=0:
+                accum = float(data[k])
+                break
+        brokers = raw_list
+        if accum==0 and raw_list:
+            try:
+                accum = sum([abs(float(b.get('value',0) or b.get('total_value',0) or b.get('net_value',0) or b.get('net',0) or b.get('accum',0) or b.get('buy_value',0) or 0)) for b in raw_list])
+            except:
+                accum = 0
     elif isinstance(data, list):
+        raw_list = data
         brokers = data
         try:
-            accum = sum([abs(b.get('value',0) or b.get('net',0) or b.get('net_value',0)) for b in brokers[:top]])
+            accum = sum([abs(float(b.get('value',0) or b.get('total_value',0) or b.get('net_value',0) or b.get('net',0) or 0)) for b in raw_list[:top]])
         except:
             accum = 0
+
+    # Kalau masih 0, jangan fallback 5B kalau raw_list ada - pakai 0 biar keliatan error, tapi biar scan tetep jalan kasih minimal
     if accum == 0:
-        base = 5_000_000_000
-        if days == 5:
-            base = int(base * 1.8)
-        elif days == 20:
-            base = int(base * 4.5)
-        accum = base
-    return accum, brokers
+        if raw_list:
+            # ada broker tapi value 0 -> mungkin formatnya beda, coba hitung dari volume*price nanti di avg
+            accum = 1  # tandain ada data tapi value 0
+        else:
+            base = 5_000_000_000
+            if days == 5:
+                base = int(base * 1.8)
+            elif days == 20:
+                base = int(base * 4.5)
+            accum = base
+
+    # Normalisasi field broker biar konsisten: broker_code, buy_value, sell_value, buy_volume, sell_volume, net_value, avg_price
+    normalized = []
+    for b in brokers[:20]:
+        if not isinstance(b, dict):
+            continue
+        code = b.get('broker_code') or b.get('broker') or b.get('code') or b.get('broker_id') or b.get('name') or "??"
+        # value fields - coba semua varian
+        buy_val = b.get('buy_value') or b.get('buy') or b.get('total_buy') or b.get('buy_total') or 0
+        sell_val = b.get('sell_value') or b.get('sell') or b.get('total_sell') or 0
+        buy_vol = b.get('buy_volume') or b.get('buy_vol') or b.get('b_vol') or b.get('volume_buy') or b.get('buy_lot') or 0
+        sell_vol = b.get('sell_volume') or b.get('sell_vol') or b.get('volume_sell') or 0
+        net_val = b.get('net_value') or b.get('net') or b.get('net_buy') or b.get('net_value_idr') or (buy_val - sell_val if buy_val or sell_val else 0)
+        # kalau value cuma ada di 'value' atau 'total_value' itu biasanya net
+        if net_val==0:
+            net_val = b.get('value') or b.get('total_value') or b.get('accum') or b.get('accumulated') or 0
+        avg_price = b.get('avg_price') or b.get('avg') or b.get('average') or 0
+        if avg_price==0 and buy_val and buy_vol:
+            try:
+                avg_price = float(buy_val) / float(buy_vol) if float(buy_vol)!=0 else 0
+            except:
+                avg_price = 0
+        # kalau buy_val 0 tapi net_val ada, anggap buy_val = net_val positif
+        if buy_val==0 and net_val>0:
+            buy_val = net_val
+
+        normalized.append({
+            "broker_code": str(code).upper(),
+            "broker": str(code).upper(),
+            "code": str(code).upper(),
+            "buy_value": float(buy_val),
+            "sell_value": float(sell_val),
+            "buy_volume": float(buy_vol),
+            "sell_volume": float(sell_vol),
+            "net_value": float(net_val),
+            "net": float(net_val),
+            "value": float(net_val),
+            "avg_price": float(avg_price),
+            "avg": float(avg_price),
+            "raw": b
+        })
+    return float(accum) if accum!=1 else float(sum([abs(x['net_value']) for x in normalized]) or 5_000_000_000), normalized
+
+def get_broker_summary(symbol):
+    # Coba net=true dulu
+    params_true = {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"}
+    data = arjum_get(f"/broker-summary/{symbol}", params=params_true)
+    print(f"DEBUG broker-summary net=true {symbol}: got={bool(data)} sample={str(data)[:1000] if data else 'None'}")
+    
+    net_value = 0
+    brokers = []
+    status = "NEUTRAL"
+    
+    if data:
+        try:
+            raw_list = []
+            if isinstance(data, dict):
+                for k in ['data','brokers','summary','result','results']:
+                    if k in data and isinstance(data[k], list) and len(data[k])>0:
+                        raw_list = data[k]
+                        break
+                for k in ['total_net','net_buy','net_value','net','total','total_net_buy']:
+                    if k in data and isinstance(data[k], (int,float)) and data[k]!=0:
+                        net_value = float(data[k])
+                        break
+            elif isinstance(data, list):
+                raw_list = data
+
+            if raw_list:
+                # normalisasi sama kayak accumulation
+                normalized = []
+                total_net_calc = 0
+                for b in raw_list[:20]:
+                    if not isinstance(b, dict):
+                        continue
+                    code = b.get('broker_code') or b.get('broker') or b.get('code') or "??"
+                    buy_val = b.get('buy_value') or b.get('buy') or 0
+                    sell_val = b.get('sell_value') or b.get('sell') or 0
+                    buy_vol = b.get('buy_volume') or b.get('buy_vol') or 0
+                    sell_vol = b.get('sell_volume') or 0
+                    net_val = b.get('net_value') or b.get('net') or b.get('net_buy') or (float(buy_val)-float(sell_val) if buy_val or sell_val else 0)
+                    if net_val==0:
+                        net_val = b.get('value') or 0
+                    avg_price = b.get('avg_price') or b.get('avg') or 0
+                    if avg_price==0 and buy_val and buy_vol:
+                        try:
+                            avg_price = float(buy_val)/float(buy_vol) if float(buy_vol)!=0 else 0
+                        except:
+                            avg_price=0
+                    total_net_calc += float(net_val)
+                    normalized.append({
+                        "broker_code": str(code).upper(),
+                        "broker": str(code).upper(),
+                        "code": str(code).upper(),
+                        "buy_value": float(buy_val),
+                        "sell_value": float(sell_val),
+                        "buy_volume": float(buy_vol),
+                        "sell_volume": float(sell_vol),
+                        "net_value": float(net_val),
+                        "net": float(net_val),
+                        "value": float(net_val),
+                        "avg_price": float(avg_price),
+                        "avg": float(avg_price),
+                        "raw": b
+                    })
+                brokers = normalized
+                if net_value==0 and total_net_calc!=0:
+                    net_value = total_net_calc
+        except Exception as e:
+            print(f"broker-summary net=true parse error {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Kalau net masih 0, coba net=false (yang lu kirim)
+    if net_value == 0:
+        params_false = {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"}
+        data2 = arjum_get(f"/broker-summary/{symbol}", params=params_false)
+        print(f"DEBUG broker-summary net=false {symbol}: got={bool(data2)} sample={str(data2)[:1000] if data2 else 'None'}")
+        if data2:
+            try:
+                raw_list = []
+                if isinstance(data2, dict):
+                    for k in ['data','brokers','summary','result']:
+                        if k in data2 and isinstance(data2[k], list) and len(data2[k])>0:
+                            raw_list = data2[k]
+                            break
+                    for k in ['total_net','net_buy','net_value','net','total']:
+                        if k in data2 and isinstance(data2[k], (int,float)) and data2[k]!=0:
+                            net_value = float(data2[k])
+                            break
+                elif isinstance(data2, list):
+                    raw_list = data2
+                
+                if raw_list:
+                    normalized = []
+                    total_net_calc = 0
+                    total_buy = 0
+                    total_sell = 0
+                    for b in raw_list[:20]:
+                        if not isinstance(b, dict):
+                            continue
+                        code = b.get('broker_code') or b.get('broker') or b.get('code') or "??"
+                        buy_val = b.get('buy_value') or b.get('buy') or b.get('buy_value_idr') or 0
+                        sell_val = b.get('sell_value') or b.get('sell') or 0
+                        buy_vol = b.get('buy_volume') or b.get('buy_vol') or b.get('buy_lot') or 0
+                        sell_vol = b.get('sell_volume') or 0
+                        net_val = b.get('net_value') or b.get('net') or b.get('net_buy') or (float(buy_val)-float(sell_val) if buy_val or sell_val else 0)
+                        if net_val==0:
+                            net_val = b.get('value') or 0
+                        avg_price = b.get('avg_price') or b.get('avg') or 0
+                        if avg_price==0 and buy_val and buy_vol:
+                            try:
+                                avg_price = float(buy_val)/float(buy_vol) if float(buy_vol)!=0 else 0
+                            except:
+                                avg_price=0
+                        total_net_calc += float(net_val)
+                        total_buy += float(buy_val)
+                        total_sell += float(sell_val)
+                        normalized.append({
+                            "broker_code": str(code).upper(),
+                            "broker": str(code).upper(),
+                            "code": str(code).upper(),
+                            "buy_value": float(buy_val),
+                            "sell_value": float(sell_val),
+                            "buy_volume": float(buy_vol),
+                            "sell_volume": float(sell_vol),
+                            "net_value": float(net_val),
+                            "net": float(net_val),
+                            "value": float(net_val),
+                            "avg_price": float(avg_price),
+                            "avg": float(avg_price),
+                            "raw": b
+                        })
+                    if net_value==0 and total_net_calc!=0:
+                        net_value = total_net_calc
+                    if not brokers:
+                        brokers = normalized
+                    else:
+                        # gabung kalau net=true udah ada tapi net=false lebih lengkap
+                        if len(normalized) > len(brokers):
+                            brokers = normalized
+                    print(f"  -> net=false calculated net={total_net_calc} buy={total_buy} sell={total_sell} brokers={len(normalized)}")
+            except Exception as e:
+                print(f"broker-summary net=false parse error {symbol}: {e}")
+                import traceback
+                traceback.print_exc()
+
+    # Final fallback
+    if net_value == 0:
+        acc_val, acc_brokers = get_broker_accumulation(symbol, top=3)
+        # kalau acc_val masih fallback 5B, jangan pakai *0.6 karena itu palsu
+        if acc_val > 5_100_000_000 or acc_val < 4_900_000_000:
+            net_value = int(acc_val * 0.6) if acc_val > 1e9 else 0
+            status = "ACCUM_EST" if net_value>0 else "NEUTRAL"
+        else:
+            net_value = 0
+            status = "NEUTRAL"
+        if not brokers and acc_brokers:
+            brokers = acc_brokers
+    else:
+        status = "ACCUM" if net_value > 0 else "DISTRIB" if net_value < 0 else "NEUTRAL"
+
+    return float(net_value), status, brokers
+
+def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
+    try:
+        if brokers and isinstance(brokers, list) and len(brokers)>0:
+            total_value = 0
+            total_vol = 0
+            for b in brokers:
+                if not isinstance(b, dict):
+                    continue
+                if b.get('avg_price') and float(b.get('avg_price')) !=0:
+                    # kalau ada avg_price langsung, ambil rata2 dari top brokers yang net positif
+                    if float(b.get('net_value',0)) >0:
+                        total_value += float(b.get('avg_price'))
+                        total_vol += 1
+                bv = float(b.get('buy_value',0) or 0)
+                bvol = float(b.get('buy_volume',0) or 0)
+                if bv!=0 and bvol!=0:
+                    # avg = value/vol
+                    avg = bv / bvol if bvol!=0 else 0
+                    if avg>0:
+                        total_value += avg
+                        total_vol += 1
+            if total_vol>0 and total_value>0:
+                # kalau total_value di sini adalah sum avg, bukan sum value*vol, jadi rata2kan
+                # bedakan: kalau kita sum avg, bagi count. Kalau sum value, bagi sum vol
+                # kita sudah sum avg di atas, jadi:
+                return float(total_value / total_vol) if total_vol!=0 else 0
+    except:
+        pass
+    try:
+        if hist_df is not None and len(hist_df)>=1:
+            df_slice = hist_df.tail(period_days) if period_days else hist_df.tail(1)
+            if len(df_slice)>0:
+                if df_slice['Volume'].sum()>0:
+                    vwap = (df_slice['Close'] * df_slice['Volume']).sum() / df_slice['Volume'].sum()
+                    return float(vwap)
+                else:
+                    return float(df_slice['Close'].iloc[-1])
+    except:
+        pass
+    return 0
 
 def get_broker_multi_tf(symbol, hist_df=None):
-    """
-    Ambil Akum & Net & Avg Bandar untuk Daily, Weekly 5D, Monthly 20D
-    """
-    # Daily
     accum_d, brokers_d = get_broker_accumulation(symbol, top=3, days=None)
     net_d, status_d, brokers_net_d = get_broker_summary(symbol)
     
-    # Weekly 5D - coba API
     accum_5d, brokers_5d = get_broker_accumulation(symbol, top=3, days=5)
-    # Monthly 20D
     accum_20d, brokers_20d = get_broker_accumulation(symbol, top=3, days=20)
     
-    # VSA fallback
     vsa_5d = 0
     vsa_20d = 0
     vsa_1d = 0
@@ -389,15 +649,21 @@ def get_broker_multi_tf(symbol, hist_df=None):
         try:
             if 'Net_Val_VSA' not in hist_df.columns:
                 hist_df, _ = calculate_vsa_metrics(hist_df)
-            vsa_1d = hist_df['Net_Val_VSA'].iloc[-1] if len(hist_df)>=1 else 0
-            vsa_5d = hist_df['Net_Val_VSA'].tail(5).sum()
-            vsa_20d = hist_df['Net_Val_VSA'].tail(20).sum()
-            if accum_5d == 5_000_000_000 or abs(accum_5d - 9000000000) < 1000:
-                accum_5d = int(abs(vsa_5d) * 1.2) if vsa_5d !=0 else accum_5d
-            if accum_20d == 5_000_000_000 or accum_20d == 22500000000:
-                accum_20d = int(abs(vsa_20d) * 1.2) if vsa_20d !=0 else accum_20d
-        except:
-            pass
+            vsa_1d = float(hist_df['Net_Val_VSA'].iloc[-1]) if len(hist_df)>=1 else 0
+            vsa_5d = float(hist_df['Net_Val_VSA'].tail(5).sum())
+            vsa_20d = float(hist_df['Net_Val_VSA'].tail(20).sum())
+            # fallback kalau API gagal (accum masih 5B)
+            if abs(accum_5d - 5_000_000_000) < 1000000 or accum_5d==1:
+                if vsa_5d !=0:
+                    accum_5d = abs(vsa_5d) * 1.2
+            if abs(accum_20d - 22_500_000_000) < 1000000 or accum_20d==1:
+                if vsa_20d !=0:
+                    accum_20d = abs(vsa_20d) * 1.2
+            if abs(accum_d - 5_000_000_000) < 1000000:
+                if vsa_1d !=0:
+                    accum_d = abs(vsa_1d) * 1.2
+        except Exception as e:
+            print(f"VSA calc error {symbol}: {e}")
     
     net_5d = int(net_d * 1.5) if net_d !=0 else int(vsa_5d * 0.8) if vsa_5d !=0 else 0
     net_20d = int(net_d * 3.2) if net_d !=0 else int(vsa_20d * 0.8) if vsa_20d !=0 else 0
@@ -406,21 +672,20 @@ def get_broker_multi_tf(symbol, hist_df=None):
 
     brokers_combined = brokers_net_d if brokers_net_d else brokers_d
 
-    # Avg bandar Daily, Weekly, Monthly
     avg_d = calculate_bandars_avg(brokers_combined, hist_df, period_days=1)
     avg_5d = calculate_bandars_avg(brokers_5d if brokers_5d else brokers_combined, hist_df, period_days=5)
     avg_20d = calculate_bandars_avg(brokers_20d if brokers_20d else brokers_combined, hist_df, period_days=20)
     
     return {
-        "accum_d": accum_d,
-        "accum_5d": accum_5d,
-        "accum_20d": accum_20d,
-        "net_d": net_d,
-        "net_5d": net_5d,
-        "net_20d": net_20d,
-        "avg_d": avg_d,
-        "avg_5d": avg_5d,
-        "avg_20d": avg_20d,
+        "accum_d": float(accum_d),
+        "accum_5d": float(accum_5d),
+        "accum_20d": float(accum_20d),
+        "net_d": float(net_d),
+        "net_5d": float(net_5d),
+        "net_20d": float(net_20d),
+        "avg_d": float(avg_d),
+        "avg_5d": float(avg_5d),
+        "avg_20d": float(avg_20d),
         "brokers": brokers_combined,
         "status": status_d,
         "vsa_1d": vsa_1d,
@@ -428,155 +693,62 @@ def get_broker_multi_tf(symbol, hist_df=None):
         "vsa_20d": vsa_20d
     }
 
-def get_broker_summary(symbol):
-    """
-    Bisa pake 2 mode yang lu kirim:
-    1. net=true -> langsung dapet net broker
-    2. net=false + broker_limit 20 level 25 -> detail buy/sell per broker, hitung net manual
-    Kita coba net=true dulu, kalau 0 fallback ke net=false
-    """
-    # Coba mode 1: net=true (yang lama) - cepat
-    params_true = {"net": "true", "broker_limit": 5, "level_limit": 5, "all_data": "false", "flow": "all"}
-    data = arjum_get(f"/broker-summary/{symbol}", params=params_true)
-    print(f"DEBUG broker-summary net=true {symbol}: got={bool(data)} sample={str(data)[:500] if data else 'None'}")
-    
-    net_value = 0
-    brokers = []
-    status = "NEUTRAL"
-    
-    if data:
-        try:
-            if isinstance(data, dict):
-                brokers = data.get('brokers') or data.get('data') or data.get('summary') or []
-                net_value = data.get('net_buy') or data.get('net_value') or data.get('total_net') or data.get('net') or data.get('total') or 0
-                if isinstance(brokers, list) and net_value==0 and len(brokers)>0:
-                    # hitung dari top brokers
-                    try:
-                        top3_net = sum([b.get('net',0) or b.get('net_value',0) or b.get('value',0) or b.get('net_buy',0) for b in brokers[:3]])
-                        if top3_net !=0:
-                            net_value = top3_net
-                    except:
-                        pass
-        except Exception as e:
-            print(f"broker-summary net=true parse error {symbol}: {e}")
-
-    # Kalau net masih 0, coba mode 2: net=false detail (yang lu kirim)
-    if net_value == 0:
-        params_false = {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"}
-        data2 = arjum_get(f"/broker-summary/{symbol}", params=params_false)
-        print(f"DEBUG broker-summary net=false {symbol}: got={bool(data2)} sample={str(data2)[:600] if data2 else 'None'}")
-        if data2:
-            try:
-                # Format net=false biasanya: {data: [{broker_code, buy_value, sell_value, net_value, buy_volume, sell_volume}]}
-                brokers_detail = []
-                if isinstance(data2, dict):
-                    brokers_detail = data2.get('data') or data2.get('brokers') or data2.get('summary') or []
-                    # kadang ada field total_net di root
-                    if 'total_net' in data2 and data2['total_net']!=0:
-                        net_value = data2['total_net']
-                    elif 'net_buy' in data2 and data2['net_buy']!=0:
-                        net_value = data2['net_buy']
-                elif isinstance(data2, list):
-                    brokers_detail = data2
-                
-                if isinstance(brokers_detail, list) and len(brokers_detail)>0 and net_value==0:
-                    # hitung net manual: sum(buy - sell) atau sum(net_value)
-                    total_net = 0
-                    total_buy = 0
-                    total_sell = 0
-                    for b in brokers_detail:
-                        # coba semua kemungkinan field
-                        b_net = b.get('net_value') or b.get('net') or b.get('net_buy') or 0
-                        b_buy = b.get('buy_value') or b.get('buy') or 0
-                        b_sell = b.get('sell_value') or b.get('sell') or 0
-                        if b_net !=0:
-                            total_net += b_net
-                        elif b_buy!=0 or b_sell!=0:
-                            total_net += (b_buy - b_sell)
-                            total_buy += b_buy
-                            total_sell += b_sell
-                    if total_net !=0:
-                        net_value = total_net
-                    brokers = brokers_detail  # pakai detail buat chart
-                    print(f"  -> net=false calculated net={total_net} buy={total_buy} sell={total_sell}")
-            except Exception as e:
-                print(f"broker-summary net=false parse error {symbol}: {e}")
-
-    # Final fallback: kalau masih 0, estimasi dari accumulation
-    if net_value == 0:
-        acc_val, acc_brokers = get_broker_accumulation(symbol, top=3)
-        net_value = int(acc_val * 0.6) if acc_val > 1e9 else 0
-        status = "ACCUM_EST" if net_value>0 else "NEUTRAL"
-        if not brokers:
-            brokers = acc_brokers
-    else:
-        status = "ACCUM" if net_value > 0 else "DISTRIB" if net_value < 0 else "NEUTRAL"
-
-    return net_value, status, brokers
-
-def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
-    """
-    Hitung avg bandar:
-    - Kalau broker data ada buy_value & buy_volume -> avg = sum(buy_value)/sum(buy_volume)
-    - Kalau ada avg_price field langsung pakai
-    - Fallback: VWAP dari hist_df tail period
-    """
-    try:
-        if brokers and isinstance(brokers, list) and len(brokers)>0:
-            total_value = 0
-            total_vol = 0
-            for b in brokers:
-                if b.get('avg_price') and b.get('avg_price') !=0:
-                    return float(b.get('avg_price'))
-                if b.get('avg') and b.get('avg') !=0:
-                    return float(b.get('avg'))
-                bv = b.get('buy_value') or b.get('buy') or 0
-                bvol = b.get('buy_volume') or b.get('buy_vol') or b.get('volume') or 0
-                if bv !=0 and bvol !=0:
-                    total_value += bv
-                    total_vol += bvol
-            if total_vol >0 and total_value>0:
-                return float(total_value / total_vol)
-    except:
-        pass
-    try:
-        if hist_df is not None and len(hist_df)>=1:
-            if period_days:
-                df_slice = hist_df.tail(period_days)
-            else:
-                df_slice = hist_df.tail(1)
-            if len(df_slice)>0 and df_slice['Volume'].sum()>0:
-                vwap = (df_slice['Close'] * df_slice['Volume']).sum() / df_slice['Volume'].sum()
-                return float(vwap)
-            else:
-                return float(df_slice['Close'].iloc[-1])
-    except:
-        pass
-    return 0
-
 def format_top_brokers(brokers, top=3):
     """Format top 3 broker codes kayak CC, BK, AK (CC 12B)"""
     if not brokers or not isinstance(brokers, list):
-        return "-"
-    # Sort by net_value descending
+        return "- (API broker kosong, cek ARJUM_API_KEY)"
+    # Filter brokers yang punya data valid
+    valid_brokers = []
+    for b in brokers:
+        if not isinstance(b, dict):
+            continue
+        net = float(b.get('net_value',0) or b.get('net',0) or b.get('value',0) or 0)
+        buy = float(b.get('buy_value',0) or 0)
+        # kalau net dan buy 0, coba ambil dari raw
+        if net==0 and buy==0:
+            raw = b.get('raw',{})
+            if isinstance(raw, dict):
+                # coba cari angka besar di raw
+                for kk, vv in raw.items():
+                    if isinstance(vv, (int,float)) and abs(vv) > 1e6:
+                        net = float(vv)
+                        break
+        # tetap masukkan walau 0 biar keliatan kodenya, tapi prioritaskan yang >0
+        valid_brokers.append(b)
+    
     try:
-        sorted_b = sorted(brokers, key=lambda x: abs(x.get('net_value',0) or x.get('net',0) or x.get('value',0) or x.get('buy_value',0) or 0), reverse=True)
+        # Sort: net >0 dulu, baru abs net
+        sorted_b = sorted(valid_brokers, key=lambda x: (
+            float(x.get('net_value',0) or x.get('net',0) or x.get('value',0) or x.get('buy_value',0) or 0)
+        ), reverse=True)
+        # kalau semua 0, sort by broker_code aja
+        if all(float(x.get('net_value',0) or 0)==0 for x in sorted_b):
+            # coba sort by buy_value
+            sorted_b = sorted(valid_brokers, key=lambda x: float(x.get('buy_value',0) or 0), reverse=True)
     except:
-        sorted_b = brokers
+        sorted_b = valid_brokers
     top_b = sorted_b[:top]
     parts = []
     for b in top_b:
         code = b.get('broker_code') or b.get('broker') or b.get('code') or b.get('name') or b.get('broker_name') or "??"
         net = b.get('net_value') or b.get('net') or b.get('value') or b.get('buy_value') or 0
-        # Format net
-        if abs(net) >= 1e9:
-            net_str = f"{net/1e9:.1f}B"
-        elif abs(net) >= 1e6:
-            net_str = f"{net/1e6:.0f}M"
+        try:
+            net_f = float(net)
+        except:
+            net_f = 0
+        if abs(net_f) >= 1e9:
+            net_str = f"{net_f/1e9:.1f}B"
+        elif abs(net_f) >= 1e6:
+            net_str = f"{net_f/1e6:.0f}M"
+        elif abs(net_f) >= 1e3:
+            net_str = f"{net_f/1e3:.0f}K"
         else:
-            net_str = f"{net:.0f}"
+            net_str = f"{net_f:.0f}"
+        # kalau net 0, tandain biar tau API gagal
+        if net_f==0:
+            net_str = "0 (cek log)"
         parts.append(f"{code} {net_str}")
-    return ", ".join(parts) if parts else "-"
+    return ", ".join(parts) if parts else "- (no broker data)"
 
 def get_analysis(symbol):
     data = arjum_get(f"/analysis/{symbol}")
@@ -1032,15 +1204,17 @@ def scan_v3():
     detected = []
     def process_symbol(sym):
         try:
+            accum_val, accum_brokers = get_broker_accumulation(sym, top=3)
+            # jangan filter negatif dulu pas weekend, biar scan tetep keluar
+            # if accum_val < -10_000_000_000:
+            #     return None
+            broker_net, broker_status, broker_list = get_broker_summary(sym)
+            # gabungin brokers dari dua endpoint, prioritaskan broker_summary
+            brokers_combined = broker_list if broker_list else accum_brokers
             hist_df = get_history_pro(sym, limit=120, timeframe="1d")
-            multi = get_broker_multi_tf(sym, hist_df=hist_df)
-            accum_val = multi['accum_d']
-            broker_net = multi['net_d']
-            broker_status = multi['status']
-            brokers_combined = multi['brokers']
-            
             analysis = get_analysis(sym)
             score, label, reasons = calculate_score_v2(sym, hist_df, accum_val, broker_net, analysis)
+            # weekend threshold lebih rendah biar /scanpro tetep bisa
             threshold = 40 if is_fallback else 55
             if score >= threshold:
                 last_close = 0
@@ -1049,6 +1223,7 @@ def scan_v3():
                     last_close = int(hist_df['Close'].iloc[-1])
                     prev = hist_df['Close'].iloc[-2]
                     change_pct = ((last_close/prev)-1)*100 if prev else 0
+                # Trading plan
                 tp = calculate_trading_plan(hist_df) if hist_df is not None else None
                 return {
                     "symbol": sym,
@@ -1057,14 +1232,7 @@ def scan_v3():
                     "score": score,
                     "score_label": label,
                     "accum_value": accum_val,
-                    "accum_5d": multi['accum_5d'],
-                    "accum_20d": multi['accum_20d'],
                     "broker_net": broker_net,
-                    "broker_net_5d": multi['net_5d'],
-                    "broker_net_20d": multi['net_20d'],
-                    "avg_d": multi['avg_d'],
-                    "avg_5d": multi['avg_5d'],
-                    "avg_20d": multi['avg_20d'],
                     "broker_status": broker_status,
                     "reasons": reasons,
                     "history_df": hist_df,
@@ -1074,8 +1242,6 @@ def scan_v3():
                 }
         except Exception as e:
             print(f"Error {sym}: {e}")
-            import traceback
-            traceback.print_exc()
         return None
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -1111,37 +1277,26 @@ def broadcast_v3(signals):
         send_reply(TARGET_CHAT_ID, "🔍 V3 Scan: Tidak ada sinyal REAL ACCUM hari ini.")
         return
     now_str = get_now_wib().strftime('%d %b %Y %H:%M WIB')
-    header = f"*RAFANO V3 PRO - REAL ACCUM MULTI TF + AVG BANDAR*\n{now_str}\nTotal: {len(signals)} | Daily, Weekly 5D, Monthly 20D + Avg Bandar\n============================\n\n"
+    header = f"*RAFANO V3 PRO - REAL ACCUM*\n{now_str}\nTotal: {len(signals)} | Cooldown 60m\n============================\n\n"
     msg = header
     keyboard = []
     for idx, item in enumerate(signals, 1):
         def fmt(v):
             return format_large_number(v, True)
         reasons_str = " | ".join(item['reasons'][:3])
+        # Trading plan
         tp = item.get('trading_plan')
         if tp:
             tp_str = f"   ├ 🎯 Plan: Entry {tp['entry']} | TP1 {tp['tp1']} ({tp['rr1']}R) | TP2 {tp['tp2']} ({tp['rr2']}R) | SL {tp['sl']} ({tp['risk_pct']}%)\n"
         else:
             tp_str = ""
+        # Top 3 broker
         brokers = item.get('brokers', []) or item.get('broker_list', [])
         top_broker_str = format_top_brokers(brokers, 3)
-        
-        accum_d = fmt(item.get('accum_value',0))
-        accum_5d = fmt(item.get('accum_5d',0))
-        accum_20d = fmt(item.get('accum_20d',0))
-        net_d = fmt(item.get('broker_net',0))
-        net_5d = fmt(item.get('broker_net_5d',0))
-        net_20d = fmt(item.get('broker_net_20d',0))
-        avg_d = int(item.get('avg_d',0) or 0)
-        avg_5d = int(item.get('avg_5d',0) or 0)
-        avg_20d = int(item.get('avg_20d',0) or 0)
-        
         item_str = (
             f"{idx}. *{item['symbol']}* — {item['close']} ({item['change_pct']:+.2f}%)\n"
             f"   ├ Score: *{item['score']}% ({item['score_label']})*\n"
-            f"   ├ Daily: Akum {accum_d} | Net {net_d} | Avg {avg_d}\n"
-            f"   ├ Weekly 5D: Akum {accum_5d} | Net {net_5d} | Avg {avg_5d}\n"
-            f"   ├ Monthly 20D: Akum {accum_20d} | Net {net_20d} | Avg {avg_20d}\n"
+            f"   ├ Akum 3B: {fmt(item['accum_value'])} | Net: {fmt(item['broker_net'])} ({item['broker_status']})\n"
             f"   ├ Top Brokers: {top_broker_str}\n"
             f"{tp_str}"
             f"   └ {reasons_str}\n\n"
@@ -1158,32 +1313,26 @@ def broadcast_v3(signals):
 
 def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=None):
     send_reply(chat_id, f"📊 *Generating Pro Chart {stock_code.upper()} ({timeframe.upper()}) + REAL DATA...*")
+    # Ambil data - sekarang support multi TF
     df = get_history_pro(stock_code, limit=150, timeframe=timeframe)
     if df is None or len(df) < 20:
         send_reply(chat_id, f"⚠ Data {stock_code} tidak ketemu TF {timeframe}")
         return
     
+    # Ambil real data buat ditempel di chart
     if extra_info_cache and stock_code in extra_info_cache:
         extra = extra_info_cache[stock_code]
+        # brokers dari cache
         brokers_cached = extra.get('brokers') or extra.get('broker_list') or []
-        multi_cache = {
-            "accum_d": extra.get('accum_value',0),
-            "accum_5d": extra.get('accum_5d',0),
-            "accum_20d": extra.get('accum_20d',0),
-            "net_d": extra.get('broker_net',0),
-            "net_5d": extra.get('broker_net_5d',0),
-            "net_20d": extra.get('broker_net_20d',0),
-            "avg_d": extra.get('avg_d',0),
-            "avg_5d": extra.get('avg_5d',0),
-            "avg_20d": extra.get('avg_20d',0)
-        }
     else:
-        multi = get_broker_multi_tf(stock_code, hist_df=df)
-        brokers_cached = multi['brokers']
-        multi_cache = multi
-        score = 70 if multi['accum_d'] > 5e9 else 50
-        extra = {"accum_value": multi['accum_d'], "broker_net": multi['net_d'], "broker_status": multi['status'], "score": score, "score_label": "REAL", "brokers": brokers_cached, **multi}
+        accum_val, accum_brokers = get_broker_accumulation(stock_code, top=3)
+        broker_net, broker_status, broker_list = get_broker_summary(stock_code)
+        brokers_cached = broker_list if broker_list else accum_brokers
+        # Score cepat
+        score = 70 if accum_val > 5e9 else 50
+        extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "score": score, "score_label": "REAL", "brokers": brokers_cached}
 
+    # Trading plan
     tp = calculate_trading_plan(df)
     top_broker_str = format_top_brokers(brokers_cached if 'brokers_cached' in locals() else extra.get('brokers', []), 3)
 
@@ -1193,9 +1342,8 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
         if tp:
             caption = (
                 f"*{stock_code.upper()}* — {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
-                f"Daily: Akum {format_large_number(multi_cache['accum_d'],True)} | Net {format_large_number(multi_cache['net_d'],True)} | Avg {int(multi_cache['avg_d'])} ({extra.get('broker_status','')})\n"
-                f"Weekly 5D: Akum {format_large_number(multi_cache['accum_5d'],True)} | Net {format_large_number(multi_cache['net_5d'],True)} | Avg {int(multi_cache['avg_5d'])}\n"
-                f"Monthly 20D: Akum {format_large_number(multi_cache['accum_20d'],True)} | Net {format_large_number(multi_cache['net_20d'],True)} | Avg {int(multi_cache['avg_20d'])}\n"
+                f"Score REAL: {extra.get('score',0)}% | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
+                f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
                 f"Top Brokers: {top_broker_str}\n"
                 f"Timeframe: {timeframe.upper()}\n"
                 f"──────────────────\n"
@@ -1207,8 +1355,8 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
         else:
             caption = (
                 f"*{stock_code.upper()}* — {safe_int(df['Close'].iloc[-1])}\n"
-                f"Daily: Akum {format_large_number(multi_cache['accum_d'],True)} | Net {format_large_number(multi_cache['net_d'],True)} | Avg {int(multi_cache['avg_d'])}\n"
-                f"Weekly 5D: Akum {format_large_number(multi_cache['accum_5d'],True)} | Net {format_large_number(multi_cache['net_5d'],True)} | Avg {int(multi_cache['avg_5d'])}\n"
+                f"Score REAL: {extra.get('score',0)}% | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
+                f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
                 f"Top Brokers: {top_broker_str}\n"
                 f"Timeframe: {timeframe.upper()}"
             )
@@ -1304,30 +1452,13 @@ def telegram_bot_listener():
                                 if not filt:
                                     send_reply(target_chat, f"*RAFANO V3* {now_str}\n0 sinyal (weekend/market tutup, coba /c BBCA)\n_Screener kosong, coba beberapa saham fallback_")
                                     return
-                                header = f"*RAFANO V3 PRO - {now_str}*\nTotal: {len(filt)} (manual, tanpa cooldown) - Multi TF + Avg Bandar\n\n"
+                                header = f"*RAFANO V3 PRO - {now_str}*\nTotal: {len(filt)} (manual, tanpa cooldown)\n\n"
                                 msg = header
                                 kb = []
                                 for idx, item in enumerate(filt,1):
                                     tp = item.get('trading_plan')
-                                    top_broker_str = format_top_brokers(item.get('brokers',[]),3)
-                                    accum_d = format_large_number(item.get('accum_value',0),True)
-                                    accum_5d = format_large_number(item.get('accum_5d',0),True)
-                                    accum_20d = format_large_number(item.get('accum_20d',0),True)
-                                    net_d = format_large_number(item.get('broker_net',0),True)
-                                    net_5d = format_large_number(item.get('broker_net_5d',0),True)
-                                    net_20d = format_large_number(item.get('broker_net_20d',0),True)
-                                    avg_d = int(item.get('avg_d',0) or 0)
-                                    avg_5d = int(item.get('avg_5d',0) or 0)
-                                    avg_20d = int(item.get('avg_20d',0) or 0)
                                     tp_line = f" | Plan Entry {tp['entry']} TP1 {tp['tp1']} SL {tp['sl']}" if tp else ""
-                                    item_str = (
-                                        f"{idx}. *{item['symbol']}* {item['score']}% {item['score_label']}\n"
-                                        f"   ├ Daily: Akum {accum_d} | Net {net_d} | Avg {avg_d}\n"
-                                        f"   ├ Weekly 5D: Akum {accum_5d} | Net {net_5d} | Avg {avg_5d}\n"
-                                        f"   ├ Monthly 20D: Akum {accum_20d} | Net {net_20d} | Avg {avg_20d}\n"
-                                        f"   ├ Top Brokers: {top_broker_str}{tp_line}\n"
-                                        f"   └ { ' | '.join(item['reasons'][:2]) }\n\n"
-                                    )
+                                    item_str = f"{idx}. *{item['symbol']}* {item['score']}% Akum:{format_large_number(item['accum_value'],True)} Net:{format_large_number(item['broker_net'],True)}{tp_line}\n"
                                     kb.append([{"text": f"📈 {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
                                     if len(msg) + len(item_str) > 3500:
                                         send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb})
