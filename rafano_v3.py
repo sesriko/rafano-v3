@@ -276,13 +276,25 @@ def is_market_open():
     return (s1_start <= current_time <= s1_end) or (s2_start <= current_time <= s2_end)
 
 # ========== ARJUM PRO WRAPPER ==========
-def arjum_get(path, params=None):
+def arjum_get(path, params=None, use_cache=True):
+    # INCREMENTAL FETCH: Cek cache dulu sebelum hit API
+    cache_key = make_cache_key(path, params) if use_cache else None
+    
+    if use_cache and cache_key:
+        # Untuk broker & screener, cek cache
+        if 'broker' in path:
+            cached = get_cached_broker(cache_key)
+            if cached is not None:
+                return cached
+        elif 'screener' in path:
+            cached = get_cached_screener()
+            if cached is not None:
+                return cached
+
     url = f"{ARJUM_BASE}{path}"
     try:
-        # Dynamic API key - baca ulang dari env setiap call
         api_key = os.getenv("ARJUM_API_KEY") or ARJUM_API_KEY
         if not api_key:
-            # coba safe_get_env lagi
             api_key = safe_get_env("ARJUM_API_KEY")
         if not api_key:
             print(f"❌ ARJUM_API_KEY KOSONG! path={path}")
@@ -292,44 +304,132 @@ def arjum_get(path, params=None):
         if r.status_code == 200:
             try:
                 j = r.json()
-                # Log untuk BBCA/IBOS biar debug
-                if "BBCA" in path or "IBOS" in path or "broker" in path:
-                    print(f"✅ arjum_get {path} OK keys={list(j.keys()) if isinstance(j, dict) else f'list len={len(j)}'}")
+                # Simpan ke cache
+                if use_cache and cache_key:
+                    if 'broker' in path:
+                        set_cached_broker(cache_key, j)
+                    elif 'screener' in path:
+                        set_cached_screener(j)
+                if "BBCA" in path or "broker" in path:
+                    print(f"🌐 API FETCH {path} OK (cache miss)")
                 return j
             except Exception as je:
-                print(f"⚠ arjum_get {path} JSON parse fail: {je}, text={r.text[:500]}")
+                print(f"⚠ arjum_get {path} JSON parse fail: {je}")
                 return None
         else:
-            print(f"⚠ arjum_get {path} params={params} -> {r.status_code} {r.text[:800]}")
+            print(f"⚠ arjum_get {path} params={params} -> {r.status_code}")
             return None
     except Exception as e:
-        print(f"arjum_get error {path} params={params}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"arjum_get error {path}: {e}")
         return None
 
 
-# Cache untuk broker data biar scan lebih cepat (5 menit TTL)
+# ========== INCREMENTAL FETCH SYSTEM - CACHE DULU BARU API ==========
+import json
+from pathlib import Path
+
 BROKER_CACHE = {}
+HISTORY_CACHE = {}
+SCREENER_CACHE = {}
+CACHE_FILE = Path("/tmp/rafano_cache.json")
 BROKER_CACHE_TTL = 300  # 5 menit
+HISTORY_CACHE_TTL = 600  # 10 menit untuk history
+SCREENER_CACHE_TTL = 180  # 3 menit untuk screener
+
+# Load cache dari file jika ada (biar survive restart)
+try:
+    if CACHE_FILE.exists():
+        with open(CACHE_FILE, 'r') as cf:
+            loaded = json.load(cf)
+            BROKER_CACHE = {k: (v[0], v[1]) for k, v in loaded.get('broker', {}).items()}
+            print(f"📦 Cache loaded: {len(BROKER_CACHE)} broker entries")
+except:
+    pass
+
+def save_cache_to_file():
+    try:
+        data = {
+            'broker': {k: [v[0], v[1]] for k, v in BROKER_CACHE.items()},
+            'timestamp': __import__('time').time()
+        }
+        with open(CACHE_FILE, 'w') as cf:
+            json.dump(data, cf)
+    except:
+        pass
 
 def get_cached_broker(key):
     import time
+    # 1. Cek memory cache dulu
     if key in BROKER_CACHE:
         ts, data = BROKER_CACHE[key]
         if time.time() - ts < BROKER_CACHE_TTL:
+            print(f"⚡ CACHE HIT broker {key} (age {int(time.time()-ts)}s)")
             return data
         else:
+            print(f"⏰ CACHE EXPIRED broker {key}")
             del BROKER_CACHE[key]
     return None
 
 def set_cached_broker(key, data):
     import time
     BROKER_CACHE[key] = (time.time(), data)
+    # async save ke file
+    try:
+        save_cache_to_file()
+    except:
+        pass
+    print(f"💾 CACHE SET broker {key}")
+
+def get_cached_history(key):
+    import time
+    if key in HISTORY_CACHE:
+        ts, data = HISTORY_CACHE[key]
+        if time.time() - ts < HISTORY_CACHE_TTL:
+            print(f"⚡ CACHE HIT history {key}")
+            return data
+        else:
+            del HISTORY_CACHE[key]
+    return None
+
+def set_cached_history(key, data):
+    import time
+    HISTORY_CACHE[key] = (time.time(), data)
+
+def get_cached_screener():
+    import time
+    if 'latest' in SCREENER_CACHE:
+        ts, data = SCREENER_CACHE['latest']
+        if time.time() - ts < SCREENER_CACHE_TTL:
+            print(f"⚡ CACHE HIT screener (age {int(time.time()-ts)}s)")
+            return data
+        else:
+            del SCREENER_CACHE['latest']
+    return None
+
+def set_cached_screener(data):
+    import time
+    SCREENER_CACHE['latest'] = (time.time(), data)
+
+def make_cache_key(path, params):
+    # Buat key unik dari path + params
+    if not params:
+        return path
+    # sort params biar konsisten
+    try:
+        sorted_params = sorted(params.items())
+        param_str = "&".join([f"{k}={v}" for k, v in sorted_params])
+        return f"{path}?{param_str}"
+    except:
+        return path
 
 
 def get_screener_latest():
-    data = arjum_get("/screener/latest")
+    # Incremental: cek cache dulu
+    cached = get_cached_screener()
+    if cached:
+        data = cached
+    else:
+        data = arjum_get("/screener/latest")
     print(f"DEBUG screener raw type={type(data)} sample={str(data)[:400]}")
     if not data:
         return []
@@ -444,8 +544,19 @@ def get_broker_accumulation(symbol, top=3, days=None):
 
 
 def get_broker_summary(symbol):
-    params_true = {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"}
-    data = arjum_get(f"/broker-summary/{symbol}", params=params_true)
+    # Coba beberapa param biar gak kosong - Arjum kadang net=true kosong, net=false ada data
+    for p in [
+        {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
+        {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
+        {"broker_limit": 20},
+        {}
+    ]:
+        data = arjum_get(f"/broker-summary/{symbol}", params=p)
+        if data and isinstance(data, dict) and (data.get('brokers') or data.get('data')):
+            print(f"DEBUG broker-summary {symbol} success with params {p}")
+            break
+    else:
+        data = None
     
     net_value = 0
     brokers = []
@@ -695,32 +806,30 @@ def get_broker_multi_tf(symbol, hist_df=None):
 def format_top_brokers(brokers, top=3, status="AKUM"):
     """Format top 3 broker codes kayak CC, BK, AK (CC 12B) - bedain AKUM vs DIST"""
     if not brokers or not isinstance(brokers, list) or len(brokers)==0:
-        return "- (Arjum no data)"
-    # Filter valid
-    valid = [b for b in brokers if isinstance(b, dict)]
+        return "-"
+    # Filter valid - jangan filter terlalu ketat, pakai semua yang ada broker_code
+    valid = [b for b in brokers if isinstance(b, dict) and (b.get('broker_code') or b.get('broker'))]
     if not valid:
-        return "- (no data)"
+        valid = [b for b in brokers if isinstance(b, dict)]
+    if not valid:
+        return "-"
+
     
-    # Jika status DIST, urutkan berdasarkan sell_value terbesar, jika AKUM urutkan buy_value/net positif
-    if status == "DIST":
-        # cari penjual terbesar
+    if status == "DIST" or status == "DISTRIB":
         try:
-            sorted_b = sorted(valid, key=lambda x: float(x.get('sell_value',0) or abs(float(x.get('net_value',0))) if float(x.get('net_value',0))<0 else 0), reverse=True)
+            sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('sell_value',0) or x.get('buy_value',0) or 0)), reverse=True)
         except:
             sorted_b = valid
-        # jika sell_value kosong, ambil net negatif
         parts = []
         for b in sorted_b[:top]:
             code = b.get('broker_code') or b.get('broker') or "??"
             sell = float(b.get('sell_value',0) or 0)
+            buy = float(b.get('buy_value',0) or 0)
             net = float(b.get('net_value',0) or 0)
-            # nilai jualan = sell_value atau abs(net) kalau net negatif
-            val = sell if sell!=0 else abs(net) if net<0 else 0
+            val = sell if sell!=0 else abs(net) if net!=0 else buy
             if val==0:
-                # fallback buy kalau memang gak ada sell
-                val = float(b.get('buy_value',0) or 0)
-                if val==0:
-                    continue
+                # tetap tampilkan broker meski 0 biar gak "-"
+                val = abs(net) if net!=0 else 1
             if abs(val)>=1e9:
                 s=f"{val/1e9:.1f}B"
             elif abs(val)>=1e6:
@@ -730,9 +839,8 @@ def format_top_brokers(brokers, top=3, status="AKUM"):
             parts.append(f"{code} {s}")
         return ", ".join(parts) if parts else "-"
     else:
-        # AKUM - buyer
         try:
-            sorted_b = sorted(valid, key=lambda x: float(x.get('buy_value',0) or x.get('net_value',0) or 0), reverse=True)
+            sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('buy_value',0) or 0)), reverse=True)
         except:
             sorted_b = valid
         parts = []
@@ -740,9 +848,8 @@ def format_top_brokers(brokers, top=3, status="AKUM"):
             code = b.get('broker_code') or b.get('broker') or "??"
             buy = float(b.get('buy_value',0) or 0)
             net = float(b.get('net_value',0) or 0)
-            val = buy if buy!=0 else net if net>0 else 0
-            if val==0:
-                continue
+            sell = float(b.get('sell_value',0) or 0)
+            val = buy if buy!=0 else abs(net) if net!=0 else sell if sell!=0 else 1
             if abs(val)>=1e9:
                 s=f"{val/1e9:.1f}B"
             elif abs(val)>=1e6:
@@ -753,11 +860,18 @@ def format_top_brokers(brokers, top=3, status="AKUM"):
         return ", ".join(parts) if parts else "-"
 
 
+
 def get_analysis(symbol):
     data = arjum_get(f"/analysis/{symbol}")
     return data if isinstance(data, dict) else {}
 
 def get_history_pro(symbol, limit=150, timeframe="1d"):
+    # Incremental: cek cache history dulu
+    hist_key = f"{symbol}_{timeframe}_{limit}"
+    cached_hist = get_cached_history(hist_key)
+    if cached_hist is not None:
+        return cached_hist
+
     """
     Multi timeframe support:
     timeframe: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w
