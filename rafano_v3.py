@@ -60,7 +60,10 @@ if not TELEGRAM_BOT_TOKEN:
     print("   -> Atau hardcode di cell: os.environ['TELEGRAM_BOT_TOKEN']='token'")
 
 ARJUM_BASE = "https://stock.arjum.com/api"
-HEADERS_ARJUM = {"X-API-Key": ARJUM_API_KEY, "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+def get_arjum_headers():
+    k = os.getenv("ARJUM_API_KEY") or ARJUM_API_KEY or safe_get_env("ARJUM_API_KEY") or ""
+    return {"X-API-Key": k.strip(), "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+HEADERS_ARJUM = get_arjum_headers()
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 def get_now_wib():
@@ -276,22 +279,33 @@ def is_market_open():
 def arjum_get(path, params=None):
     url = f"{ARJUM_BASE}{path}"
     try:
-        if not ARJUM_API_KEY:
+        # Dynamic API key - baca ulang dari env setiap call
+        api_key = os.getenv("ARJUM_API_KEY") or ARJUM_API_KEY
+        if not api_key:
+            # coba safe_get_env lagi
+            api_key = safe_get_env("ARJUM_API_KEY")
+        if not api_key:
             print(f"❌ ARJUM_API_KEY KOSONG! path={path}")
             return None
-        r = requests.get(url, headers=HEADERS_ARJUM, params=params, timeout=12)
+        headers = {"X-API-Key": api_key, "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, params=params, timeout=12)
         if r.status_code == 200:
             try:
-                return r.json()
-            except:
-                print(f"⚠ arjum_get {path} JSON parse fail, text={r.text[:500]}")
+                j = r.json()
+                # Log untuk BBCA/IBOS biar debug
+                if "BBCA" in path or "IBOS" in path or "broker" in path:
+                    print(f"✅ arjum_get {path} OK keys={list(j.keys()) if isinstance(j, dict) else f'list len={len(j)}'}")
+                return j
+            except Exception as je:
+                print(f"⚠ arjum_get {path} JSON parse fail: {je}, text={r.text[:500]}")
                 return None
         else:
-            # debug untuk semua endpoint biar ketahuan kenapa fallback 5B
-            print(f"⚠ arjum_get {path} params={params} -> {r.status_code} {r.text[:500]}")
+            print(f"⚠ arjum_get {path} params={params} -> {r.status_code} {r.text[:800]}")
             return None
     except Exception as e:
         print(f"arjum_get error {path} params={params}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def get_screener_latest():
@@ -680,60 +694,29 @@ def get_broker_multi_tf(symbol, hist_df=None):
 
 def format_top_brokers(brokers, top=3):
     """Format top 3 broker codes kayak CC, BK, AK (CC 12B)"""
-    if not brokers or not isinstance(brokers, list):
-        return "- (API broker kosong, cek ARJUM_API_KEY)"
-    # Filter brokers yang punya data valid
-    valid_brokers = []
-    for b in brokers:
-        if not isinstance(b, dict):
-            continue
-        net = float(b.get('net_value',0) or b.get('net',0) or b.get('value',0) or 0)
-        buy = float(b.get('buy_value',0) or 0)
-        # kalau net dan buy 0, coba ambil dari raw
-        if net==0 and buy==0:
-            raw = b.get('raw',{})
-            if isinstance(raw, dict):
-                # coba cari angka besar di raw
-                for kk, vv in raw.items():
-                    if isinstance(vv, (int,float)) and abs(vv) > 1e6:
-                        net = float(vv)
-                        break
-        # tetap masukkan walau 0 biar keliatan kodenya, tapi prioritaskan yang >0
-        valid_brokers.append(b)
-    
+    if not brokers or not isinstance(brokers, list) or len(brokers)==0:
+        return "- (Arjum no data, pakai VSA)"
+    valid = [b for b in brokers if isinstance(b, dict) and (float(b.get('net_value',0) or b.get('buy_value',0) or b.get('value',0) or 0) != 0)]
+    if not valid:
+        return "- (Arjum no data, pakai VSA)"
     try:
-        # Sort: net >0 dulu, baru abs net
-        sorted_b = sorted(valid_brokers, key=lambda x: (
-            float(x.get('net_value',0) or x.get('net',0) or x.get('value',0) or x.get('buy_value',0) or 0)
-        ), reverse=True)
-        # kalau semua 0, sort by broker_code aja
-        if all(float(x.get('net_value',0) or 0)==0 for x in sorted_b):
-            # coba sort by buy_value
-            sorted_b = sorted(valid_brokers, key=lambda x: float(x.get('buy_value',0) or 0), reverse=True)
+        sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('buy_value',0) or 0)), reverse=True)
     except:
-        sorted_b = valid_brokers
-    top_b = sorted_b[:top]
+        sorted_b = valid
     parts = []
-    for b in top_b:
-        code = b.get('broker_code') or b.get('broker') or b.get('code') or b.get('name') or b.get('broker_name') or "??"
-        net = b.get('net_value') or b.get('net') or b.get('value') or b.get('buy_value') or 0
-        try:
-            net_f = float(net)
-        except:
-            net_f = 0
-        if abs(net_f) >= 1e9:
-            net_str = f"{net_f/1e9:.1f}B"
-        elif abs(net_f) >= 1e6:
-            net_str = f"{net_f/1e6:.0f}M"
-        elif abs(net_f) >= 1e3:
-            net_str = f"{net_f/1e3:.0f}K"
+    for b in sorted_b[:top]:
+        code = b.get('broker_code') or b.get('broker') or "??"
+        net = float(b.get('net_value',0) or b.get('buy_value',0) or 0)
+        if net==0:
+            continue
+        if abs(net)>=1e9:
+            s=f"{net/1e9:.1f}B"
+        elif abs(net)>=1e6:
+            s=f"{net/1e6:.0f}M"
         else:
-            net_str = f"{net_f:.0f}"
-        # kalau net 0, tandain biar tau API gagal
-        if net_f==0:
-            net_str = "0 (cek log)"
-        parts.append(f"{code} {net_str}")
-    return ", ".join(parts) if parts else "- (no broker data)"
+            s=f"{net:.0f}"
+        parts.append(f"{code} {s}")
+    return ", ".join(parts) if parts else "- (Arjum no data, pakai VSA)"
 
 def get_analysis(symbol):
     data = arjum_get(f"/analysis/{symbol}")
