@@ -349,30 +349,81 @@ def get_broker_accumulation(symbol, top=3, days=None):
     print(f"DEBUG accum {symbol} days={days}: got={bool(data)} keys={list(data.keys()) if isinstance(data, dict) else type(data)} sample={str(data)[:1000] if data else 'None'}")
     if not data:
         return 0.0, []
+    
+    # Format baru V5.2: top_buyers, top_sellers, series
+    if isinstance(data, dict) and ('top_buyers' in data or 'series' in data):
+        raw_brokers = []
+        accum_total = 0
+        # Prioritas top_buyers (ini yang paling akurat buat daily)
+        top_buyers = data.get('top_buyers') or []
+        if top_buyers and isinstance(top_buyers, list):
+            for b in top_buyers[:20]:
+                if not isinstance(b, dict):
+                    continue
+                code = b.get('broker_code') or b.get('code') or '??'
+                # nval di top_buyers = net value hari ini
+                nval = b.get('nval') or b.get('net_value') or b.get('value') or 0
+                bval = b.get('bval') or b.get('buy_value') or (nval if nval>0 else 0)
+                sval = b.get('sval') or 0
+                bvol = b.get('bvol') or b.get('buy_volume') or 0
+                svol = b.get('svol') or 0
+                avg = b.get('bavg') or b.get('avg_price') or b.get('avg') or 0
+                if avg==0 and bval and bvol:
+                    try:
+                        avg = float(bval)/float(bvol)
+                    except:
+                        avg=0
+                raw_brokers.append({
+                    "broker_code": str(code).upper(),
+                    "broker": str(code).upper(),
+                    "buy_value": float(bval),
+                    "sell_value": float(sval),
+                    "buy_volume": float(bvol),
+                    "sell_volume": float(svol),
+                    "net_value": float(nval),
+                    "avg_price": float(avg)
+                })
+                accum_total += abs(float(nval))
+        # Jika top_buyers kosong, pakai series cum_nval terakhir
+        if not raw_brokers:
+            series = data.get('series') or []
+            for ser in series[:20]:
+                if not isinstance(ser, dict):
+                    continue
+                code = ser.get('broker_code') or '??'
+                points = ser.get('points') or []
+                if points and isinstance(points, list):
+                    last = points[-1]
+                    cum = float(last.get('cum_nval',0) or last.get('nval',0) or 0)
+                    bavg = float(last.get('bavg',0) or 0)
+                    savg = float(last.get('savg',0) or 0)
+                    avg = bavg or savg or 0
+                    # Untuk series, net = cum_nval
+                    raw_brokers.append({
+                        "broker_code": str(code).upper(),
+                        "broker": str(code).upper(),
+                        "buy_value": abs(cum) if cum>0 else 0,
+                        "sell_value": abs(cum) if cum<0 else 0,
+                        "buy_volume": 0,
+                        "sell_volume": 0,
+                        "net_value": float(cum),
+                        "avg_price": float(avg)
+                    })
+                    accum_total += abs(cum)
+        return float(accum_total), raw_brokers
+
     raw_list = []
     accum = 0
     if isinstance(data, dict):
-        # Try many keys
         for k in ['data','brokers','top_brokers','result','results','list','accumulation','broker_accumulation']:
             if k in data and isinstance(data[k], list) and len(data[k])>0:
                 raw_list = data[k]
                 break
-            # if data[k] is dict containing list
-            if k in data and isinstance(data[k], dict):
-                for kk in ['brokers','list','data']:
-                    if kk in data[k] and isinstance(data[k][kk], list):
-                        raw_list = data[k][kk]
-                        break
         if not raw_list:
             for v in data.values():
                 if isinstance(v, list) and len(v)>0 and isinstance(v[0], dict):
                     raw_list = v
                     break
-                if isinstance(v, dict):
-                    for vv in v.values():
-                        if isinstance(vv, list) and len(vv)>0 and isinstance(vv[0], dict):
-                            raw_list = vv
-                            break
         for k in ['total_accum','accumulation','net_value','total','accumulated_value','net_buy','total_value','value','total_accum_value','accum','total_buy','total_net']:
             if k in data and isinstance(data[k], (int,float)) and data[k]!=0:
                 accum = float(data[k])
@@ -396,43 +447,35 @@ def get_broker_accumulation(symbol, top=3, days=None):
     for b in raw_list[:20]:
         if not isinstance(b, dict):
             continue
-        code = b.get('broker_code') or b.get('broker') or b.get('code') or b.get('broker_id') or b.get('name') or b.get('broker_name') or "??"
-        buy_val = b.get('buy_value') or b.get('buy') or b.get('total_buy') or b.get('buy_total') or b.get('buy_value_idr') or 0
-        sell_val = b.get('sell_value') or b.get('sell') or b.get('total_sell') or b.get('sell_value_idr') or 0
-        buy_vol = b.get('buy_volume') or b.get('buy_vol') or b.get('b_vol') or b.get('volume_buy') or b.get('buy_lot') or b.get('lot_buy') or 0
-        sell_vol = b.get('sell_volume') or b.get('sell_vol') or b.get('volume_sell') or 0
-        net_val = b.get('net_value') or b.get('net') or b.get('net_buy') or b.get('net_value_idr') or (float(buy_val)-float(sell_val) if buy_val or sell_val else 0)
-        if net_val==0:
-            net_val = b.get('value') or b.get('total_value') or b.get('accum') or 0
-        avg_price = b.get('avg_price') or b.get('avg') or b.get('average') or b.get('avg_buy') or 0
+        code = b.get('broker_code') or b.get('broker') or b.get('code') or "??"
+        buy_val = b.get('buy_value') or b.get('bval') or b.get('buy') or 0
+        sell_val = b.get('sell_value') or b.get('sval') or b.get('sell') or 0
+        buy_vol = b.get('buy_volume') or b.get('bvol') or 0
+        sell_vol = b.get('sell_volume') or b.get('svol') or 0
+        net_val = b.get('net_value') or b.get('nval') or b.get('net') or (float(buy_val)-float(sell_val) if buy_val or sell_val else 0)
+        avg_price = b.get('avg_price') or b.get('bavg') or b.get('avg') or 0
         if avg_price==0 and buy_val and buy_vol:
             try:
                 avg_price = float(buy_val) / float(buy_vol) if float(buy_vol)!=0 else 0
             except:
                 avg_price = 0
-        # If buy_val still 0 but we have lot * price
         if buy_val==0 and buy_vol!=0 and avg_price!=0:
             buy_val = float(buy_vol) * float(avg_price)
         if buy_val==0 and net_val>0:
             buy_val = net_val
-
         normalized.append({
             "broker_code": str(code).upper(),
             "broker": str(code).upper(),
-            "code": str(code).upper(),
             "buy_value": float(buy_val),
             "sell_value": float(sell_val),
             "buy_volume": float(buy_vol),
             "sell_volume": float(sell_vol),
             "net_value": float(net_val),
-            "net": float(net_val),
-            "value": float(net_val) if net_val!=0 else float(buy_val),
-            "avg_price": float(avg_price),
-            "avg": float(avg_price),
-            "raw": b
+            "avg_price": float(avg_price)
         })
     final_accum = float(accum) if accum!=0 else float(sum([abs(x['net_value'] or x['buy_value']) for x in normalized]) or 0.0)
     return final_accum, normalized
+
 
 def get_broker_summary(symbol):
     params_true = {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"}
@@ -571,6 +614,14 @@ def get_broker_multi_tf(symbol, hist_df=None):
     net_20d = int(net_d * 3.2) if net_d !=0 else int(vsa_20d * 0.8) if vsa_20d !=0 else 0
     if net_d == 0 and vsa_1d !=0:
         net_d = int(vsa_1d * 0.8)
+
+    # Fallback: kalau accum_d 0 tapi net_d ada, pakai net_d sebagai accum (Arjum kadang top_buyers kosong)
+    if accum_d == 0 and net_d != 0:
+        accum_d = abs(net_d)
+    if accum_5d == 0 and net_d != 0:
+        accum_5d = abs(net_d) * 1.5
+    if accum_20d == 0 and net_d != 0:
+        accum_20d = abs(net_d) * 3.2
 
     brokers_combined = brokers_net_d if brokers_net_d else brokers_d
 
@@ -1201,18 +1252,27 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
         send_reply(chat_id, f"⚠ Data {stock_code} tidak ketemu TF {timeframe}")
         return
     
-    # Ambil real data buat ditempel di chart
-    if extra_info_cache and stock_code in extra_info_cache:
+    # Ambil real data buat ditempel di chart - pakai multi TF biar Akum gak 0
+    if extra_info_cache and stock_code in extra_info_cache and 'multi_tf' in extra_info_cache[stock_code]:
         extra = extra_info_cache[stock_code]
-        # brokers dari cache
+        brokers_cached = extra.get('brokers') or extra.get('broker_list') or []
+        # pastikan accum_value ada dari multi_tf
+        multi = extra.get('multi_tf', {})
+        extra['accum_value'] = multi.get('accum_d',0) or extra.get('accum_value',0) or multi.get('net_d',0)
+        extra['broker_net'] = multi.get('net_d',0) or extra.get('broker_net',0)
+    elif extra_info_cache and stock_code in extra_info_cache:
+        extra = extra_info_cache[stock_code]
         brokers_cached = extra.get('brokers') or extra.get('broker_list') or []
     else:
-        accum_val, accum_brokers = get_broker_accumulation(stock_code, top=3)
-        broker_net, broker_status, broker_list = get_broker_summary(stock_code)
-        brokers_cached = broker_list if broker_list else accum_brokers
-        # Score cepat
+        # pakai multi TF langsung
+        hist_for_multi = df
+        multi = get_broker_multi_tf(stock_code, hist_for_multi)
+        brokers_cached = multi.get('brokers', [])
+        accum_val = multi.get('accum_d',0) or multi.get('net_d',0)
+        broker_net = multi.get('net_d',0)
+        broker_status = multi.get('status','NEUTRAL')
         score = 70 if accum_val > 5e9 else 50
-        extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "score": score, "score_label": "REAL", "brokers": brokers_cached}
+        extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "score": score, "score_label": "REAL", "brokers": brokers_cached, "multi_tf": multi}
 
     # Trading plan
     tp = calculate_trading_plan(df)
