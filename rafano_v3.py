@@ -176,17 +176,33 @@ def arjum_get(path, params=None):
 
 def get_screener_latest():
     data = arjum_get("/screener/latest")
-    print(f"DEBUG screener raw type={type(data)} sample={str(data)[:300]}")
+    print(f"DEBUG screener raw type={type(data)} sample={str(data)[:400]}")
     if not data:
         return []
     if isinstance(data, dict):
-        # Arjum Pro return bisa {screener: [...]} atau {data:[...]}
+        # Format baru V5.2: {'rows': [{'stock_code':'IBOS', ...}]}
+        if 'rows' in data and isinstance(data['rows'], list) and len(data['rows'])>0:
+            # normalisasi jadi format symbol
+            normalized = []
+            for r in data['rows']:
+                code = r.get('stock_code') or r.get('symbol') or r.get('code') or r.get('stock')
+                if code:
+                    # gabungin sisa data biar score bisa pake bucket dll
+                    item = {'symbol': code.replace(".JK","").upper(), 'raw': r, 'bucket': r.get('bucket',''), 'summary': r.get('summary','')}
+                    normalized.append(item)
+            print(f"  -> V5.2 detected, {len(normalized)} saham: {[x['symbol'] for x in normalized[:10]]}")
+            return normalized
+        # Format lama
         for k in ['data','results','stocks','screener','latest','items']:
             if k in data and isinstance(data[k], list) and len(data[k])>0:
                 return data[k]
         # jika dict tapi values list langsung
-        if len(data)>0 and isinstance(list(data.values())[0], list):
-            return list(data.values())[0]
+        try:
+            first_val = list(data.values())[0]
+            if isinstance(first_val, list) and len(first_val)>0:
+                return first_val
+        except:
+            pass
         return data.get('data') or data.get('results') or data.get('stocks') or []
     return data if isinstance(data, list) else []
 
