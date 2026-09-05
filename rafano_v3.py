@@ -597,7 +597,6 @@ def get_broker_multi_tf(symbol, hist_df=None):
             vsa_1d = float(hist_df['Net_Val_VSA'].iloc[-1]) if len(hist_df)>=1 else 0
             vsa_5d = float(hist_df['Net_Val_VSA'].tail(5).sum())
             vsa_20d = float(hist_df['Net_Val_VSA'].tail(20).sum())
-            # fallback kalau API gagal (accum masih 5B)
             if abs(accum_5d - 5_000_000_000) < 1000000 or accum_5d==1:
                 if vsa_5d !=0:
                     accum_5d = abs(vsa_5d) * 1.2
@@ -610,18 +609,72 @@ def get_broker_multi_tf(symbol, hist_df=None):
         except Exception as e:
             print(f"VSA calc error {symbol}: {e}")
     
-    net_5d = int(net_d * 1.5) if net_d !=0 else int(vsa_5d * 0.8) if vsa_5d !=0 else 0
-    net_20d = int(net_d * 3.2) if net_d !=0 else int(vsa_20d * 0.8) if vsa_20d !=0 else 0
-    if net_d == 0 and vsa_1d !=0:
-        net_d = int(vsa_1d * 0.8)
+    # Helper hitung Buy vs Sell top3
+    def calc_buy_sell_status(brokers_list):
+        if not brokers_list or len(brokers_list)==0:
+            return 0, 0, 0, "NEUTRAL"
+        # ambil top3 berdasarkan net_value
+        try:
+            sorted_b = sorted(brokers_list, key=lambda x: float(x.get('net_value',0) or x.get('buy_value',0) or 0), reverse=True)
+        except:
+            sorted_b = brokers_list
+        top3 = sorted_b[:3]
+        buy_sum = sum([float(b.get('buy_value',0) or b.get('bval',0) or 0) for b in top3])
+        sell_sum = sum([float(b.get('sell_value',0) or b.get('sval',0) or 0) for b in top3])
+        net_sum = sum([float(b.get('net_value',0) or b.get('nval',0) or 0) for b in top3])
+        # jika buy_value kosong tapi net ada, pakai net sebagai acuan
+        if buy_sum==0 and sell_sum==0:
+            if net_sum>0:
+                buy_sum = net_sum
+                sell_sum = 0
+            elif net_sum<0:
+                buy_sum = 0
+                sell_sum = abs(net_sum)
+        if buy_sum > sell_sum:
+            status = "AKUM"
+        elif buy_sum < sell_sum:
+            status = "DIST"
+        else:
+            status = "NEUTRAL"
+        return buy_sum, sell_sum, net_sum, status
 
-    # Fallback: kalau accum_d 0 tapi net_d ada, pakai net_d sebagai accum (Arjum kadang top_buyers kosong)
-    if accum_d == 0 and net_d != 0:
-        accum_d = abs(net_d)
-    if accum_5d == 0 and net_d != 0:
-        accum_5d = abs(net_d) * 1.5
-    if accum_20d == 0 and net_d != 0:
-        accum_20d = abs(net_d) * 3.2
+    # Daily status dari broker_summary (real)
+    buy_d, sell_d, net_d_calc, status_d_new = calc_buy_sell_status(brokers_net_d if brokers_net_d else brokers_d)
+    # Jika net_d dari summary ada, pakai itu untuk net
+    if net_d !=0:
+        net_d_calc = net_d
+        # status_d dari net_d
+        if status_d_new=="NEUTRAL":
+            status_d_new = "AKUM" if net_d>0 else "DIST" if net_d<0 else "NEUTRAL"
+
+    # 5D dan 20D status dari accum (top_buyers)
+    buy_5d, sell_5d, net_5d_calc, status_5d = calc_buy_sell_status(brokers_5d if brokers_5d else brokers_net_d)
+    buy_20d, sell_20d, net_20d_calc, status_20d = calc_buy_sell_status(brokers_20d if brokers_20d else brokers_net_d)
+
+    # Fallback logic lama kalau masih 0
+    net_5d = int(net_d * 1.5) if net_d !=0 else int(vsa_5d * 0.8) if vsa_5d !=0 else int(net_5d_calc) if net_5d_calc!=0 else 0
+    net_20d = int(net_d * 3.2) if net_d !=0 else int(vsa_20d * 0.8) if vsa_20d !=0 else int(net_20d_calc) if net_20d_calc!=0 else 0
+    if net_d == 0 and vsa_1d !=0:
+        net_d_calc = int(vsa_1d * 0.8)
+
+    # Akum = buy_sum top3, bukan abs(net) - ini sesuai request user
+    if accum_d == 0 and buy_d !=0:
+        accum_d = buy_d
+    elif accum_d == 0 and net_d_calc !=0:
+        accum_d = abs(net_d_calc)
+    if accum_5d == 0:
+        accum_5d = buy_5d if buy_5d!=0 else abs(net_5d)
+    if accum_20d == 0:
+        accum_20d = buy_20d if buy_20d!=0 else abs(net_20d)
+
+    # Final net pakai yang sudah dihitung
+    if net_d_calc !=0:
+        net_d = net_d_calc
+    # Untuk 5D 20D kalau status masih neutral tapi net ada, tentukan status
+    if status_5d=="NEUTRAL" and net_5d!=0:
+        status_5d = "AKUM" if net_5d>0 else "DIST"
+    if status_20d=="NEUTRAL" and net_20d!=0:
+        status_20d = "AKUM" if net_20d>0 else "DIST"
 
     brokers_combined = brokers_net_d if brokers_net_d else brokers_d
 
@@ -633,6 +686,12 @@ def get_broker_multi_tf(symbol, hist_df=None):
         "accum_d": float(accum_d),
         "accum_5d": float(accum_5d),
         "accum_20d": float(accum_20d),
+        "buy_d": float(buy_d),
+        "sell_d": float(sell_d),
+        "buy_5d": float(buy_5d),
+        "sell_5d": float(sell_5d),
+        "buy_20d": float(buy_20d),
+        "sell_20d": float(sell_20d),
         "net_d": float(net_d),
         "net_5d": float(net_5d),
         "net_20d": float(net_20d),
@@ -640,37 +699,78 @@ def get_broker_multi_tf(symbol, hist_df=None):
         "avg_5d": float(avg_5d),
         "avg_20d": float(avg_20d),
         "brokers": brokers_combined,
-        "status": status_d,
+        "brokers_5d": brokers_5d,
+        "brokers_20d": brokers_20d,
+        "status": status_d_new,
+        "status_d": status_d_new,
+        "status_5d": status_5d,
+        "status_20d": status_20d,
         "vsa_1d": vsa_1d,
         "vsa_5d": vsa_5d,
         "vsa_20d": vsa_20d
     }
 
-def format_top_brokers(brokers, top=3):
-    """Format top 3 broker codes kayak CC, BK, AK (CC 12B)"""
+
+def format_top_brokers(brokers, top=3, status="AKUM"):
+    """Format top 3 broker codes kayak CC, BK, AK (CC 12B) - bedain AKUM vs DIST"""
     if not brokers or not isinstance(brokers, list) or len(brokers)==0:
-        return "- (Arjum no data, pakai VSA)"
-    valid = [b for b in brokers if isinstance(b, dict) and (float(b.get('net_value',0) or b.get('buy_value',0) or b.get('value',0) or 0) != 0)]
+        return "- (Arjum no data)"
+    # Filter valid
+    valid = [b for b in brokers if isinstance(b, dict)]
     if not valid:
-        return "- (Arjum no data, pakai VSA)"
-    try:
-        sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('buy_value',0) or 0)), reverse=True)
-    except:
-        sorted_b = valid
-    parts = []
-    for b in sorted_b[:top]:
-        code = b.get('broker_code') or b.get('broker') or "??"
-        net = float(b.get('net_value',0) or b.get('buy_value',0) or 0)
-        if net==0:
-            continue
-        if abs(net)>=1e9:
-            s=f"{net/1e9:.1f}B"
-        elif abs(net)>=1e6:
-            s=f"{net/1e6:.0f}M"
-        else:
-            s=f"{net:.0f}"
-        parts.append(f"{code} {s}")
-    return ", ".join(parts) if parts else "- (Arjum no data, pakai VSA)"
+        return "- (no data)"
+    
+    # Jika status DIST, urutkan berdasarkan sell_value terbesar, jika AKUM urutkan buy_value/net positif
+    if status == "DIST":
+        # cari penjual terbesar
+        try:
+            sorted_b = sorted(valid, key=lambda x: float(x.get('sell_value',0) or abs(float(x.get('net_value',0))) if float(x.get('net_value',0))<0 else 0), reverse=True)
+        except:
+            sorted_b = valid
+        # jika sell_value kosong, ambil net negatif
+        parts = []
+        for b in sorted_b[:top]:
+            code = b.get('broker_code') or b.get('broker') or "??"
+            sell = float(b.get('sell_value',0) or 0)
+            net = float(b.get('net_value',0) or 0)
+            # nilai jualan = sell_value atau abs(net) kalau net negatif
+            val = sell if sell!=0 else abs(net) if net<0 else 0
+            if val==0:
+                # fallback buy kalau memang gak ada sell
+                val = float(b.get('buy_value',0) or 0)
+                if val==0:
+                    continue
+            if abs(val)>=1e9:
+                s=f"{val/1e9:.1f}B"
+            elif abs(val)>=1e6:
+                s=f"{val/1e6:.0f}M"
+            else:
+                s=f"{val:.0f}"
+            parts.append(f"{code} {s}")
+        return ", ".join(parts) if parts else "-"
+    else:
+        # AKUM - buyer
+        try:
+            sorted_b = sorted(valid, key=lambda x: float(x.get('buy_value',0) or x.get('net_value',0) or 0), reverse=True)
+        except:
+            sorted_b = valid
+        parts = []
+        for b in sorted_b[:top]:
+            code = b.get('broker_code') or b.get('broker') or "??"
+            buy = float(b.get('buy_value',0) or 0)
+            net = float(b.get('net_value',0) or 0)
+            val = buy if buy!=0 else net if net>0 else 0
+            if val==0:
+                continue
+            if abs(val)>=1e9:
+                s=f"{val/1e9:.1f}B"
+            elif abs(val)>=1e6:
+                s=f"{val/1e6:.0f}M"
+            else:
+                s=f"{val:.0f}"
+            parts.append(f"{code} {s}")
+        return ", ".join(parts) if parts else "-"
+
 
 def get_analysis(symbol):
     data = arjum_get(f"/analysis/{symbol}")
@@ -1216,23 +1316,48 @@ def broadcast_v3(signals):
         reasons_str = " | ".join(item.get('reasons', [])[:3])
         multi = item.get('multi_tf') or {}
         if multi:
-            daily_str = f"Daily: Akum {fmt(multi.get('accum_d',0))} | Net {fmt(multi.get('net_d',0))} | Avg {fmt_avg(multi.get('avg_d',0))}"
-            weekly_str = f"Weekly 5D: Akum {fmt(multi.get('accum_5d',0))} | Net {fmt(multi.get('net_5d',0))} | Avg {fmt_avg(multi.get('avg_5d',0))}"
-            monthly_str = f"Monthly 20D: Akum {fmt(multi.get('accum_20d',0))} | Net {fmt(multi.get('net_20d',0))} | Avg {fmt_avg(multi.get('avg_20d',0))}"
+            st_d = multi.get('status_d','NEUTRAL')
+            st_5d = multi.get('status_5d','NEUTRAL')
+            st_20d = multi.get('status_20d','NEUTRAL')
+            emoji_d = "🟢" if st_d=="AKUM" else "🔴" if st_d=="DIST" else "⚪"
+            emoji_5d = "🟢" if st_5d=="AKUM" else "🔴" if st_5d=="DIST" else "⚪"
+            emoji_20d = "🟢" if st_20d=="AKUM" else "🔴" if st_20d=="DIST" else "⚪"
+            # Brokers per TF
+            brokers_d = multi.get('brokers', []) or item.get('brokers', []) or []
+            brokers_5d = multi.get('brokers_5d', []) or brokers_d
+            brokers_20d = multi.get('brokers_20d', []) or brokers_d
+            top_d = format_top_brokers(brokers_d, 3, st_d)
+            top_5d = format_top_brokers(brokers_5d, 3, st_5d)
+            top_20d = format_top_brokers(brokers_20d, 3, st_20d)
+            label_d = "Top Buy" if st_d=="AKUM" else "Top Sell" if st_d=="DIST" else "Top"
+            label_5d = "Top Buy" if st_5d=="AKUM" else "Top Sell" if st_5d=="DIST" else "Top"
+            label_20d = "Top Buy" if st_20d=="AKUM" else "Top Sell" if st_20d=="DIST" else "Top"
+            daily_str = f"{emoji_d} Daily: {st_d} | Buy {fmt(multi.get('buy_d',0))} Sell {fmt(multi.get('sell_d',0))} Net {fmt(multi.get('net_d',0))} | Avg {fmt_avg(multi.get('avg_d',0))}"
+            daily_top = f"   |  └ {label_d}: {top_d}"
+            weekly_str = f"{emoji_5d} Weekly 5D: {st_5d} | Buy {fmt(multi.get('buy_5d',0))} Sell {fmt(multi.get('sell_5d',0))} Net {fmt(multi.get('net_5d',0))} | Avg {fmt_avg(multi.get('avg_5d',0))}"
+            weekly_top = f"   |  └ {label_5d}: {top_5d}"
+            monthly_str = f"{emoji_20d} Monthly 20D: {st_20d} | Buy {fmt(multi.get('buy_20d',0))} Sell {fmt(multi.get('sell_20d',0))} Net {fmt(multi.get('net_20d',0))} | Avg {fmt_avg(multi.get('avg_20d',0))}"
+            monthly_top = f"   |  └ {label_20d}: {top_20d}"
         else:
             daily_str = f"Akum: {fmt(item.get('accum_value',0))} | Net: {fmt(item.get('broker_net',0))}"
             weekly_str = ""
             monthly_str = ""
-        brokers = item.get('brokers', []) or item.get('broker_list', [])
-        top_broker_str = format_top_brokers(brokers, 3)
+            daily_top = ""
+            weekly_top = ""
+            monthly_top = ""
         item_str = f"{idx}. *{item['symbol']}* -- {item['close']} ({item['change_pct']:+.2f}%)\n"
         item_str += f"   |- Score: {item['score']}% ({item['score_label']})\n"
         item_str += f"   |- {daily_str}\n"
+        if daily_top:
+            item_str += f"{daily_top}\n"
         if weekly_str:
             item_str += f"   |- {weekly_str}\n"
+            if weekly_top:
+                item_str += f"{weekly_top}\n"
         if monthly_str:
             item_str += f"   |- {monthly_str}\n"
-        item_str += f"   |- Top Brokers: {top_broker_str}\n"
+            if monthly_top:
+                item_str += f"{monthly_top}\n"
         item_str += f"   +- {reasons_str}\n\n"
         keyboard.append([{"text": f"Pro Chart {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
         if len(msg) + len(item_str) > 3500:
@@ -1276,32 +1401,89 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
 
     # Trading plan
     tp = calculate_trading_plan(df)
-    top_broker_str = format_top_brokers(brokers_cached if 'brokers_cached' in locals() else extra.get('brokers', []), 3)
+
+    # Ambil multi TF untuk caption
+    multi = extra.get('multi_tf') or {}
+    if not multi and 'multi' in locals():
+        multi = locals().get('multi', {})
+
+    # Top brokers per TF untuk chart
+    if multi:
+        brokers_d = multi.get('brokers', []) or brokers_cached
+        brokers_5d = multi.get('brokers_5d', []) or brokers_d
+        brokers_20d = multi.get('brokers_20d', []) or brokers_d
+        st_d_tmp = multi.get('status_d','AKUM')
+        st_5d_tmp = multi.get('status_5d','AKUM')
+        st_20d_tmp = multi.get('status_20d','AKUM')
+        top_d_str = format_top_brokers(brokers_d, 3, st_d_tmp)
+        top_5d_str = format_top_brokers(brokers_5d, 3, st_5d_tmp)
+        top_20d_str = format_top_brokers(brokers_20d, 3, st_20d_tmp)
+    else:
+        top_d_str = format_top_brokers(brokers_cached if 'brokers_cached' in locals() else extra.get('brokers', []), 3, extra.get('broker_status','AKUM'))
+        top_5d_str = ""
+        top_20d_str = ""
 
     chart_file = f"chart_{stock_code.upper()}_{timeframe}_{int(time.time())}.png"
     try:
         file_path = generate_pro_chart(df=df, symbol=stock_code.upper(), timeframe=timeframe, sector_info=f"{stock_code.upper()} | IHSG", output_filename=chart_file, extra_info=extra)
-        if tp:
-            caption = (
-                f"*{stock_code.upper()}* — {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
-                f"Score REAL: {extra.get('score',0)}% | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
-                f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
-                f"Top Brokers: {top_broker_str}\n"
-                f"Timeframe: {timeframe.upper()}\n"
-                f"──────────────────\n"
-                f"🎯 *TRADING PLAN*\n"
-                f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
-                f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
-                f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
-            )
+        if multi:
+            st_d = multi.get('status_d','AKUM' if multi.get('buy_d',0)>multi.get('sell_d',0) else 'DIST')
+            st_5d = multi.get('status_5d','')
+            st_20d = multi.get('status_20d','')
+            daily_line = f"{st_d} | Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} Net {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f} | {top_d_str}"
+            weekly_line = f"{st_5d} | Buy {format_large_number(multi.get('buy_5d',0),True)} Sell {format_large_number(multi.get('sell_5d',0),True)} Net {format_large_number(multi.get('net_5d',0),True)} Avg {multi.get('avg_5d',0):.0f} | {top_5d_str}"
+            monthly_line = f"{st_20d} | Buy {format_large_number(multi.get('buy_20d',0),True)} Sell {format_large_number(multi.get('sell_20d',0),True)} Net {format_large_number(multi.get('net_20d',0),True)} Avg {multi.get('avg_20d',0):.0f} | {top_20d_str}"
         else:
-            caption = (
-                f"*{stock_code.upper()}* — {safe_int(df['Close'].iloc[-1])}\n"
-                f"Score REAL: {extra.get('score',0)}% | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
-                f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
-                f"Top Brokers: {top_broker_str}\n"
-                f"Timeframe: {timeframe.upper()}"
-            )
+            daily_line = f"Akum: {format_large_number(extra.get('accum_value',0), True)} Net: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})"
+            weekly_line = ""
+            monthly_line = ""
+
+        if tp:
+            if multi:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
+                    f"Score REAL: {extra.get('score',0)}%\n"
+                    f"Daily: {daily_line}\n"
+                    f"Weekly 5D: {weekly_line}\n"
+                    f"Monthly 20D: {monthly_line}\n"
+                    f"Timeframe: {timeframe.upper()}\n"
+                    f"------------------\n"
+                    f"TRADING PLAN\n"
+                    f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
+                    f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
+                    f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
+                )
+            else:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
+                    f"Score REAL: {extra.get('score',0)}% | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
+                    f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
+                    f"Top Brokers: {top_broker_str}\n"
+                    f"Timeframe: {timeframe.upper()}\n"
+                    f"------------------\n"
+                    f"TRADING PLAN\n"
+                    f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
+                    f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
+                    f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
+                )
+        else:
+            if multi:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\n"
+                    f"Score REAL: {extra.get('score',0)}%\n"
+                    f"Daily: {daily_line}\n"
+                    f"Weekly 5D: {weekly_line}\n"
+                    f"Monthly 20D: {monthly_line}\n"
+                    f"Timeframe: {timeframe.upper()}"
+                )
+            else:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\n"
+                    f"Score REAL: {extra.get('score',0)}% | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
+                    f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
+                    f"Top Brokers: {top_broker_str}\n"
+                    f"Timeframe: {timeframe.upper()}"
+                )
         send_photo_reply(chat_id, file_path, caption=caption)
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -1411,23 +1593,49 @@ def telegram_bot_listener():
                                     top_broker_str = format_top_brokers(brokers, 3)
                                     reasons_str = " | ".join(item.get('reasons', [])[:2])
                                     if multi:
-                                        daily_str = f"Daily: Akum {fmt(multi.get('accum_d',0))} | Net {fmt(multi.get('net_d',0))} | Avg {fmt_avg(multi.get('avg_d',0))}"
-                                        weekly_str = f"Weekly 5D: Akum {fmt(multi.get('accum_5d',0))} | Net {fmt(multi.get('net_5d',0))} | Avg {fmt_avg(multi.get('avg_5d',0))}"
-                                        monthly_str = f"Monthly 20D: Akum {fmt(multi.get('accum_20d',0))} | Net {fmt(multi.get('net_20d',0))} | Avg {fmt_avg(multi.get('avg_20d',0))}"
+                                        st_d = multi.get('status_d','NEUTRAL')
+                                        st_5d = multi.get('status_5d','NEUTRAL')
+                                        st_20d = multi.get('status_20d','NEUTRAL')
+                                        emoji_d = "🟢" if st_d=="AKUM" else "🔴" if st_d=="DIST" else "⚪"
+                                        emoji_5d = "🟢" if st_5d=="AKUM" else "🔴" if st_5d=="DIST" else "⚪"
+                                        emoji_20d = "🟢" if st_20d=="AKUM" else "🔴" if st_20d=="DIST" else "⚪"
+                                        brokers_d = multi.get('brokers', []) or item.get('brokers', []) or []
+                                        brokers_5d = multi.get('brokers_5d', []) or brokers_d
+                                        brokers_20d = multi.get('brokers_20d', []) or brokers_d
+                                        top_d = format_top_brokers(brokers_d, 3, st_d)
+                                        top_5d = format_top_brokers(brokers_5d, 3, st_5d)
+                                        top_20d = format_top_brokers(brokers_20d, 3, st_20d)
+                                        label_d = "Top Buy" if st_d=="AKUM" else "Top Sell" if st_d=="DIST" else "Top"
+                                        label_5d = "Top Buy" if st_5d=="AKUM" else "Top Sell" if st_5d=="DIST" else "Top"
+                                        label_20d = "Top Buy" if st_20d=="AKUM" else "Top Sell" if st_20d=="DIST" else "Top"
+                                        daily_str = f"{emoji_d} Daily: {st_d} | Buy {fmt(multi.get('buy_d',0))} Sell {fmt(multi.get('sell_d',0))} Net {fmt(multi.get('net_d',0))} | Avg {fmt_avg(multi.get('avg_d',0))}"
+                                        daily_top = f"   |  └ {label_d}: {top_d}"
+                                        weekly_str = f"{emoji_5d} Weekly 5D: {st_5d} | Buy {fmt(multi.get('buy_5d',0))} Sell {fmt(multi.get('sell_5d',0))} Net {fmt(multi.get('net_5d',0))} | Avg {fmt_avg(multi.get('avg_5d',0))}"
+                                        weekly_top = f"   |  └ {label_5d}: {top_5d}"
+                                        monthly_str = f"{emoji_20d} Monthly 20D: {st_20d} | Buy {fmt(multi.get('buy_20d',0))} Sell {fmt(multi.get('sell_20d',0))} Net {fmt(multi.get('net_20d',0))} | Avg {fmt_avg(multi.get('avg_20d',0))}"
+                                        monthly_top = f"   |  └ {label_20d}: {top_20d}"
                                     else:
                                         daily_str = f"Akum {fmt(item.get('accum_value',0))} | Net {fmt(item.get('broker_net',0))}"
                                         weekly_str = ""
                                         monthly_str = ""
+                                        daily_top = ""
+                                        weekly_top = ""
+                                        monthly_top = ""
                                     tp = item.get('trading_plan')
                                     tp_line = f"Entry {tp['entry']} TP1 {tp['tp1']} SL {tp['sl']}" if tp else reasons_str
                                     item_str = f"{idx}. *{item['symbol']}* -- {item.get('close',0)} ({item.get('change_pct',0):+.2f}%)\n"
                                     item_str += f"   |- Score: {item['score']}% ({item.get('score_label','')})\n"
                                     item_str += f"   |- {daily_str}\n"
+                                    if 'daily_top' in locals() and daily_top:
+                                        item_str += f"{daily_top}\n"
                                     if weekly_str:
                                         item_str += f"   |- {weekly_str}\n"
+                                        if 'weekly_top' in locals() and weekly_top:
+                                            item_str += f"{weekly_top}\n"
                                     if monthly_str:
                                         item_str += f"   |- {monthly_str}\n"
-                                    item_str += f"   |- Top Brokers: {top_broker_str}\n"
+                                        if 'monthly_top' in locals() and monthly_top:
+                                            item_str += f"{monthly_top}\n"
                                     item_str += f"   +- {tp_line}\n\n"
                                     kb.append([{"text": f"Pro Chart {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
                                     if len(msg) + len(item_str) > 3500:
