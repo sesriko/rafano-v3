@@ -1,0 +1,8 @@
+.env
+*.png
+__pycache__/
+.ipynb_checkpoints/
+chart_*.png
+arjum_*.json
+cooldown.json
+.DS_Store
