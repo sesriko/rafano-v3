@@ -1398,10 +1398,38 @@ def telegram_bot_listener():
                                 msg = header
                                 kb = []
                                 for idx, item in enumerate(filt,1):
+                                    def fmt(v):
+                                        return format_large_number(v, True)
+                                    def fmt_avg(v):
+                                        try:
+                                            fv = float(v)
+                                            return f"{fv:.0f}" if fv >= 100 else f"{fv:.1f}"
+                                        except:
+                                            return "0"
+                                    multi = item.get('multi_tf') or {}
+                                    brokers = item.get('brokers', []) or []
+                                    top_broker_str = format_top_brokers(brokers, 3)
+                                    reasons_str = " | ".join(item.get('reasons', [])[:2])
+                                    if multi:
+                                        daily_str = f"Daily: Akum {fmt(multi.get('accum_d',0))} | Net {fmt(multi.get('net_d',0))} | Avg {fmt_avg(multi.get('avg_d',0))}"
+                                        weekly_str = f"Weekly 5D: Akum {fmt(multi.get('accum_5d',0))} | Net {fmt(multi.get('net_5d',0))} | Avg {fmt_avg(multi.get('avg_5d',0))}"
+                                        monthly_str = f"Monthly 20D: Akum {fmt(multi.get('accum_20d',0))} | Net {fmt(multi.get('net_20d',0))} | Avg {fmt_avg(multi.get('avg_20d',0))}"
+                                    else:
+                                        daily_str = f"Akum {fmt(item.get('accum_value',0))} | Net {fmt(item.get('broker_net',0))}"
+                                        weekly_str = ""
+                                        monthly_str = ""
                                     tp = item.get('trading_plan')
-                                    tp_line = f" | Plan Entry {tp['entry']} TP1 {tp['tp1']} SL {tp['sl']}" if tp else ""
-                                    item_str = f"{idx}. *{item['symbol']}* {item['score']}% Akum:{format_large_number(item['accum_value'],True)} Net:{format_large_number(item['broker_net'],True)}{tp_line}\n"
-                                    kb.append([{"text": f"📈 {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
+                                    tp_line = f"Entry {tp['entry']} TP1 {tp['tp1']} SL {tp['sl']}" if tp else reasons_str
+                                    item_str = f"{idx}. *{item['symbol']}* -- {item.get('close',0)} ({item.get('change_pct',0):+.2f}%)\n"
+                                    item_str += f"   |- Score: {item['score']}% ({item.get('score_label','')})\n"
+                                    item_str += f"   |- {daily_str}\n"
+                                    if weekly_str:
+                                        item_str += f"   |- {weekly_str}\n"
+                                    if monthly_str:
+                                        item_str += f"   |- {monthly_str}\n"
+                                    item_str += f"   |- Top Brokers: {top_broker_str}\n"
+                                    item_str += f"   +- {tp_line}\n\n"
+                                    kb.append([{"text": f"Pro Chart {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
                                     if len(msg) + len(item_str) > 3500:
                                         send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb})
                                         msg = item_str
