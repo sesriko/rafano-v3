@@ -22,6 +22,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- AUTO LOAD DARI GOOGLE COLAB SECRETS (biar gak input manual) ---
+try:
+    from google.colab import userdata
+    # Coba ambil dari Colab Secrets jika ada, timpa os.environ
+    for k in ["TELEGRAM_BOT_TOKEN", "TARGET_CHAT_ID", "ARJUM_API_KEY"]:
+        try:
+            v = userdata.get(k)
+            if v:
+                os.environ[k] = v
+        except:
+            pass
+except:
+    pass # bukan di Colab, skip
+
 TIMEZONE_WIB = pytz.timezone('Asia/Jakarta')
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
@@ -722,7 +736,8 @@ def telegram_bot_listener():
                                     for top in filt[:3]:
                                         process_chart_request(target_chat, top['symbol'], "1d", LAST_SIGNALS_CACHE)
                                         time.sleep(1)
-                            threading.Thread(target=manual_scan, args=(first_word=="/scanpro", target_chat=chat_id)).start()
+                            is_pro_flag = (first_word == "/scanpro")
+                            threading.Thread(target=manual_scan, args=(is_pro_flag, chat_id)).start()
         except Exception as e:
             print(f"Listener error: {e}")
             time.sleep(3)
