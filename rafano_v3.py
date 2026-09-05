@@ -22,44 +22,48 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- AUTO LOAD DARI GOOGLE COLAB SECRETS (biar gak input manual) ---
-try:
-    from google.colab import userdata
-    # Coba ambil dari Colab Secrets jika ada, timpa os.environ
-    for k in ["TELEGRAM_BOT_TOKEN", "TARGET_CHAT_ID", "ARJUM_API_KEY"]:
-        try:
-            v = userdata.get(k)
-            if v:
-                os.environ[k] = v
-        except:
-            pass
-except:
-    pass # bukan di Colab, skip
-
-TIMEZONE_WIB = pytz.timezone('Asia/Jakarta')
-# Debug: cek apakah secrets kebaca
-try:
-    from google.colab import userdata
-    print(f"🔑 DEBUG Secrets - TOKEN: {len(userdata.get('TELEGRAM_BOT_TOKEN') or '')} chars, CHAT_ID: {len(userdata.get('TARGET_CHAT_ID') or '')} chars, ARJUM: {len(userdata.get('ARJUM_API_KEY') or '')} chars")
-except Exception as e:
-    print(f"🔑 DEBUG Secrets error: {e}")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
-ARJUM_API_KEY = os.getenv("ARJUM_API_KEY")
-
-print(f"🔑 ENV Loaded - TOKEN exists={bool(TELEGRAM_BOT_TOKEN)} len={len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}, CHAT_ID={TARGET_CHAT_ID}, ARJUM exists={bool(ARJUM_API_KEY)}")
-if not TELEGRAM_BOT_TOKEN:
-    print("❌ FATAL: TELEGRAM_BOT_TOKEN KOSONG - Cek Secrets toggle Notebook access!")
-    # Coba load ulang paksa
+# ========== COLAB SECRETS FIX - ANTI JSON ERROR ==========
+def get_secret_robust(key):
     try:
         from google.colab import userdata
-        TELEGRAM_BOT_TOKEN = userdata.get('TELEGRAM_BOT_TOKEN')
-        TARGET_CHAT_ID = userdata.get('TARGET_CHAT_ID')
-        ARJUM_API_KEY = userdata.get('ARJUM_API_KEY')
-        print(f"🔧 Retry load - TOKEN len={len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}")
-    except Exception as e:
-        print(f"Retry fail: {e}")
+        try:
+            v = userdata.get(key)
+            if v:
+                v = str(v).strip()
+                if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+                    v = v[1:-1].strip()
+                if v.startswith("{") and v.endswith("}"):
+                    try:
+                        import json
+                        j = json.loads(v)
+                        for vv in j.values():
+                            if isinstance(vv, str) and len(vv) > 5:
+                                v = vv
+                                break
+                    except:
+                        pass
+                if v:
+                    os.environ[key] = v
+                    return v
+        except Exception as e:
+            print(f"⚠ get_secret {key} userdata error: {e}")
+    except:
+        pass
+    v = os.getenv(key)
+    if v:
+        return str(v).strip().strip('"').strip("'")
+    return None
+
+for k in ["TELEGRAM_BOT_TOKEN", "TARGET_CHAT_ID", "ARJUM_API_KEY"]:
+    get_secret_robust(k)
+
+TIMEZONE_WIB = pytz.timezone('Asia/Jakarta')
+
+TELEGRAM_BOT_TOKEN = get_secret_robust("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+TARGET_CHAT_ID = get_secret_robust("TARGET_CHAT_ID") or os.getenv("TARGET_CHAT_ID")
+ARJUM_API_KEY = get_secret_robust("ARJUM_API_KEY") or os.getenv("ARJUM_API_KEY")
+
+print(f"🔑 ENV Loaded - TOKEN exists={bool(TELEGRAM_BOT_TOKEN)} len={len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}, CHAT_ID={TARGET_CHAT_ID}, ARJUM exists={bool(ARJUM_API_KEY)} len={len(ARJUM_API_KEY) if ARJUM_API_KEY else 0}")
 
 ARJUM_BASE = "https://stock.arjum.com/api"
 HEADERS_ARJUM = {"X-API-Key": ARJUM_API_KEY, "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
