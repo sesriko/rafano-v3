@@ -332,85 +332,73 @@ def get_broker_accumulation(symbol, top=3, days=None):
         params["days"] = days
         params["period"] = days
     data = arjum_get(f"/broker-accumulation/{symbol}", params=params)
-    print(f"DEBUG accum {symbol} days={days}: got={bool(data)} sample={str(data)[:800] if data else 'None'}")
+    print(f"DEBUG accum {symbol} days={days}: got={bool(data)} keys={list(data.keys()) if isinstance(data, dict) else type(data)} sample={str(data)[:1000] if data else 'None'}")
     if not data:
-        base = 5_000_000_000
-        if days == 5:
-            base = int(base * 1.8)
-        elif days == 20:
-            base = int(base * 4.5)
-        return base, []
-    accum = 0
-    brokers = []
-    # Normalisasi data jadi list
+        return 0.0, []
     raw_list = []
+    accum = 0
     if isinstance(data, dict):
-        # coba semua kemungkinan key yang isinya list broker
-        for k in ['data','brokers','top_brokers','result','results','list']:
+        # Try many keys
+        for k in ['data','brokers','top_brokers','result','results','list','accumulation','broker_accumulation']:
             if k in data and isinstance(data[k], list) and len(data[k])>0:
                 raw_list = data[k]
                 break
+            # if data[k] is dict containing list
+            if k in data and isinstance(data[k], dict):
+                for kk in ['brokers','list','data']:
+                    if kk in data[k] and isinstance(data[k][kk], list):
+                        raw_list = data[k][kk]
+                        break
         if not raw_list:
-            # kalau dict tapi isinya langsung broker dicts di values?
-            # coba ambil first list value
             for v in data.values():
                 if isinstance(v, list) and len(v)>0 and isinstance(v[0], dict):
                     raw_list = v
                     break
-        # total accum dari root
-        for k in ['total_accum','accumulation','net_value','total','accumulated_value','net_buy','total_value','value','total_accum_value','accum']:
+                if isinstance(v, dict):
+                    for vv in v.values():
+                        if isinstance(vv, list) and len(vv)>0 and isinstance(vv[0], dict):
+                            raw_list = vv
+                            break
+        for k in ['total_accum','accumulation','net_value','total','accumulated_value','net_buy','total_value','value','total_accum_value','accum','total_buy','total_net']:
             if k in data and isinstance(data[k], (int,float)) and data[k]!=0:
                 accum = float(data[k])
                 break
-        brokers = raw_list
         if accum==0 and raw_list:
             try:
-                accum = sum([abs(float(b.get('value',0) or b.get('total_value',0) or b.get('net_value',0) or b.get('net',0) or b.get('accum',0) or b.get('buy_value',0) or 0)) for b in raw_list])
+                accum = sum([abs(float(b.get('value',0) or b.get('total_value',0) or b.get('net_value',0) or b.get('net',0) or b.get('accum',0) or b.get('buy_value',0) or b.get('total_buy',0) or 0)) for b in raw_list])
             except:
                 accum = 0
     elif isinstance(data, list):
         raw_list = data
-        brokers = data
         try:
-            accum = sum([abs(float(b.get('value',0) or b.get('total_value',0) or b.get('net_value',0) or b.get('net',0) or 0)) for b in raw_list[:top]])
+            accum = sum([abs(float(b.get('value',0) or b.get('total_value',0) or b.get('net_value',0) or b.get('net',0) or b.get('buy_value',0) or 0)) for b in raw_list[:top]])
         except:
             accum = 0
 
-    # Kalau masih 0, jangan fallback 5B kalau raw_list ada - pakai 0 biar keliatan error, tapi biar scan tetep jalan kasih minimal
-    if accum == 0:
-        if raw_list:
-            # ada broker tapi value 0 -> mungkin formatnya beda, coba hitung dari volume*price nanti di avg
-            accum = 1  # tandain ada data tapi value 0
-        else:
-            base = 5_000_000_000
-            if days == 5:
-                base = int(base * 1.8)
-            elif days == 20:
-                base = int(base * 4.5)
-            accum = base
+    if accum == 0 and not raw_list:
+        return 0.0, []
 
-    # Normalisasi field broker biar konsisten: broker_code, buy_value, sell_value, buy_volume, sell_volume, net_value, avg_price
     normalized = []
-    for b in brokers[:20]:
+    for b in raw_list[:20]:
         if not isinstance(b, dict):
             continue
-        code = b.get('broker_code') or b.get('broker') or b.get('code') or b.get('broker_id') or b.get('name') or "??"
-        # value fields - coba semua varian
-        buy_val = b.get('buy_value') or b.get('buy') or b.get('total_buy') or b.get('buy_total') or 0
-        sell_val = b.get('sell_value') or b.get('sell') or b.get('total_sell') or 0
-        buy_vol = b.get('buy_volume') or b.get('buy_vol') or b.get('b_vol') or b.get('volume_buy') or b.get('buy_lot') or 0
+        code = b.get('broker_code') or b.get('broker') or b.get('code') or b.get('broker_id') or b.get('name') or b.get('broker_name') or "??"
+        buy_val = b.get('buy_value') or b.get('buy') or b.get('total_buy') or b.get('buy_total') or b.get('buy_value_idr') or 0
+        sell_val = b.get('sell_value') or b.get('sell') or b.get('total_sell') or b.get('sell_value_idr') or 0
+        buy_vol = b.get('buy_volume') or b.get('buy_vol') or b.get('b_vol') or b.get('volume_buy') or b.get('buy_lot') or b.get('lot_buy') or 0
         sell_vol = b.get('sell_volume') or b.get('sell_vol') or b.get('volume_sell') or 0
-        net_val = b.get('net_value') or b.get('net') or b.get('net_buy') or b.get('net_value_idr') or (buy_val - sell_val if buy_val or sell_val else 0)
-        # kalau value cuma ada di 'value' atau 'total_value' itu biasanya net
+        net_val = b.get('net_value') or b.get('net') or b.get('net_buy') or b.get('net_value_idr') or (float(buy_val)-float(sell_val) if buy_val or sell_val else 0)
         if net_val==0:
-            net_val = b.get('value') or b.get('total_value') or b.get('accum') or b.get('accumulated') or 0
-        avg_price = b.get('avg_price') or b.get('avg') or b.get('average') or 0
+            net_val = b.get('value') or b.get('total_value') or b.get('accum') or 0
+        avg_price = b.get('avg_price') or b.get('avg') or b.get('average') or b.get('avg_buy') or 0
         if avg_price==0 and buy_val and buy_vol:
             try:
                 avg_price = float(buy_val) / float(buy_vol) if float(buy_vol)!=0 else 0
             except:
                 avg_price = 0
-        # kalau buy_val 0 tapi net_val ada, anggap buy_val = net_val positif
+        # If buy_val still 0 but we have lot * price
+        if buy_val==0 and buy_vol!=0 and avg_price!=0:
+            buy_val = float(buy_vol) * float(avg_price)
         if buy_val==0 and net_val>0:
             buy_val = net_val
 
@@ -424,12 +412,13 @@ def get_broker_accumulation(symbol, top=3, days=None):
             "sell_volume": float(sell_vol),
             "net_value": float(net_val),
             "net": float(net_val),
-            "value": float(net_val),
+            "value": float(net_val) if net_val!=0 else float(buy_val),
             "avg_price": float(avg_price),
             "avg": float(avg_price),
             "raw": b
         })
-    return float(accum) if accum!=1 else float(sum([abs(x['net_value']) for x in normalized]) or 5_000_000_000), normalized
+    final_accum = float(accum) if accum!=0 else float(sum([abs(x['net_value'] or x['buy_value']) for x in normalized]) or 0.0)
+    return final_accum, normalized
 
 def get_broker_summary(symbol):
     # Coba net=true dulu
@@ -575,18 +564,16 @@ def get_broker_summary(symbol):
                 import traceback
                 traceback.print_exc()
 
-    # Final fallback
-    if net_value == 0:
+    # Final fallback - no fake 5B
+    if net_value == 0 and not brokers:
         acc_val, acc_brokers = get_broker_accumulation(symbol, top=3)
-        # kalau acc_val masih fallback 5B, jangan pakai *0.6 karena itu palsu
-        if acc_val > 5_100_000_000 or acc_val < 4_900_000_000:
-            net_value = int(acc_val * 0.6) if acc_val > 1e9 else 0
+        if acc_val and acc_val > 0:
+            net_value = acc_val
             status = "ACCUM_EST" if net_value>0 else "NEUTRAL"
+            if not brokers and acc_brokers:
+                brokers = acc_brokers
         else:
-            net_value = 0
             status = "NEUTRAL"
-        if not brokers and acc_brokers:
-            brokers = acc_brokers
     else:
         status = "ACCUM" if net_value > 0 else "DISTRIB" if net_value < 0 else "NEUTRAL"
 
