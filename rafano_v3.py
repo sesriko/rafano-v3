@@ -22,48 +22,42 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ========== COLAB SECRETS FIX - ANTI JSON ERROR ==========
-def get_secret_robust(key):
-    try:
-        from google.colab import userdata
-        try:
-            v = userdata.get(key)
-            if v:
-                v = str(v).strip()
-                if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
-                    v = v[1:-1].strip()
-                if v.startswith("{") and v.endswith("}"):
-                    try:
-                        import json
-                        j = json.loads(v)
-                        for vv in j.values():
-                            if isinstance(vv, str) and len(vv) > 5:
-                                v = vv
-                                break
-                    except:
-                        pass
-                if v:
-                    os.environ[key] = v
-                    return v
-        except Exception as e:
-            print(f"⚠ get_secret {key} userdata error: {e}")
-    except:
-        pass
+# ========== COLAB FIX - ANTI JSON ERROR ==========
+# JANGAN pakai userdata.get di top-level, nanti Colab JS error kalau secret ada "
+# Kita pakai os.getenv saja, Colab akan auto-inject secrets sebagai env var
+def safe_get_env(key):
     v = os.getenv(key)
     if v:
-        return str(v).strip().strip('"').strip("'")
+        # strip quotes jika user isi pakai "
+        v = str(v).strip()
+        if len(v)>=2 and ((v[0]=='"' and v[-1]=='"') or (v[0]=="'" and v[-1]=="'")):
+            v = v[1:-1].strip()
+        return v
+    # fallback coba userdata tapi dengan try catch halus
+    try:
+        from google.colab import userdata
+        vv = userdata.get(key)
+        if vv:
+            vv = str(vv).strip().strip('"').strip("'")
+            os.environ[key] = vv
+            return vv
+    except Exception as ee:
+        # jangan print error JSON disini, biar gak crash
+        pass
     return None
-
-for k in ["TELEGRAM_BOT_TOKEN", "TARGET_CHAT_ID", "ARJUM_API_KEY"]:
-    get_secret_robust(k)
 
 TIMEZONE_WIB = pytz.timezone('Asia/Jakarta')
 
-TELEGRAM_BOT_TOKEN = get_secret_robust("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-TARGET_CHAT_ID = get_secret_robust("TARGET_CHAT_ID") or os.getenv("TARGET_CHAT_ID")
-ARJUM_API_KEY = get_secret_robust("ARJUM_API_KEY") or os.getenv("ARJUM_API_KEY")
+TELEGRAM_BOT_TOKEN = safe_get_env("TELEGRAM_BOT_TOKEN")
+TARGET_CHAT_ID = safe_get_env("TARGET_CHAT_ID")
+ARJUM_API_KEY = safe_get_env("ARJUM_API_KEY")
 
-print(f"🔑 ENV Loaded - TOKEN exists={bool(TELEGRAM_BOT_TOKEN)} len={len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}, CHAT_ID={TARGET_CHAT_ID}, ARJUM exists={bool(ARJUM_API_KEY)} len={len(ARJUM_API_KEY) if ARJUM_API_KEY else 0}")
+# Debug aman tanpa userdata
+print(f"🔑 ENV Loaded - TOKEN exists={bool(TELEGRAM_BOT_TOKEN)} len={len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}, CHAT_ID={TARGET_CHAT_ID}, ARJUM len={len(ARJUM_API_KEY) if ARJUM_API_KEY else 0}")
+if not TELEGRAM_BOT_TOKEN:
+    print("❌ FATAL: TELEGRAM_BOT_TOKEN KOSONG!")
+    print("   -> Colab > Secrets > isi TANPA tanda petik, toggle ON Notebook access")
+    print("   -> Atau hardcode di cell: os.environ['TELEGRAM_BOT_TOKEN']='token'")
 
 ARJUM_BASE = "https://stock.arjum.com/api"
 HEADERS_ARJUM = {"X-API-Key": ARJUM_API_KEY, "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
