@@ -37,9 +37,29 @@ except:
     pass # bukan di Colab, skip
 
 TIMEZONE_WIB = pytz.timezone('Asia/Jakarta')
+# Debug: cek apakah secrets kebaca
+try:
+    from google.colab import userdata
+    print(f"🔑 DEBUG Secrets - TOKEN: {len(userdata.get('TELEGRAM_BOT_TOKEN') or '')} chars, CHAT_ID: {len(userdata.get('TARGET_CHAT_ID') or '')} chars, ARJUM: {len(userdata.get('ARJUM_API_KEY') or '')} chars")
+except Exception as e:
+    print(f"🔑 DEBUG Secrets error: {e}")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 ARJUM_API_KEY = os.getenv("ARJUM_API_KEY")
+
+print(f"🔑 ENV Loaded - TOKEN exists={bool(TELEGRAM_BOT_TOKEN)} len={len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}, CHAT_ID={TARGET_CHAT_ID}, ARJUM exists={bool(ARJUM_API_KEY)}")
+if not TELEGRAM_BOT_TOKEN:
+    print("❌ FATAL: TELEGRAM_BOT_TOKEN KOSONG - Cek Secrets toggle Notebook access!")
+    # Coba load ulang paksa
+    try:
+        from google.colab import userdata
+        TELEGRAM_BOT_TOKEN = userdata.get('TELEGRAM_BOT_TOKEN')
+        TARGET_CHAT_ID = userdata.get('TARGET_CHAT_ID')
+        ARJUM_API_KEY = userdata.get('ARJUM_API_KEY')
+        print(f"🔧 Retry load - TOKEN len={len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}")
+    except Exception as e:
+        print(f"Retry fail: {e}")
 
 ARJUM_BASE = "https://stock.arjum.com/api"
 HEADERS_ARJUM = {"X-API-Key": ARJUM_API_KEY, "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
