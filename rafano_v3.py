@@ -471,14 +471,17 @@ def get_broker_summary(symbol):
                     "net_value": float(nval),
                     "avg_price": float(avg)
                 })
-            # Total net from broker_net or sum nval
-            if 'broker_net' in data:
+            # Total net from sum nval (broker_net in API is not numeric, it's date range)
+            # broker_net is start/end date string, not value, so always sum
+            net_value = sum([x['net_value'] for x in brokers])
+            # If sum is 0 but brokers exist, try broker_net if it's numeric
+            if net_value==0 and 'broker_net' in data:
                 try:
-                    net_value = float(data['broker_net'])
+                    bn = data['broker_net']
+                    if isinstance(bn, (int,float)):
+                        net_value = float(bn)
                 except:
-                    net_value = sum([x['net_value'] for x in brokers])
-            else:
-                net_value = sum([x['net_value'] for x in brokers])
+                    pass
     
     if net_value == 0 and not brokers:
         # fallback to accumulation
@@ -1072,17 +1075,17 @@ def scan_v3():
     detected = []
     def process_symbol(sym):
         try:
-            accum_val, accum_brokers = get_broker_accumulation(sym, top=3)
-            # jangan filter negatif dulu pas weekend, biar scan tetep keluar
-            # if accum_val < -10_000_000_000:
-            #     return None
-            broker_net, broker_status, broker_list = get_broker_summary(sym)
-            # gabungin brokers dari dua endpoint, prioritaskan broker_summary
-            brokers_combined = broker_list if broker_list else accum_brokers
+            # Multi TF data
             hist_df = get_history_pro(sym, limit=120, timeframe="1d")
+            multi = get_broker_multi_tf(sym, hist_df)
+            
+            accum_val = multi['accum_d']
+            broker_net = multi['net_d']
+            brokers_combined = multi['brokers']
+            broker_status = multi['status']
+            
             analysis = get_analysis(sym)
             score, label, reasons = calculate_score_v2(sym, hist_df, accum_val, broker_net, analysis)
-            # weekend threshold lebih rendah biar /scanpro tetep bisa
             threshold = 40 if is_fallback else 55
             if score >= threshold:
                 last_close = 0
@@ -1091,7 +1094,6 @@ def scan_v3():
                     last_close = int(hist_df['Close'].iloc[-1])
                     prev = hist_df['Close'].iloc[-2]
                     change_pct = ((last_close/prev)-1)*100 if prev else 0
-                # Trading plan
                 tp = calculate_trading_plan(hist_df) if hist_df is not None else None
                 return {
                     "symbol": sym,
@@ -1106,10 +1108,13 @@ def scan_v3():
                     "history_df": hist_df,
                     "trading_plan": tp,
                     "brokers": brokers_combined,
-                    "broker_list": brokers_combined
+                    "broker_list": brokers_combined,
+                    "multi_tf": multi
                 }
         except Exception as e:
             print(f"Error {sym}: {e}")
+            import traceback
+            traceback.print_exc()
         return None
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -1145,33 +1150,66 @@ def broadcast_v3(signals):
         send_reply(TARGET_CHAT_ID, "🔍 V3 Scan: Tidak ada sinyal REAL ACCUM hari ini.")
         return
     now_str = get_now_wib().strftime('%d %b %Y %H:%M WIB')
-    header = f"*RAFANO V3 PRO - REAL ACCUM*\n{now_str}\nTotal: {len(signals)} | Cooldown 60m\n============================\n\n"
+    header = f"*RAFANO V3 PRO - REAL ACCUM*
+{now_str}
+Total: {len(signals)} | Cooldown 60m
+============================
+
+"
     msg = header
     keyboard = []
     for idx, item in enumerate(signals, 1):
         def fmt(v):
             return format_large_number(v, True)
+        def fmt_avg(v):
+            return f"{v:.0f}" if v>=100 else f"{v:.1f}"
         reasons_str = " | ".join(item['reasons'][:3])
-        # Trading plan
-        tp = item.get('trading_plan')
-        if tp:
-            tp_str = f"   ├ 🎯 Plan: Entry {tp['entry']} | TP1 {tp['tp1']} ({tp['rr1']}R) | TP2 {tp['tp2']} ({tp['rr2']}R) | SL {tp['sl']} ({tp['risk_pct']}%)\n"
+        
+        multi = item.get('multi_tf') or {}
+        # Daily / Weekly / Monthly with Avg
+        if multi:
+            daily_str = f"Daily: Akum {fmt(multi.get('accum_d',0))} | Net {fmt(multi.get('net_d',0))} | Avg {fmt_avg(multi.get('avg_d',0))}"
+            weekly_str = f"Weekly 5D: Akum {fmt(multi.get('accum_5d',0))} | Net {fmt(multi.get('net_5d',0))} | Avg {fmt_avg(multi.get('avg_5d',0))}"
+            monthly_str = f"Monthly 20D: Akum {fmt(multi.get('accum_20d',0))} | Net {fmt(multi.get('net_20d',0))} | Avg {fmt_avg(multi.get('avg_20d',0))}"
         else:
-            tp_str = ""
-        # Top 3 broker
+            daily_str = f"Akum: {fmt(item['accum_value'])} | Net: {fmt(item['broker_net'])}"
+            weekly_str = ""
+            monthly_str = ""
+        
         brokers = item.get('brokers', []) or item.get('broker_list', [])
         top_broker_str = format_top_brokers(brokers, 3)
+        
+        # Build in requested format
         item_str = (
-            f"{idx}. *{item['symbol']}* — {item['close']} ({item['change_pct']:+.2f}%)\n"
-            f"   ├ Score: *{item['score']}% ({item['score_label']})*\n"
-            f"   ├ Akum 3B: {fmt(item['accum_value'])} | Net: {fmt(item['broker_net'])} ({item['broker_status']})\n"
-            f"   ├ Top Brokers: {top_broker_str}\n"
-            f"{tp_str}"
-            f"   └ {reasons_str}\n\n"
+            f"{idx}. *{item['symbol']}* — {item['close']} ({item['change_pct']:+.2f}%)
+"
+            f"   ├ Score: {item['score']}% ({item['score_label']})
+"
+            f"   ├ {daily_str}
+"
+        )
+        if weekly_str:
+            item_str += f"   ├ {weekly_str}
+"
+        if monthly_str:
+            item_str += f"   ├ {monthly_str}
+"
+        item_str += (
+            f"   ├ Top Brokers: {top_broker_str}
+"
+            f"   └ {reasons_str}
+
+"
         )
         keyboard.append([{"text": f"📈 {item['symbol']} Pro Chart", "callback_data": f"chart_{item['symbol']}_1d"}])
         if len(msg) + len(item_str) > 3500:
             send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard": keyboard})
+            msg = item_str
+            keyboard = []
+        else:
+            msg += item_str
+    if msg:
+        send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard": keyboard})
             msg = item_str
             keyboard = []
         else:
