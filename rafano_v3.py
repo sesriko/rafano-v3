@@ -840,15 +840,18 @@ def get_broker_accumulation(symbol, top=3, days=None):
 
 
 
-def get_broker_summary(symbol):
+def get_broker_summary(symbol, days=1):
+    # FIX: dukung multi-timeframe D/5D/20D.
+    # days dipakai sebagai parameter API bila tersedia, tanpa membuat data sintetis.
     # FIX Buy 0 Sell 0 - coba net=false dulu tanpa cache, pakai use_cache=False
     data = None
     used_params = None
     for p in [
-        {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
-        {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
-        {"broker_limit": 20, "flow": "all"},
-        {"flow": "all"},
+        {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all", "days": days},
+        {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all", "days": days},
+        {"broker_limit": 20, "flow": "all", "days": days},
+        {"flow": "all", "days": days},
+        {"days": days},
         {}
     ]:
         d = arjum_get(f"/broker-summary/{symbol}", params=p, use_cache=False)
@@ -945,7 +948,7 @@ def get_broker_summary(symbol):
                     net_value = buy_sum * 0.8
     if (net_value == 0 or not brokers):
         try:
-            acc_val, acc_brokers = get_broker_accumulation(symbol, top=5)
+            acc_val, acc_brokers = get_broker_accumulation(symbol, top=5, days=days)
             if acc_val and acc_val != 0:
                 if net_value == 0:
                     net_value = acc_val
