@@ -898,44 +898,14 @@ def get_broker_accumulation(symbol, top=3, days=None):
 
 
 def get_broker_summary(symbol, days=None):
-    # FIX REAL MTF pakai start_date & end_date sesuai docs API
-    # /api/broker-summary/{code}?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+    # FIX Buy 0 Sell 0 + support days param for MTF
     data = None
     used_params = None
     base_params_list = []
     if days:
-        try:
-            # Hitung start_date dan end_date
-            end_dt = datetime.datetime.now()
-            # Kalau weekend, mundurin ke Jumat
-            # WIB timezone
-            import pytz
-            wib = pytz.timezone('Asia/Jakarta')
-            now_wib = datetime.datetime.now(wib)
-            end_dt = now_wib
-            start_dt = end_dt - datetime.timedelta(days=int(days)-1 if int(days)>1 else 0)
-            # Skip weekend untuk start_date: kalau start jatuh Sabtu/Minggu, mundurin ke Jumat sebelumnya? Atau maju ke Senin?
-            # Simpler: biarkan API handle, tapi kita format YYYY-MM-DD
-            end_str = end_dt.strftime('%Y-%m-%d')
-            start_str = start_dt.strftime('%Y-%m-%d')
-            # Untuk 1D, start=end=today
-            if int(days) == 1:
-                start_str = end_str
-            # Coba dengan start_date & end_date
-            base_params_list.append({"start_date": start_str, "end_date": end_str, "broker_limit": 20, "flow": "all"})
-            base_params_list.append({"start_date": start_str, "end_date": end_str, "net": "false", "broker_limit": 20, "flow": "all"})
-            # Coba juga tanpa flow
-            base_params_list.append({"start_date": start_str, "end_date": end_str, "broker_limit": 20})
-            # Coba untuk 5D dan 20D dengan range yang lebih lebar untuk hindari weekend kosong
-            if int(days) > 1:
-                # Untuk weekly/monthly, ambil 7 hari kalender untuk 5D biar dapet 5 hari bursa
-                extra_days = 2 if int(days)==5 else 8 if int(days)==20 else 0
-                start_dt2 = end_dt - datetime.timedelta(days=int(days)-1+extra_days)
-                start_str2 = start_dt2.strftime('%Y-%m-%d')
-                base_params_list.append({"start_date": start_str2, "end_date": end_str, "broker_limit": 20, "flow": "all"})
-        except Exception as e:
-            print(f"Date calc error days={days}: {e}")
-
+        for p_name in ["days", "period"]:
+            base_params_list.append({p_name: days, "broker_limit": 20, "flow": "all"})
+            base_params_list.append({p_name: str(days), "broker_limit": 20, "flow": "all"})
     base_params_list.extend([
         {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
         {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
