@@ -463,6 +463,26 @@ def get_broker_multi_tf_fixed(symbol, hist_df=None):
     return result
 
 # ===== SISANYA SAMA - SCAN, CHART, TELEGRAM =====
+
+# Aliases for compatibility with original listener (minimal fix - keep original names pointing to fixed logic)
+def get_broker_accumulation(symbol, top=10, days=None):
+    net, brokers, buy, sell = get_broker_accumulation_fixed(symbol, top=top, days=days)
+    return net, brokers
+
+def get_broker_summary(symbol, days=None):
+    net, status, brokers, buy, sell = get_broker_summary_fixed(symbol, days=days)
+    return net, status, brokers, buy, sell
+
+def get_broker_multi_tf(symbol, hist_df=None):
+    return get_broker_multi_tf_fixed(symbol, hist_df=hist_df)
+
+def format_top_brokers(brokers, top=3, status="AKUM"):
+    return format_top_brokers_fixed(brokers, top=top, status=status)
+
+def calculate_vsa_metrics(df):
+    return calculate_vsa_metrics_fixed(df)
+
+
 def is_market_open():
     now=get_now_wib(); wd=now.weekday()
     if wd>=5: return False
@@ -791,66 +811,437 @@ def process_chart_request(chat_id,stock_code,timeframe="1d",extra_cache=None):
         logging.error(f"Chart req {e}",exc_info=True)
         send_reply(chat_id,f"❌ Error: {e}")
 
+
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE
-    offset=0
-    print("🤖 Listener V3.2...")
+    offset = 0
+    print("🤖 Telegram Listener V3 Running...")
     try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
-        r=requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe",timeout=10)
-        print(f"✅ Bot {r.json().get('result',{}).get('username')}")
-    except Exception as e: print(f"Bot init {e}")
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
+        print("✅ Webhook deleted, polling mode active")
+    except Exception as e:
+        print(f"Webhook delete fail: {e}")
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=10)
+        print(f"✅ Bot Info: {r.json().get('result',{})}")
+    except Exception as e:
+        print(f"❌ Bot token error: {e}")
     while True:
         try:
-            res=requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20",timeout=25)
-            if res.status_code!=200: time.sleep(3); continue
-            data=res.json()
-            for upd in data.get("result",[]):
-                offset=upd["update_id"]+1
-                if "callback_query" in upd:
-                    cb=upd["callback_query"]
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":cb.get("id")},timeout=5)
-                    cd=cb.get("data","")
-                    if cd.startswith("chart_"):
-                        p=cd.split("_")
-                        if len(p)>=3:
-                            threading.Thread(target=process_chart_request,args=(cb["message"]["chat"]["id"],p[1],p[2],LAST_SIGNALS_CACHE),daemon=True).start()
-                elif "message" in upd and "text" in upd["message"]:
-                    msg=upd["message"]; text=msg.get("text","").strip(); chat_id=msg["chat"]["id"]
-                    fw=text.split()[0].lower() if text else ""
-                    print(f"📩 {text} from {chat_id}")
-                    if fw in ["/start","/help"]:
-                        send_reply(chat_id,"🤖 *RAFANO V3.2 AKUM/DIST REAL*\n`/c KODE [TF]` Chart\n`/scan` Scan\n`/top` Top Akum\n`/clearcache` Clear")
-                    elif fw in ["/c","/chart"]:
-                        parts=text.split()
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
+            res = requests.get(url, timeout=25)
+            if res.status_code != 200:
+                print(f"⚠ getUpdates {res.status_code}: {res.text[:200]}")
+                time.sleep(3)
+                continue
+            data = res.json()
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                if "callback_query" in update:
+                    cb = update["callback_query"]
+                    cb_id = cb.get("id")
+                    cb_data = cb.get("data","")
+                    chat_id = cb["message"]["chat"]["id"]
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id})
+                    if cb_data.startswith("chart_"):
+                        parts = cb_data.split("_")
+                        if len(parts) >=3:
+                            sym = parts[1]
+                            tf = parts[2]
+                            threading.Thread(target=process_chart_request, args=(chat_id, sym, tf, LAST_SIGNALS_CACHE), daemon=True).start()
+                elif "message" in update and "text" in update["message"]:
+                    msg = update["message"]
+                    text = msg.get("text","").strip()
+                    chat_id = msg["chat"]["id"]
+                    first_word = text.split()[0].lower() if text else ""
+                    print(f"📩 Pesan masuk: {text} dari chat_id={chat_id}")
+                    if first_word in ["/start","/help"]:
+                        help_msg = (
+                            "🤖 *RAFANO V3 PRO FINAL*
+"
+                            "============================
+"
+                            "📈 *CHART & ANALISA*
+"
+                            "`/c <KODE> [TF]` - Chart Pro + Real Akum
+"
+                            "   `/c BBCA` `/c ANTM 15m` `/c BBCA 1h`
+"
+                            "`/b <KODE>` - Detail Bandar / Broker
+"
+                            "`/info <KODE>` - Info lengkap saham
+"
+                            "`/trend <KODE>` - Analisa trend MTF
+"
+                            "
+"
+                            "🔍 *SCREENER*
+"
+                            "`/scan` - Scan V3 Real Accumulation
+"
+                            "`/scanpro` - Scan + chart top 3
+"
+                            "`/top [N] [akum/dist]` - Top akumulasi
+"
+                            "   `/top 10` `/top 5 dist`
+"
+                            "`/compare <KODE1> <KODE2>` - Bandingkan 2 saham
+"
+                            "
+"
+                            "⭐ *WATCHLIST*
+"
+                            "`/wl` - Lihat watchlist
+"
+                            "`/wl add <KODE>` - Tambah watchlist
+"
+                            "`/wl del <KODE>` - Hapus
+"
+                            "`/wl scan` - Scan hanya watchlist
+"
+                            "
+"
+                            "🛠 *TOOLS*
+"
+                            "`/clearcache` atau `/cc` - Hapus cache Buy 0
+"
+                            "`/help` - Menu ini
+"
+                        )
+                        send_reply(chat_id, help_msg)
+                    elif first_word in ["/c","/chart","!chart"]:
+                        parts = text.split()
+                        if len(parts) >=2:
+                            sym = parts[1].upper()
+                            tf = parts[2] if len(parts)>=3 else "1d"
+                            threading.Thread(target=process_chart_request, args=(chat_id, sym, tf, LAST_SIGNALS_CACHE), daemon=True).start()
+                        else:
+                            send_reply(chat_id, "⚠ Format: `/c <KODE> [TF]`")
+                    elif first_word in ["/b","/broker","/bandar"]:
+                        parts = text.split()
+                        if len(parts) >=2:
+                            sym = parts[1].upper()
+                            def broker_detail(target_chat, symbol):
+                                try:
+                                    multi = get_broker_multi_tf(symbol)
+                                    net_d, status_d, brokers, buy_d, sell_d = get_broker_summary(symbol)
+                                    acc, brokers_acc, b_buy, b_sell = get_broker_accumulation(symbol, top=10)
+                                    msg = f"🏦 *BROKER DETAIL {symbol}* -- {get_now_wib().strftime('%d %b %H:%M')}
+"
+                                    msg += f"Status: {status_d} | Net: {format_large_number(net_d, True)}
+"
+                                    msg += f"Accum: {format_large_number(acc, True)}
+
+"
+                                    if multi:
+                                        msg += f"Daily: {multi.get('status_d')} | Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} Net {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f}
+"
+                                        msg += f"  └ Top: {format_top_brokers(multi.get('brokers',[]),3,multi.get('status_d'))}
+"
+                                        msg += f"Weekly: {multi.get('status_5d')} | Buy {format_large_number(multi.get('buy_5d',0),True)} Sell {format_large_number(multi.get('sell_5d',0),True)} Net {format_large_number(multi.get('net_5d',0),True)} Avg {multi.get('avg_5d',0):.0f}
+"
+                                        msg += f"  └ Top: {format_top_brokers(multi.get('brokers_5d',[]) or multi.get('brokers',[]),3,multi.get('status_5d'))}
+"
+                                        msg += f"Monthly: {multi.get('status_20d')} | Buy {format_large_number(multi.get('buy_20d',0),True)} Sell {format_large_number(multi.get('sell_20d',0),True)} Net {format_large_number(multi.get('net_20d',0),True)} Avg {multi.get('avg_20d',0):.0f}
+"
+                                        msg += f"  └ Top: {format_top_brokers(multi.get('brokers_20d',[]) or multi.get('brokers',[]),3,multi.get('status_20d'))}
+
+"
+                                    msg += "*TOP BROKERS:*
+"
+                                    for idx, b in enumerate(brokers[:10],1):
+                                        code = b.get('broker_code','??')
+                                        buy = format_large_number(b.get('buy_value',0), True)
+                                        sell = format_large_number(b.get('sell_value',0), True)
+                                        net = format_large_number(b.get('net_value',0), True)
+                                        emoji = "🟢" if b.get('net_value',0)>0 else "🔴" if b.get('net_value',0)<0 else "⚪"
+                                        msg += f"{idx}. {emoji} {code} Buy {buy} Sell {sell} Net {net}
+"
+                                    send_reply(target_chat, msg)
+                                except Exception as e:
+                                    send_reply(target_chat, f"❌ Error broker {symbol}: {e}")
+                            threading.Thread(target=broker_detail, args=(chat_id, sym), daemon=True).start()
+                        else:
+                            send_reply(chat_id, "⚠ Format: `/b <KODE>` contoh `/b BBCA`")
+                    elif first_word in ["/info","/i"]:
+                        parts = text.split()
+                        if len(parts) >=2:
+                            sym = parts[1].upper()
+                            def info_detail(target_chat, symbol):
+                                try:
+                                    df = get_history_pro(symbol, limit=50, timeframe="1d")
+                                    multi = get_broker_multi_tf(symbol, df)
+                                    last_close = df['Close'].iloc[-1] if df is not None and len(df)>0 else 0
+                                    msg = f"📊 *INFO {symbol}* -- {safe_int(last_close)}
+"
+                                    msg += f"Time: {get_now_wib().strftime('%d %b %Y %H:%M')}
+
+"
+                                    if multi:
+                                        msg += f"🏦 Bandar: {multi.get('status_d')} | {multi.get('status_5d')} | {multi.get('status_20d')}
+"
+                                        msg += f"Daily Net: {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f}
+"
+                                        msg += f"Top: {format_top_brokers(multi.get('brokers',[]),3, multi.get('status_d','AKUM'))}
+
+"
+                                    if df is not None and len(df)>=20:
+                                        df['EMA50'] = df['Close'].ewm(span=50).mean()
+                                        ema50 = df['EMA50'].iloc[-1]
+                                        trend = "UPTREND" if last_close>ema50 else "DOWNTREND"
+                                        msg += f"📈 Trend: {trend} | EMA50: {ema50:.0f}
+"
+                                        msg += f"High 20D: {df['High'].tail(20).max():.0f} Low 20D: {df['Low'].tail(20).min():.0f}
+
+"
+                                    msg += f"Gunakan `/c {symbol}` untuk chart, `/b {symbol}` untuk broker detail"
+                                    send_reply(target_chat, msg)
+                                except Exception as e:
+                                    import traceback; traceback.print_exc()
+                                    send_reply(target_chat, f"❌ Error info {symbol}: {e}")
+                            threading.Thread(target=info_detail, args=(chat_id, sym), daemon=True).start()
+                        else:
+                            send_reply(chat_id, "⚠ Format: `/info <KODE>`")
+                    elif first_word in ["/trend","/t"]:
+                        parts = text.split()
+                        if len(parts) >=2:
+                            sym = parts[1].upper()
+                            def trend_detail(target_chat, symbol):
+                                try:
+                                    df = get_history_pro(symbol, limit=150, timeframe="1d")
+                                    multi = get_broker_multi_tf(symbol, df)
+                                    buy_sigs, _ = detect_buy_signals(df, multi)
+                                    sell_sigs, _ = detect_sell_signals(df, multi)
+                                    tp = calculate_trading_plan(df, signals=buy_sigs+sell_sigs, multi_tf=multi)
+                                    msg = f"📈 *TREND MTF {symbol}*
+
+"
+                                    if multi:
+                                        msg += f"Daily: {multi.get('status_d')} Net {format_large_number(multi.get('net_d',0),True)}
+"
+                                        msg += f"Weekly: {multi.get('status_5d')} Net {format_large_number(multi.get('net_5d',0),True)}
+"
+                                        msg += f"Monthly: {multi.get('status_20d')} Net {format_large_number(multi.get('net_20d',0),True)}
+
+"
+                                    if tp:
+                                        msg += f"Signal: {tp.get('signal_type')} | {tp.get('side')} ({tp.get('signal_strength')}%)
+"
+                                        msg += f"Trend: {tp.get('trend')}
+"
+                                        msg += f"MTF Confirm: {tp.get('mtf_confirm')}
+"
+                                    send_reply(target_chat, msg)
+                                except Exception as e:
+                                    send_reply(target_chat, f"❌ Error trend {symbol}: {e}")
+                            threading.Thread(target=trend_detail, args=(chat_id, sym), daemon=True).start()
+                        else:
+                            send_reply(chat_id, "⚠ Format: `/trend <KODE>`")
+                    elif first_word in ["/top"]:
+                        parts = text.split()
+                        n = 10
+                        filter_status = None
                         if len(parts)>=2:
-                            sym=parts[1].upper(); tf=parts[2] if len(parts)>=3 else "1d"
-                            threading.Thread(target=process_chart_request,args=(chat_id,sym,tf,LAST_SIGNALS_CACHE),daemon=True).start()
-                    elif fw in ["/scan","/scanpro"]:
-                        send_reply(chat_id,"🔍 *Scanning REAL...*")
-                        def ms(target_chat=chat_id):
-                            global LAST_SIGNALS_CACHE
-                            sigs=scan_v3(); LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
-                            if not sigs:
-                                send_reply(target_chat,"0 sinyal"); return
-                            header=f"*RAFANO V3.2 {get_now_wib().strftime('%d %b %H:%M')}* Total {len(sigs)}\n\n"; mt=header; kb=[]
-                            for idx,item in enumerate(sigs,1):
-                                multi=item.get('multi_tf') or {}
-                                s=f"{idx}. *{item['symbol']}* {item['close']} ({item['change_pct']:+.2f}%) Net {format_large_number(multi.get('net_d',0),True)} {multi.get('status_d','')}\n"
-                                kb.append([{"text":f"Chart {item['symbol']}","callback_data":f"chart_{item['symbol']}_1d"}])
-                                if len(mt)+len(s)>3500:
-                                    send_reply(target_chat,mt,reply_markup={"inline_keyboard":kb}); mt=s; kb=[]
-                                else: mt+=s
-                            send_reply(target_chat,mt,reply_markup={"inline_keyboard":kb})
-                        threading.Thread(target=ms,daemon=True).start()
-                    elif fw in ["/clearcache","/cc"]:
-                        BROKER_CACHE.clear(); HISTORY_CACHE.clear(); SCREENER_CACHE.clear()
+                            try:
+                                n = int(parts[1])
+                                if len(parts)>=3:
+                                    filter_status = parts[2].upper()
+                            except:
+                                filter_status = parts[1].upper()
+                        def top_accum(target_chat, limit, status_filter):
+                            try:
+                                sigs = list(LAST_SIGNALS_CACHE.values()) if LAST_SIGNALS_CACHE else scan_v3()
+                                def get_net(x):
+                                    multi = x.get('multi_tf') or {}
+                                    return abs(multi.get('net_d',0) or x.get('broker_net',0) or 0)
+                                sorted_sigs = sorted(sigs, key=get_net, reverse=True)
+                                if status_filter:
+                                    def match_status(s):
+                                        st = (s.get('multi_tf',{}).get('status_d','') or s.get('broker_status','') or '').upper()
+                                        if status_filter in ["DIST", "DISTRIB", "DISTRIBUSI"]:
+                                            return st in ["DIST", "DISTRIB", "DISTRIBUSI"]
+                                        elif status_filter in ["AKUM", "ACCUM"]:
+                                            return st in ["AKUM", "ACCUM", "AKUMULASI"]
+                                        else:
+                                            return st == status_filter
+                                    sorted_sigs = [s for s in sorted_sigs if match_status(s)]
+                                msg = f"🏆 *TOP {limit} {status_filter or 'AKUMULASI'}*
+
+"
+                                for idx, item in enumerate(sorted_sigs[:limit],1):
+                                    multi = item.get('multi_tf') or {}
+                                    sym = item.get('symbol','??')
+                                    net = multi.get('net_d',0) or item.get('broker_net',0)
+                                    status = multi.get('status_d','') or item.get('broker_status','')
+                                    emoji = "🟢" if status=="AKUM" else "🔴" if status=="DIST" else "⚪"
+                                    msg += f"{idx}. {emoji} *{sym}* {status} Net {format_large_number(net,True)} | {format_top_brokers(multi.get('brokers',[]) or item.get('brokers',[]),2,status)}
+"
+                                send_reply(target_chat, msg)
+                            except Exception as e:
+                                import traceback; traceback.print_exc()
+                                send_reply(target_chat, f"❌ Error top: {e}")
+                        threading.Thread(target=top_accum, args=(chat_id, n, filter_status), daemon=True).start()
+                    elif first_word in ["/compare","/comp"]:
+                        parts = text.split()
+                        if len(parts)>=3:
+                            sym1 = parts[1].upper()
+                            sym2 = parts[2].upper()
+                            def compare_stocks(target_chat, s1, s2):
+                                try:
+                                    m1 = get_broker_multi_tf(s1)
+                                    m2 = get_broker_multi_tf(s2)
+                                    df1 = get_history_pro(s1, limit=20)
+                                    df2 = get_history_pro(s2, limit=20)
+                                    close1 = df1['Close'].iloc[-1] if df1 is not None else 0
+                                    close2 = df2['Close'].iloc[-1] if df2 is not None else 0
+                                    msg = f"⚖ *COMPARE {s1} vs {s2}*
+
+"
+                                    msg += f"*{s1}* {safe_int(close1)} | {m1.get('status_d')} Net {format_large_number(m1.get('net_d',0),True)}
+"
+                                    msg += f"  Top: {format_top_brokers(m1.get('brokers',[]),2,m1.get('status_d'))}
+
+"
+                                    msg += f"*{s2}* {safe_int(close2)} | {m2.get('status_d')} Net {format_large_number(m2.get('net_d',0),True)}
+"
+                                    msg += f"  Top: {format_top_brokers(m2.get('brokers',[]),2,m2.get('status_d'))}
+
+"
+                                    winner = s1 if abs(m1.get('net_d',0))>abs(m2.get('net_d',0)) else s2
+                                    msg += f"🏆 Lebih kuat: *{winner}*"
+                                    send_reply(target_chat, msg)
+                                except Exception as e:
+                                    send_reply(target_chat, f"❌ Error compare: {e}")
+                            threading.Thread(target=compare_stocks, args=(chat_id, sym1, sym2), daemon=True).start()
+                        else:
+                            send_reply(chat_id, "⚠ Format: `/compare BBCA BBRI`")
+                    elif first_word in ["/wl","/watchlist"]:
+                        parts = text.split()
+                        WATCHLIST_FILE = "/tmp/rafano_watchlist.json"
+                        def load_wl():
+                            try:
+                                import json, os
+                                if os.path.exists(WATCHLIST_FILE):
+                                    with open(WATCHLIST_FILE,'r') as f:
+                                        return json.load(f)
+                            except: pass
+                            return []
+                        def save_wl(wl):
+                            try:
+                                import json
+                                with open(WATCHLIST_FILE,'w') as f:
+                                    json.dump(wl,f)
+                            except: pass
+                        if len(parts)==1 or parts[1].lower() in ["list","show"]:
+                            wl = load_wl()
+                            if not wl:
+                                send_reply(chat_id, "⭐ Watchlist kosong. Tambah dengan `/wl add BBCA`")
+                            else:
+                                msg = f"⭐ *WATCHLIST* ({len(wl)} saham)
+
+"
+                                for s in wl: msg += f"• {s}
+"
+                                send_reply(chat_id, msg)
+                        elif parts[1].lower()=="add" and len(parts)>=3:
+                            sym = parts[2].upper()
+                            wl = load_wl()
+                            if sym not in wl:
+                                wl.append(sym); save_wl(wl)
+                                send_reply(chat_id, f"✅ {sym} ditambah ke watchlist")
+                            else:
+                                send_reply(chat_id, f"⚠ {sym} sudah ada")
+                        elif parts[1].lower() in ["del","remove","rm"] and len(parts)>=3:
+                            sym = parts[2].upper()
+                            wl = load_wl()
+                            if sym in wl:
+                                wl.remove(sym); save_wl(wl)
+                                send_reply(chat_id, f"🗑 {sym} dihapus")
+                            else:
+                                send_reply(chat_id, f"⚠ {sym} tidak ada")
+                        elif parts[1].lower()=="scan":
+                            wl = load_wl()
+                            if not wl:
+                                send_reply(chat_id, "⭐ Watchlist kosong")
+                            else:
+                                def scan_wl(target_chat, symbols):
+                                    try:
+                                        results = []
+                                        for sym in symbols:
+                                            try:
+                                                df = get_history_pro(sym, limit=50)
+                                                multi = get_broker_multi_tf(sym, df)
+                                                results.append({"symbol":sym, "multi_tf":multi, "close": df['Close'].iloc[-1] if df is not None else 0})
+                                            except: pass
+                                        results = sorted(results, key=lambda x: abs(x.get('multi_tf',{}).get('net_d',0)), reverse=True)
+                                        msg = f"⭐ *WATCHLIST SCAN* ({len(results)})
+
+"
+                                        for idx, item in enumerate(results,1):
+                                            multi = item.get('multi_tf',{})
+                                            msg += f"{idx}. *{item['symbol']}* -- {safe_int(item.get('close',0))} | {multi.get('status_d')} Net {format_large_number(multi.get('net_d',0),True)}
+"
+                                        send_reply(target_chat, msg)
+                                    except Exception as e:
+                                        send_reply(target_chat, f"❌ Error wl scan: {e}")
+                                threading.Thread(target=scan_wl, args=(chat_id, wl), daemon=True).start()
+                    elif first_word in ["/clearcache","/cc","/clear"]:
                         try:
-                            if CACHE_FILE.exists(): CACHE_FILE.unlink()
-                        except: pass
-                        send_reply(chat_id,"🧹 Cache cleared")
+                            BROKER_CACHE.clear(); HISTORY_CACHE.clear(); SCREENER_CACHE.clear(); LAST_SIGNALS_CACHE.clear()
+                            send_reply(chat_id, "🧹 Cache cleared, coba `/scan` lagi")
+                        except Exception as e:
+                            send_reply(chat_id, f"❌ Error clear: {e}")
+                    elif first_word in ["/scan","!scan","/scanpro"]:
+                        send_reply(chat_id, "🔍 *V3 Scanning Real Accumulation...*")
+                        def manual_scan(is_pro=False, target_chat=chat_id):
+                            global LAST_SIGNALS_CACHE
+                            sigs = scan_v3()
+                            LAST_SIGNALS_CACHE = {s['symbol']: s for s in sigs}
+                            # FILTER: hanya AKUM untuk scan, biar gak campur DIST
+                            filt_akum = [s for s in sigs if (s.get('multi_tf',{}).get('status_d')=='AKUM' or s.get('broker_status')=='AKUM')]
+                            # kalau mau lihat DIST, pakai /top dist
+                            filt = filt_akum if filt_akum else sigs  # fallback jika tidak ada akum
+                            now_str = get_now_wib().strftime('%d %b %Y %H:%M WIB')
+                            if not filt:
+                                send_reply(target_chat, f"*RAFANO V3* {now_str}
+0 sinyal akumulasi")
+                                return
+                            header = f"*RAFANO V3 PRO - {now_str}*
+Total: {len(filt)} (AKUM only)
+
+"
+                            msg = header; kb=[]
+                            for idx, item in enumerate(filt,1):
+                                def fmt(v): return format_large_number(v, True)
+                                multi = item.get('multi_tf') or {}
+                                daily_str = f"Daily: {multi.get('status_d','')} Net {fmt(multi.get('net_d',0))}"
+                                weekly_str = f"Weekly 5D: {multi.get('status_5d','')} Net {fmt(multi.get('net_5d',0))}"
+                                top_d = format_top_brokers(multi.get('brokers',[]) or item.get('brokers',[]),2,multi.get('status_d','AKUM'))
+                                tp = item.get('trading_plan')
+                                tp_line = f"Entry {tp['entry']} TP1 {tp['tp1']} SL {tp['sl']}" if tp else ""
+                                item_str = f"{idx}. *{item['symbol']}* -- {item.get('close',0)} ({item.get('change_pct',0):+.2f}%)
+   |- {daily_str} | {top_d}
+   |- {weekly_str}
+   +- {tp_line}
+
+"
+                                kb.append([{"text": f"Pro Chart {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
+                                if len(msg) + len(item_str) > 3500:
+                                    send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb})
+                                    msg = item_str; kb = []
+                                else:
+                                    msg += item_str
+                            send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb})
+                            if is_pro:
+                                for top in filt[:3]:
+                                    process_chart_request(target_chat, top['symbol'], "1d", LAST_SIGNALS_CACHE)
+                                    time.sleep(1)
+                        is_pro_flag = (first_word == "/scanpro")
+                        threading.Thread(target=manual_scan, args=(is_pro_flag, chat_id), daemon=True).start()
         except Exception as e:
-            logging.error(f"Listener {e}"); time.sleep(3)
+            print(f"Listener error: {e}")
+            time.sleep(3)
+
 
 def auto_screener_loop():
     global LAST_SIGNALS_CACHE
