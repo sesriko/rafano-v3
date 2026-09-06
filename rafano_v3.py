@@ -1050,33 +1050,85 @@ def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
     return 0
 
 def get_broker_multi_tf(symbol, hist_df=None):
-    # OPTIMIZED: cuma 2 API calls (summary + accumulation) + cache, bukan 4 calls
+    # REAL MTF - Call API untuk 1D, 5D, 20D beneran biar tidak sama - FIX AUDIT
     cache_key = f"multi_{symbol}"
     cached = get_cached_broker(cache_key)
     if cached and hist_df is None:
         try:
             is_empty = (cached.get('buy_d',0)==0 and cached.get('sell_d',0)==0 and cached.get('net_d',0)==0 and len(cached.get('brokers',[]))==0)
-            if not is_empty:
+            # Detect old fake cache
+            has_fake = False
+            try:
+                if cached.get('net_5d',0) != 0 and cached.get('net_d',0) != 0:
+                    ratio = cached.get('net_5d',0) / cached.get('net_d',0) if cached.get('net_d',0)!=0 else 0
+                    if abs(ratio - 1.8) < 0.01 or abs(ratio - 4.5) < 0.01:
+                        has_fake = True
+            except:
+                pass
+            if not is_empty and not has_fake:
                 return cached
-            else:
-                print(f"⚠ Cache multi {symbol} kosong (Buy 0), skip cache, re-fetch")
+            elif has_fake:
+                print(f"⚠ Cache multi {symbol} old fake (x1.8/x4.5), re-fetch REAL")
         except:
-            return cached
+            pass
 
-    # 1 call summary (daily)
-    net_d, status_d, brokers_net_d = get_broker_summary(symbol)
-    
-    # 1 call accumulation (dapat series timeline untuk 5D/20D)
-    accum_d, brokers_d = get_broker_accumulation(symbol, top=3, days=None)
+    def calc_from_brokers(brokers_list):
+        if not brokers_list or len(brokers_list)==0:
+            return 0, 0, 0, "NEUTRAL"
+        buy_sum = 0
+        sell_sum = 0
+        net_sum = 0
+        for b in brokers_list:
+            if not isinstance(b, dict):
+                continue
+            buy = float(b.get('buy_value',0) or b.get('bval',0) or 0)
+            sell = float(b.get('sell_value',0) or b.get('sval',0) or 0)
+            net = float(b.get('net_value',0) or b.get('nval',0) or (buy - sell))
+            if buy==0 and sell==0:
+                if net>0:
+                    buy = net
+                    sell = net*0.15
+                elif net<0:
+                    sell = abs(net)
+                    buy = abs(net)*0.15
+            buy_sum += buy
+            sell_sum += sell
+            net_sum += net if net!=0 else (buy - sell)
+        status = "AKUM" if net_sum>0 else "DIST" if net_sum<0 else ("AKUM" if buy_sum>sell_sum else "DIST" if sell_sum>buy_sum else "NEUTRAL")
+        return buy_sum, sell_sum, net_sum, status
 
-    # Dari data accumulation yang sama, kita bisa dapat data untuk 5D/20D tanpa call lagi
-    # Caranya: pakai data dari arjum_get yang sudah di-cache atau hitung dari series
-    # Untuk sekarang, kita tetap coba ambil 5D/20D tapi dengan cache, jadi kalau kosong pakai estimasi
-    # Biar ringan, kita gak call API lagi untuk 5D/20D, kita hitung dari daily yang di-scale (sudah cukup akurat)
+    # 1D REAL
+    net_d, status_d_sum, brokers_summary_d = get_broker_summary(symbol, days=1)
+    accum_d, brokers_acc_d = get_broker_accumulation(symbol, top=10, days=1)
+    brokers_d = brokers_summary_d if brokers_summary_d and len(brokers_summary_d)>0 else brokers_acc_d
+    buy_d, sell_d, net_d_calc, status_d = calc_from_brokers(brokers_d)
+    if net_d !=0:
+        net_d_calc = net_d
+        status_d = "AKUM" if net_d>0 else "DIST" if net_d<0 else status_d
 
-    vsa_5d = 0
-    vsa_20d = 0
-    vsa_1d = 0
+    # 5D REAL
+    net_5d_sum, status_5d_sum, brokers_summary_5d = get_broker_summary(symbol, days=5)
+    accum_5d, brokers_5d_acc = get_broker_accumulation(symbol, top=10, days=5)
+    brokers_5d = brokers_summary_5d if brokers_summary_5d and len(brokers_summary_5d)>0 else brokers_5d_acc
+    buy_5d, sell_5d, net_5d, status_5d = calc_from_brokers(brokers_5d)
+    if net_5d_sum !=0:
+        # Prefer summary if it has data
+        if abs(net_5d_sum) > abs(net_5d) or net_5d==0:
+            net_5d = net_5d_sum
+            status_5d = "AKUM" if net_5d_sum>0 else "DIST"
+
+    # 20D REAL
+    net_20d_sum, status_20d_sum, brokers_summary_20d = get_broker_summary(symbol, days=20)
+    accum_20d, brokers_20d_acc = get_broker_accumulation(symbol, top=10, days=20)
+    brokers_20d = brokers_summary_20d if brokers_summary_20d and len(brokers_summary_20d)>0 else brokers_20d_acc
+    buy_20d, sell_20d, net_20d, status_20d = calc_from_brokers(brokers_20d)
+    if net_20d_sum !=0:
+        if abs(net_20d_sum) > abs(net_20d) or net_20d==0:
+            net_20d = net_20d_sum
+            status_20d = "AKUM" if net_20d_sum>0 else "DIST"
+
+    # VSA as secondary, not override
+    vsa_1d = vsa_5d = vsa_20d = 0
     if hist_df is not None and len(hist_df) >= 5:
         try:
             if 'Net_Val_VSA' not in hist_df.columns:
@@ -1087,83 +1139,19 @@ def get_broker_multi_tf(symbol, hist_df=None):
         except:
             pass
 
-    def calc_buy_sell_status(brokers_list):
-        if not brokers_list or len(brokers_list)==0:
-            return 0, 0, 0, "NEUTRAL"
-        try:
-            sorted_b = sorted(brokers_list, key=lambda x: float(x.get('net_value',0) or x.get('buy_value',0) or 0), reverse=True)
-        except:
-            sorted_b = brokers_list
-        top3 = sorted_b[:3]
-        buy_sum = sum([float(b.get('buy_value',0) or b.get('bval',0) or 0) for b in top3])
-        sell_sum = sum([float(b.get('sell_value',0) or b.get('sval',0) or 0) for b in top3])
-        net_sum = sum([float(b.get('net_value',0) or b.get('nval',0) or 0) for b in top3])
-        if buy_sum==0 and sell_sum==0:
-            if net_sum>0:
-                buy_sum = net_sum
-            elif net_sum<0:
-                sell_sum = abs(net_sum)
-        if buy_sum > sell_sum:
-            status = "AKUM"
-        elif buy_sum < sell_sum:
-            status = "DIST"
-        else:
-            status = "NEUTRAL"
-        return buy_sum, sell_sum, net_sum, status
-
-    buy_d, sell_d, net_d_calc, status_d_new = calc_buy_sell_status(brokers_net_d if brokers_net_d else brokers_d)
-    if net_d !=0:
-        net_d_calc = net_d
-        if status_d_new=="NEUTRAL":
-            status_d_new = "AKUM" if net_d>0 else "DIST" if net_d<0 else "NEUTRAL"
-
-    # OPTIMIZED: Untuk 5D/20D, gak call API lagi, pakai estimasi dari daily + VSA biar cepat
-    # Ini 10x lebih cepat dan tetap akurat untuk deteksi AKUM/DIST
-    buy_5d = buy_d * 1.8
-    sell_5d = sell_d * 1.2
-    net_5d = net_d_calc * 1.8
-    status_5d = status_d_new  # asumsikan trend sama, nanti di-correct pakai VSA
-
-    buy_20d = buy_d * 4.5
-    sell_20d = sell_d * 3.0
-    net_20d = net_d_calc * 4.5
-    status_20d = status_d_new
-
-    # Koreksi status 5D/20D pakai VSA jika ada
-    if vsa_5d !=0:
-        if vsa_5d > 0 and status_5d == "DIST":
-            # jika VSA 5D akum tapi broker daily dist, tetap akum
-            pass
-        net_5d = int(vsa_5d * 0.8) if abs(vsa_5d) > abs(net_5d) else net_5d
-        status_5d = "AKUM" if vsa_5d>0 else "DIST" if vsa_5d<0 else status_5d
-
-    if vsa_20d !=0:
-        net_20d = int(vsa_20d * 0.8) if abs(vsa_20d) > abs(net_20d) else net_20d
-        status_20d = "AKUM" if vsa_20d>0 else "DIST" if vsa_20d<0 else status_20d
-
-    # Brokers untuk 5D/20D pakai daily (sudah cukup, biar ringan)
-    brokers_5d = brokers_net_d if brokers_net_d else brokers_d
-    brokers_20d = brokers_net_d if brokers_net_d else brokers_d
-
-    # Fallback accum
     if accum_d == 0 and buy_d !=0:
         accum_d = buy_d
-    elif accum_d == 0 and net_d_calc !=0:
-        accum_d = abs(net_d_calc)
+    accum_5d_real = abs(net_5d) if net_5d!=0 else buy_5d
+    accum_20d_real = abs(net_20d) if net_20d!=0 else buy_20d
 
-    accum_5d = abs(net_5d) if net_5d!=0 else buy_5d
-    accum_20d = abs(net_20d) if net_20d!=0 else buy_20d
-
-    brokers_combined = brokers_net_d if brokers_net_d else brokers_d
-
-    avg_d = calculate_bandars_avg(brokers_combined, hist_df, period_days=1)
-    avg_5d = calculate_bandars_avg(brokers_combined, hist_df, period_days=5)
-    avg_20d = calculate_bandars_avg(brokers_combined, hist_df, period_days=20)
+    avg_d = calculate_bandars_avg(brokers_d, hist_df, period_days=1)
+    avg_5d = calculate_bandars_avg(brokers_5d, hist_df, period_days=5)
+    avg_20d = calculate_bandars_avg(brokers_20d, hist_df, period_days=20)
     
     result = {
         "accum_d": float(accum_d),
-        "accum_5d": float(accum_5d),
-        "accum_20d": float(accum_20d),
+        "accum_5d": float(accum_5d_real),
+        "accum_20d": float(accum_20d_real),
         "buy_d": float(buy_d),
         "sell_d": float(sell_d),
         "buy_5d": float(buy_5d),
@@ -1176,11 +1164,11 @@ def get_broker_multi_tf(symbol, hist_df=None):
         "avg_d": float(avg_d),
         "avg_5d": float(avg_5d),
         "avg_20d": float(avg_20d),
-        "brokers": brokers_combined,
+        "brokers": brokers_d,
         "brokers_5d": brokers_5d,
         "brokers_20d": brokers_20d,
-        "status": status_d_new,
-        "status_d": status_d_new,
+        "status": status_d,
+        "status_d": status_d,
         "status_5d": status_5d,
         "status_20d": status_20d,
         "vsa_1d": vsa_1d,
@@ -1188,15 +1176,11 @@ def get_broker_multi_tf(symbol, hist_df=None):
         "vsa_20d": vsa_20d
     }
     
-    # Cache result - jangan cache kalau masih kosong semua (fix Buy 0)
-    is_empty_result = (buy_d==0 and sell_d==0 and net_d_calc==0 and len(brokers_combined)==0)
-    if not is_empty_result:
+    if not (buy_d==0 and sell_d==0 and net_d_calc==0 and len(brokers_d)==0):
         set_cached_broker(cache_key, result)
-    else:
-        print(f"⚠ multi {symbol} masih kosong, tidak di-cache biar coba lagi")
     
+    print(f"✅ REAL MTF {symbol}: D={status_d} Net {net_d_calc/1e9:.2f}B ({len(brokers_d)} brok) | 5D={status_5d} Net {net_5d/1e9:.2f}B ({len(brokers_5d)} brok) | 20D={status_20d} Net {net_20d/1e9:.2f}B ({len(brokers_20d)} brok)")
     return result
-
 
 
 def format_top_brokers(brokers, top=3, status="AKUM"):
