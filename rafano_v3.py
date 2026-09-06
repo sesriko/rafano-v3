@@ -2040,6 +2040,7 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
             monthly_line = ""
 
         if tp:
+            top_broker_str = top_d_str if 'top_d_str' in locals() else "-"
             sig_type = tp.get('signal_type','NO SIGNAL')
             sig_reason = tp.get('signal_reason','')
             sig_strength = tp.get('signal_strength',0)
@@ -2116,6 +2117,7 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
                     f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
                 )
         else:
+            top_broker_str = top_d_str if 'top_d_str' in locals() else "-"
             if multi:
                 caption = (
                     f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\n"
