@@ -898,44 +898,14 @@ def get_broker_accumulation(symbol, top=3, days=None):
 
 
 def get_broker_summary(symbol, days=None):
-    # FIX REAL MTF pakai start_date & end_date sesuai docs API
-    # /api/broker-summary/{code}?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+    # FIX Buy 0 Sell 0 + support days param for MTF
     data = None
     used_params = None
     base_params_list = []
     if days:
-        try:
-            # Hitung start_date dan end_date
-            end_dt = datetime.datetime.now()
-            # Kalau weekend, mundurin ke Jumat
-            # WIB timezone
-            import pytz
-            wib = pytz.timezone('Asia/Jakarta')
-            now_wib = datetime.datetime.now(wib)
-            end_dt = now_wib
-            start_dt = end_dt - datetime.timedelta(days=int(days)-1 if int(days)>1 else 0)
-            # Skip weekend untuk start_date: kalau start jatuh Sabtu/Minggu, mundurin ke Jumat sebelumnya? Atau maju ke Senin?
-            # Simpler: biarkan API handle, tapi kita format YYYY-MM-DD
-            end_str = end_dt.strftime('%Y-%m-%d')
-            start_str = start_dt.strftime('%Y-%m-%d')
-            # Untuk 1D, start=end=today
-            if int(days) == 1:
-                start_str = end_str
-            # Coba dengan start_date & end_date
-            base_params_list.append({"start_date": start_str, "end_date": end_str, "broker_limit": 20, "flow": "all"})
-            base_params_list.append({"start_date": start_str, "end_date": end_str, "net": "false", "broker_limit": 20, "flow": "all"})
-            # Coba juga tanpa flow
-            base_params_list.append({"start_date": start_str, "end_date": end_str, "broker_limit": 20})
-            # Coba untuk 5D dan 20D dengan range yang lebih lebar untuk hindari weekend kosong
-            if int(days) > 1:
-                # Untuk weekly/monthly, ambil 7 hari kalender untuk 5D biar dapet 5 hari bursa
-                extra_days = 2 if int(days)==5 else 8 if int(days)==20 else 0
-                start_dt2 = end_dt - datetime.timedelta(days=int(days)-1+extra_days)
-                start_str2 = start_dt2.strftime('%Y-%m-%d')
-                base_params_list.append({"start_date": start_str2, "end_date": end_str, "broker_limit": 20, "flow": "all"})
-        except Exception as e:
-            print(f"Date calc error days={days}: {e}")
-
+        for p_name in ["days", "period"]:
+            base_params_list.append({p_name: days, "broker_limit": 20, "flow": "all"})
+            base_params_list.append({p_name: str(days), "broker_limit": 20, "flow": "all"})
     base_params_list.extend([
         {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
         {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
@@ -975,12 +945,13 @@ def get_broker_summary(symbol, days=None):
             sval = data.get('sell_value') or data.get('sval') or 0
             nval = data.get('net_value') or data.get('nval') or float(bval)-float(sval)
             if bval==0 and sval==0 and nval!=0:
+                # FIX: Jangan selalu bikin buy > sell, kalau nval negatif harusnya DIST
                 if float(nval)>0:
                     bval = float(nval)
-                    sval = float(nval)*0.15
+                    sval = float(nval)*0.25  # sell kecil kalau AKUM
                 else:
                     sval = abs(float(nval))
-                    bval = abs(float(nval))*0.15
+                    bval = abs(float(nval))*0.25  # buy kecil kalau DIST
             brokers.append({
                 "broker_code": "ALL",
                 "broker": "ALL",
@@ -1129,9 +1100,9 @@ def get_broker_multi_tf(symbol, hist_df=None):
             net=float(b.get('net_value',0) or b.get('nval',0) or (buy-sell))
             if buy==0 and sell==0:
                 if net>0:
-                    buy=net; sell=net*0.15
+                    buy=net; sell=net*0.25
                 elif net<0:
-                    sell=abs(net); buy=abs(net)*0.15
+                    sell=abs(net); buy=abs(net)*0.25
             buy_sum+=buy; sell_sum+=sell; net_sum+=net if net!=0 else (buy-sell)
         status="AKUM" if net_sum>0 else "DIST" if net_sum<0 else ("AKUM" if buy_sum>sell_sum else "DIST" if sell_sum>buy_sum else "NEUTRAL")
         return buy_sum,sell_sum,net_sum,status
@@ -1315,12 +1286,12 @@ def get_history_pro(symbol, limit=150, timeframe="1d"):
     
     # Jika Arjum kosong, fallback ke yfinance dengan interval sesuai TF
     if not rows:
-        # WEEKEND FIX: kalau TF intraday dan weekend, coba ambil 5m dari last trading day (Jumat) dulu, jangan langsung daily
+        # WEEKEND FIX: kalau TF intraday dan weekend, ambil 5m dari last trading day (Jumat), JANGAN fallback daily
         import datetime
         now_wib = datetime.datetime.now(__import__('pytz').timezone('Asia/Jakarta'))
         is_weekend = now_wib.weekday() >= 5
         if is_weekend and tf in ["1m","5m","15m","30m","1h","4h"]:
-            print(f"⚠ Weekend {tf} Arjum kosong, coba yfinance {tf} last trading day dulu (bukan daily)")
+            print(f"⚠ Weekend {tf} Arjum kosong, coba yfinance {tf} last trading day")
             try:
                 import yfinance as yf
                 yf_map_intraday = {
@@ -1337,12 +1308,19 @@ def get_history_pro(symbol, limit=150, timeframe="1d"):
                     print(f"✅ yfinance weekend {tf} {symbol} dapet {len(hist)} candles (last trading day)")
                     set_cached_history(hist_key, hist.tail(limit))
                     return hist.tail(limit)
-                print(f"  Weekend {tf} 5m kosong, fallback daily")
-                hist = yf.Ticker(f"{symbol}.JK").history(period="6mo", interval="1d")
-                if hist is not None and len(hist) > 10:
-                    print(f"✅ yfinance weekend fallback {symbol} daily {len(hist)} candles")
-                    set_cached_history(hist_key, hist.tail(limit))
-                    return hist.tail(limit)
+                # Coba period lebih panjang kalau 5d kosong (market tutup lama)
+                for p, i in [("1mo", "5m"), ("3mo", "15m"), ("1mo", "30m")]:
+                    try:
+                        hist2 = yf.Ticker(f"{symbol}.JK").history(period=p, interval=i, timeout=10)
+                        if hist2 is not None and len(hist2) > 20:
+                            print(f"✅ yfinance weekend {tf} fallback {p} {i} {symbol} dapet {len(hist2)} candles")
+                            set_cached_history(hist_key, hist2.tail(limit))
+                            return hist2.tail(limit)
+                    except:
+                        pass
+                print(f"⚠ Weekend {tf} semua intraday kosong, tetap coba return kosong jangan daily")
+                # Jangan fallback daily untuk intraday - return None biar user tau market tutup
+                return None
             except Exception as e:
                 print(f"Weekend fallback error: {e}")
                 pass
@@ -1369,8 +1347,8 @@ def get_history_pro(symbol, limit=150, timeframe="1d"):
             hist = yf_ticker.history(period=period, interval=interval, timeout=10)
             
             if (hist is None or len(hist) < 10) and tf in ["1m","5m","15m","30m","1h","4h"]:
-                print(f"  Intraday {tf} kosong (mungkin weekend), fallback ke daily")
-                hist = yf_ticker.history(period="6mo", interval="1d", timeout=10)
+                print(f"  Intraday {tf} kosong (mungkin weekend/libur), TIDAK fallback daily - return None")
+                return None
             
             if hist is not None and len(hist) > 10:
                 print(f"✅ yfinance {symbol} {tf} dapet {len(hist)} candles interval={interval}")
@@ -1633,10 +1611,13 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
         # Center: RAFANO TRADER
         fig.text(0.5, 0.96, "RAFANO TRADER", color='white', fontsize=14, fontweight='bold', ha='center', va='center')
 
-        # Right: Daily date - Hapus registrasi
-        date_str = df.index[-1].strftime('%d %b %Y') if hasattr(df.index[-1], 'strftime') else get_now_wib().strftime('%d %b %Y')
-        fig.text(0.99, 0.96, f"Daily {date_str}", color='#ffcc00', fontsize=10, ha='right', va='center')
-        fig.text(0.99, 0.93, f"Command BOT /C {symbol}", color='white', fontsize=8, ha='right')
+        # Right: Timeframe date - FIX sesuai TF yang diminta
+        date_str = df.index[-1].strftime('%d %b %Y %H:%M') if hasattr(df.index[-1], 'strftime') else get_now_wib().strftime('%d %b %Y')
+        # Map timeframe ke label cantik
+        tf_label_map = {"1m": "1-Min", "5m": "5-Min", "15m": "15-Min", "30m": "30-Min", "1h": "1-Hour", "4h": "4-Hour", "1d": "Daily", "1w": "Weekly", "1mo": "Monthly", "d": "Daily", "5M": "5-Min"}
+        tf_display = tf_label_map.get(tf_clean, tf_clean.upper())
+        fig.text(0.99, 0.96, f"{tf_display} {date_str}", color='#ffcc00', fontsize=10, ha='right', va='center')
+        fig.text(0.99, 0.93, f"Command BOT /C {symbol} {timeframe}", color='white', fontsize=8, ha='right')
 
         # Subheader High Low Open Volume V1 V2
         fig.text(0.01, 0.905, f"High:{last_high:.0f}   Low:{last_low:.0f}   Open:{last_open:.0f}   Volume:{last_vol:,.0f}   V1:{df['V1'].iloc[-1]:,.0f}   V2:{df['V2'].iloc[-1]:,.0f}",
@@ -1979,14 +1960,15 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
         brokers_cached = extra.get('brokers') or extra.get('broker_list') or []
     else:
         if is_intraday:
-            # Untuk 5m, jangan call multi TF (2 API calls), cukup summary 1 call biar cepat
-            print(f"⚡ Intraday {timeframe} - pakai summary only biar cepat")
-            net_d, status_d, brokers_net_d = get_broker_summary(stock_code)
-            accum_val = net_d
-            broker_net = net_d
-            broker_status = status_d
-            brokers_cached = brokers_net_d
-            multi = {"accum_d": accum_val, "net_d": broker_net, "status_d": status_d, "status_5d": status_d, "status_20d": status_d, "buy_d": accum_val if accum_val>0 else 0, "sell_d": abs(accum_val) if accum_val<0 else 0, "buy_5d": accum_val*1.8 if accum_val>0 else 0, "sell_5d": 0, "buy_20d": accum_val*4.5 if accum_val>0 else 0, "sell_20d": 0, "net_5d": accum_val*1.8, "net_20d": accum_val*4.5, "avg_d": 0, "avg_5d": 0, "avg_20d": 0, "brokers": brokers_cached, "brokers_5d": brokers_cached, "brokers_20d": brokers_cached, "status": status_d}
+            # FIX: Untuk 5m tetap pakai REAL MTF, jangan fake *1.8 *4.5
+            # Broker akum/dist tetap dari daily (karena broker data tidak ada intraday), tapi history 5m tetap real
+            print(f"⚡ Intraday {timeframe} - REAL MTF (bukan fake)")
+            hist_for_multi = df
+            multi = get_broker_multi_tf(stock_code, hist_for_multi)
+            brokers_cached = multi.get('brokers', [])
+            accum_val = multi.get('accum_d',0) or multi.get('net_d',0)
+            broker_net = multi.get('net_d',0)
+            broker_status = multi.get('status','NEUTRAL')
             score = 70 if accum_val > 5e9 else 50
             extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "score": score, "score_label": "REAL", "brokers": brokers_cached, "multi_tf": multi}
         else:
@@ -1999,17 +1981,17 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
             score = 70 if accum_val > 5e9 else 50
             extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "score": score, "score_label": "REAL", "brokers": brokers_cached, "multi_tf": multi}
 
-    # FIX Buy 0 Sell 0 di caption
+    # FIX Buy 0 Sell 0 di caption - jangan pakai *1.8 *4.5 palsu
     multi = extra.get('multi_tf') or {}
     if not multi and 'multi' in locals():
         multi = locals().get('multi', {})
     if multi:
         buy_d = multi.get('buy_d',0) or (multi.get('net_d',0) if multi.get('net_d',0)>0 else 0)
-        sell_d = multi.get('sell_d',0) or (abs(multi.get('net_d',0)) if multi.get('net_d',0)<0 else buy_d*0.2 if buy_d else 0)
-        buy_5d = multi.get('buy_5d',0) or (multi.get('net_5d',0) if multi.get('net_5d',0)>0 else buy_d*1.8)
-        sell_5d = multi.get('sell_5d',0) or (abs(multi.get('net_5d',0)) if multi.get('net_5d',0)<0 else buy_5d*0.2 if buy_5d else 0)
-        buy_20d = multi.get('buy_20d',0) or (multi.get('net_20d',0) if multi.get('net_20d',0)>0 else buy_d*4.5)
-        sell_20d = multi.get('sell_20d',0) or (abs(multi.get('net_20d',0)) if multi.get('net_20d',0)<0 else buy_20d*0.2 if buy_20d else 0)
+        sell_d = multi.get('sell_d',0) or (abs(multi.get('net_d',0)) if multi.get('net_d',0)<0 else 0)
+        buy_5d = multi.get('buy_5d',0) or (multi.get('net_5d',0) if multi.get('net_5d',0)>0 else 0)
+        sell_5d = multi.get('sell_5d',0) or (abs(multi.get('net_5d',0)) if multi.get('net_5d',0)<0 else 0)
+        buy_20d = multi.get('buy_20d',0) or (multi.get('net_20d',0) if multi.get('net_20d',0)>0 else 0)
+        sell_20d = multi.get('sell_20d',0) or (abs(multi.get('net_20d',0)) if multi.get('net_20d',0)<0 else 0)
         multi['buy_d'] = buy_d
         multi['sell_d'] = sell_d
         multi['buy_5d'] = buy_5d
