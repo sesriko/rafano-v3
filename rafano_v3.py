@@ -329,148 +329,205 @@ def detect_sell_signals(df, multi_tf=None):
         return [], df
 
 def calculate_trading_plan(df, signals=None, multi_tf=None):
-    """Build a trading plan only when a valid recent trigger exists."""
+    """
+    Trading plan MTF: Berlaku multi timeframe
+    - Primary TF = timeframe chart yang dipanggil
+    - Konfirmasi Higher TF (Weekly) trend
+    - Konfirmasi Lower TF (5m/15m) untuk entry timing
+    """
     try:
         if df is None or len(df) < 20:
             return None
-        last_close = float(df['Close'].iloc[-1])
+        last_close = df['Close'].iloc[-1]
         atr = calculate_atr(df, 14).iloc[-1]
-        if pd.isna(atr) or atr <= 0:
+        if pd.isna(atr) or atr == 0:
             atr = last_close * 0.03
-        ema20 = df['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = df['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
-        ema200 = df['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
+        ema20 = df['Close'].ewm(span=20).mean().iloc[-1]
+        ema50 = df['Close'].ewm(span=50).mean().iloc[-1]
+        ema200 = df['Close'].ewm(span=200).mean().iloc[-1]
 
+        # Deteksi sinyal jika belum ada
         if signals is None:
             buy_sigs, _ = detect_buy_signals(df, multi_tf)
             sell_sigs, _ = detect_sell_signals(df, multi_tf)
             signals = buy_sigs + sell_sigs
         else:
-            buy_sigs = [s for s in signals if s.get('side') == 'BUY']
-            sell_sigs = [s for s in signals if s.get('side') == 'SELL']
+            buy_sigs = [s for s in signals if s.get('side')=='BUY']
+            sell_sigs = [s for s in signals if s.get('side')=='SELL']
 
-        mtf_confirm = "NEUTRAL"
+        # === MTF ANALYSIS ===
         mtf_trend = {}
+        mtf_confirm = "NEUTRAL"
+        weekly_bullish = False
+        monthly_bullish = False
         if multi_tf:
-            status_5d = multi_tf.get('status_5d', 'NEUTRAL')
-            status_20d = multi_tf.get('status_20d', 'NEUTRAL')
-            net_5d = float(multi_tf.get('net_5d', 0) or 0)
-            net_20d = float(multi_tf.get('net_20d', 0) or 0)
-            mtf_trend = {'weekly': status_5d, 'monthly': status_20d}
-            weekly_bullish = status_5d == 'AKUM' and net_5d > 0
-            monthly_bullish = status_20d == 'AKUM' and net_20d > 0
+            # Dari multi_tf broker + price vs EMA
+            # Weekly 5D dan Monthly 20D status
+            status_5d = multi_tf.get('status_5d','NEUTRAL')
+            status_20d = multi_tf.get('status_20d','NEUTRAL')
+            net_5d = multi_tf.get('net_5d',0)
+            net_20d = multi_tf.get('net_20d',0)
+            mtf_trend['weekly'] = status_5d
+            mtf_trend['monthly'] = status_20d
+            weekly_bullish = status_5d == "AKUM" and net_5d > 0
+            monthly_bullish = status_20d == "AKUM" and net_20d > 0
             if weekly_bullish and monthly_bullish:
-                mtf_confirm = 'STRONG BULLISH MTF'
+                mtf_confirm = "STRONG BULLISH MTF"
             elif weekly_bullish or monthly_bullish:
-                mtf_confirm = 'BULLISH MTF'
-            elif status_5d == 'DIST' and status_20d == 'DIST':
-                mtf_confirm = 'BEARISH MTF'
+                mtf_confirm = "BULLISH MTF"
+            elif status_5d == "DIST" and status_20d == "DIST":
+                mtf_confirm = "BEARISH MTF"
 
-        recent_buy = [s for s in buy_sigs if s.get('index', -999) >= len(df)-10]
-        recent_sell = [s for s in sell_sigs if s.get('index', -999) >= len(df)-10]
-        last_signal = None
+        # Tentukan sinyal terbaru (10 candle terakhir)
+        recent_buy = [s for s in (buy_sigs if 'buy_sigs' in locals() else []) if s['index'] >= len(df)-10]
+        recent_sell = [s for s in (sell_sigs if 'sell_sigs' in locals() else []) if s['index'] >= len(df)-10]
+
         if recent_buy and (not recent_sell or recent_buy[-1]['index'] >= recent_sell[-1]['index']):
             last_signal = recent_buy[-1]
-            side = 'BUY'
+            entry = last_signal['entry']
+            sl = last_signal['sl']
+            signal_type = last_signal['type']
+            signal_reason = last_signal['reason']
+            signal_strength = last_signal['strength']
+            signal_date = last_signal['date']
+            side = "BUY"
+            is_buy = True
         elif recent_sell:
             last_signal = recent_sell[-1]
-            side = 'SELL'
+            entry = last_signal['entry']
+            sl = last_signal['sl']
+            signal_type = last_signal['type']
+            signal_reason = last_signal['reason']
+            signal_strength = last_signal['strength']
+            signal_date = last_signal['date']
+            side = "SELL"
+            is_buy = False
         else:
-            side = 'WAIT'
-
-        if last_close > ema20 and last_close > ema50 and last_close > ema200:
-            trend = 'STRONG UPTREND'
-        elif last_close > ema20 and last_close > ema50:
-            trend = 'UPTREND'
-        elif last_close > ema20:
-            trend = 'WEAK UPTREND'
-        elif last_close < ema20 and last_close < ema50 and last_close < ema200:
-            trend = 'STRONG DOWNTREND'
-        else:
-            trend = 'DOWNTREND'
-
-        # Hard gate: falling trend + no BUY trigger in last 3 candles => WAIT.
-        very_recent_buy = [s for s in buy_sigs if s.get('index', -999) >= len(df)-3]
-        if 'DOWNTREND' in trend and side == 'BUY' and not very_recent_buy:
-            side = 'WAIT'
-            last_signal = None
-
-        if side == 'WAIT':
-            signal_type = 'NO SIGNAL'
-            signal_reason = f'Tunggu trigger valid. Trend {trend}; tidak ada trigger BUY/SELL yang valid sesuai aturan.'
+            # No recent signal
+            entry = round_to_ihsg_fraction(last_close)
+            sl = round_to_ihsg_fraction(max(df['Low'].tail(5).min(), last_close - atr*1.5))
+            signal_type = "NO SIGNAL"
+            signal_reason = "Tunggu BO EMA50 / BOW BB / BOS EMA (BUY) atau BD EMA50 / SOS BB (SELL)"
             signal_strength = 0
             signal_date = df.index[-1]
-            entry = sl = tp1 = tp2 = None
-            risk = reward1 = reward2 = 0.0
-            rr1 = rr2 = 0.0
-            is_buy = is_sell = False
-        else:
-            entry = float(last_signal['entry'])
-            sl = float(last_signal['sl'])
-            signal_type = last_signal.get('type', 'SIGNAL')
-            signal_reason = last_signal.get('reason', '')
-            signal_strength = int(last_signal.get('strength', 0))
-            signal_date = last_signal.get('date', df.index[-1])
-            is_buy = side == 'BUY'
-            is_sell = side == 'SELL'
+            side = "WAIT"
+            is_buy = False
 
-            if side == 'BUY':
-                if mtf_confirm == 'STRONG BULLISH MTF':
-                    signal_strength = min(100, signal_strength + 10)
-                    signal_reason += ' + MTF Weekly+Monthly AKUM'
-                elif mtf_confirm == 'BULLISH MTF':
-                    signal_strength = min(95, signal_strength + 5)
-                    signal_reason += ' + MTF Bullish'
-                min_sl, max_sl = last_close * 0.92, last_close * 0.98
-                sl = max(min(sl, max_sl), min_sl)
-                sl = round_to_ihsg_fraction(sl)
-                if entry <= sl:
-                    entry = round_to_ihsg_fraction(sl * 1.03)
-                if 'BOW' in signal_type:
-                    tp1, tp2 = round_to_ihsg_fraction(entry*1.04), round_to_ihsg_fraction(entry*1.08)
-                elif 'BO EMA50' in signal_type:
-                    tp1, tp2 = round_to_ihsg_fraction(entry+atr*1.5), round_to_ihsg_fraction(entry+atr*3.0)
-                    if mtf_confirm == 'STRONG BULLISH MTF': tp2 = round_to_ihsg_fraction(entry+atr*4.0)
-                else:
-                    tp1, tp2 = round_to_ihsg_fraction(entry*1.035), round_to_ihsg_fraction(entry+atr*1.8)
-                risk, reward1, reward2 = entry-sl, tp1-entry, tp2-entry
+        # MTF Boost strength
+        if side == "BUY" and mtf_confirm == "STRONG BULLISH MTF":
+            signal_strength = min(100, signal_strength + 10)
+            signal_reason += " + MTF Weekly+Monthly AKUM"
+        elif side == "BUY" and mtf_confirm == "BULLISH MTF":
+            signal_strength = min(95, signal_strength + 5)
+            signal_reason += " + MTF Bullish"
+        elif side == "SELL" and mtf_confirm == "BEARISH MTF":
+            signal_strength = min(100, signal_strength + 10)
+            signal_reason += " + MTF Weekly+Monthly DIST"
+
+        # Validasi SL max 7% risk
+        min_sl = last_close * 0.92
+        max_sl = last_close * 0.98
+        sl = max(min(sl, max_sl), min_sl)
+        sl = round_to_ihsg_fraction(sl)
+        if entry <= sl and side != "SELL":
+            entry = round_to_ihsg_fraction(sl * 1.03)
+
+        # TP berdasarkan tipe sinyal + MTF
+        if side == "BUY":
+            if "BOW" in signal_type:
+                tp1 = round_to_ihsg_fraction(entry * 1.04)
+                tp2 = round_to_ihsg_fraction(entry * 1.08)
+            elif "BO EMA50" in signal_type:
+                tp1 = round_to_ihsg_fraction(entry + atr*1.5)
+                tp2 = round_to_ihsg_fraction(entry + atr*3.0)
+                if mtf_confirm == "STRONG BULLISH MTF":
+                    tp2 = round_to_ihsg_fraction(entry + atr*4.0)  # target lebih tinggi kalau MTF bullish
             else:
-                if mtf_confirm == 'BEARISH MTF':
-                    signal_strength = min(100, signal_strength + 10)
-                    signal_reason += ' + MTF Weekly+Monthly DIST'
-                sl = round_to_ihsg_fraction(min(max(sl, last_close*1.02), last_close*1.08))
-                if entry >= sl: entry = round_to_ihsg_fraction(sl*0.97)
-                if 'SOS' in signal_type:
-                    tp1, tp2 = round_to_ihsg_fraction(entry*0.96), round_to_ihsg_fraction(entry*0.92)
-                elif 'BD EMA50' in signal_type:
-                    tp1, tp2 = round_to_ihsg_fraction(entry-atr*1.5), round_to_ihsg_fraction(entry-atr*3.0)
-                else:
-                    tp1, tp2 = round_to_ihsg_fraction(entry*0.965), round_to_ihsg_fraction(entry-atr*1.8)
-                risk, reward1, reward2 = sl-entry, entry-tp1, entry-tp2
-            rr1 = reward1/risk if risk > 0 else 0
-            rr2 = reward2/risk if risk > 0 else 0
+                tp1 = round_to_ihsg_fraction(entry * 1.035)
+                tp2 = round_to_ihsg_fraction(entry + atr*1.8)
+            risk = entry - sl
+            reward1 = tp1 - entry
+            reward2 = tp2 - entry
+        elif side == "SELL":
+            sl_sell = min(max(sl, last_close*1.02), last_close*1.08)
+            sl = round_to_ihsg_fraction(sl_sell)
+            if entry >= sl:
+                entry = round_to_ihsg_fraction(sl * 0.97)
+            tp1 = round_to_ihsg_fraction(entry * 0.965)
+            tp2 = round_to_ihsg_fraction(entry - atr*1.8)
+            if "SOS" in signal_type:
+                tp1 = round_to_ihsg_fraction(entry * 0.96)
+                tp2 = round_to_ihsg_fraction(entry * 0.92)
+            elif "BD EMA50" in signal_type:
+                tp1 = round_to_ihsg_fraction(entry - atr*1.5)
+                tp2 = round_to_ihsg_fraction(entry - atr*3.0)
+            risk = sl - entry
+            reward1 = entry - tp1
+            reward2 = entry - tp2
+        else:
+            tp1 = round_to_ihsg_fraction(entry * 1.035)
+            tp2 = round_to_ihsg_fraction(entry + atr*1.8)
+            risk = entry - sl
+            reward1 = tp1 - entry
+            reward2 = tp2 - entry
+
+        rr1 = reward1 / risk if risk>0 else 0
+        rr2 = reward2 / risk if risk>0 else 0
+
+        if last_close > ema20 and last_close > ema50 and last_close > ema200:
+            trend = "STRONG UPTREND"
+        elif last_close > ema20 and last_close > ema50:
+            trend = "UPTREND"
+        elif last_close > ema20:
+            trend = "WEAK UPTREND"
+        elif last_close < ema20 and last_close < ema50 and last_close < ema200:
+            trend = "STRONG DOWNTREND"
+        else:
+            trend = "DOWNTREND"
+
+        # FIX AUDIT: DOWNTREND harus WAIT kecuali trigger fresh 3 candle
+        if "DOWNTREND" in trend:
+            very_recent_buy = [s for s in (buy_sigs if 'buy_sigs' in locals() else []) if s['index'] >= len(df)-3]
+            if not very_recent_buy and 'side' in locals() and side == "BUY":
+                side = "WAIT"
+                is_buy = False
+                signal_type = "NO SIGNAL"
+                signal_reason = f"Tunggu trigger valid - Trend {trend}, tidak ada BO/BOW 3 candle terakhir. MTF {mtf_confirm} bukan jaminan"
+                signal_strength = 0
+
+        # Gabung trend dengan MTF confirm
+        trend_mtf = f"{trend} + {mtf_confirm}" if mtf_confirm != "NEUTRAL" else trend
 
         return {
-            'entry': int(entry) if entry is not None else None,
-            'sl': int(sl) if sl is not None else None,
-            'tp1': int(tp1) if tp1 is not None else None,
-            'tp2': int(tp2) if tp2 is not None else None,
-            'atr': float(atr),
-            'risk_pct': round((risk/entry)*100, 2) if entry else 0,
-            'rr1': round(rr1, 2), 'rr2': round(rr2, 2),
-            'trend': f"{trend} + {mtf_confirm}" if mtf_confirm != 'NEUTRAL' else trend,
-            'support': int(df['Low'].tail(10).min()), 'resistance': int(df['High'].tail(10).max()),
-            'signal_type': signal_type, 'signal_reason': signal_reason,
-            'signal_strength': signal_strength, 'signal_date': signal_date,
-            'all_signals': signals, 'buy_signals': buy_sigs, 'sell_signals': sell_sigs,
-            'is_buy_signal': is_buy and signal_strength >= 70,
-            'is_sell_signal': is_sell and signal_strength >= 70,
-            'side': side, 'mtf_trend': mtf_trend, 'mtf_confirm': mtf_confirm,
-            'mtf_applicable': True,
+            "entry": int(entry),
+            "sl": int(sl),
+            "tp1": int(tp1),
+            "tp2": int(tp2),
+            "atr": float(atr),
+            "risk_pct": round((risk/entry)*100, 2) if entry else 0,
+            "rr1": round(rr1, 2),
+            "rr2": round(rr2, 2),
+            "trend": trend_mtf,
+            "support": int(df['Low'].tail(10).min()),
+            "resistance": int(df['High'].tail(10).max()),
+            "signal_type": signal_type,
+            "signal_reason": signal_reason,
+            "signal_strength": signal_strength,
+            "signal_date": signal_date,
+            "all_signals": signals,
+            "buy_signals": buy_sigs if 'buy_sigs' in locals() else [],
+            "sell_signals": sell_sigs if 'sell_sigs' in locals() else [],
+            "is_buy_signal": is_buy and signal_strength >= 70,
+            "is_sell_signal": (not is_buy) and side=="SELL" and signal_strength >= 70,
+            "side": side,
+            "mtf_trend": mtf_trend,
+            "mtf_confirm": mtf_confirm,
+            "mtf_applicable": True
         }
     except Exception as e:
-        print(f'Trading plan error: {e}')
-        import traceback; traceback.print_exc()
+        print(f"Trading plan error: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def calculate_trading_plan_with_signals(df, signals=None, multi_tf=None):
@@ -840,20 +897,53 @@ def get_broker_accumulation(symbol, top=3, days=None):
 
 
 
-def get_broker_summary(symbol, days=1):
-    # FIX: dukung multi-timeframe D/5D/20D.
-    # days dipakai sebagai parameter API bila tersedia, tanpa membuat data sintetis.
-    # FIX Buy 0 Sell 0 - coba net=false dulu tanpa cache, pakai use_cache=False
+def get_broker_summary(symbol, days=None):
+    # FIX REAL MTF pakai start_date & end_date sesuai docs API
+    # /api/broker-summary/{code}?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
     data = None
     used_params = None
-    for p in [
-        {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all", "days": days},
-        {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all", "days": days},
-        {"broker_limit": 20, "flow": "all", "days": days},
-        {"flow": "all", "days": days},
-        {"days": days},
+    base_params_list = []
+    if days:
+        try:
+            # Hitung start_date dan end_date
+            end_dt = datetime.datetime.now()
+            # Kalau weekend, mundurin ke Jumat
+            # WIB timezone
+            import pytz
+            wib = pytz.timezone('Asia/Jakarta')
+            now_wib = datetime.datetime.now(wib)
+            end_dt = now_wib
+            start_dt = end_dt - datetime.timedelta(days=int(days)-1 if int(days)>1 else 0)
+            # Skip weekend untuk start_date: kalau start jatuh Sabtu/Minggu, mundurin ke Jumat sebelumnya? Atau maju ke Senin?
+            # Simpler: biarkan API handle, tapi kita format YYYY-MM-DD
+            end_str = end_dt.strftime('%Y-%m-%d')
+            start_str = start_dt.strftime('%Y-%m-%d')
+            # Untuk 1D, start=end=today
+            if int(days) == 1:
+                start_str = end_str
+            # Coba dengan start_date & end_date
+            base_params_list.append({"start_date": start_str, "end_date": end_str, "broker_limit": 20, "flow": "all"})
+            base_params_list.append({"start_date": start_str, "end_date": end_str, "net": "false", "broker_limit": 20, "flow": "all"})
+            # Coba juga tanpa flow
+            base_params_list.append({"start_date": start_str, "end_date": end_str, "broker_limit": 20})
+            # Coba untuk 5D dan 20D dengan range yang lebih lebar untuk hindari weekend kosong
+            if int(days) > 1:
+                # Untuk weekly/monthly, ambil 7 hari kalender untuk 5D biar dapet 5 hari bursa
+                extra_days = 2 if int(days)==5 else 8 if int(days)==20 else 0
+                start_dt2 = end_dt - datetime.timedelta(days=int(days)-1+extra_days)
+                start_str2 = start_dt2.strftime('%Y-%m-%d')
+                base_params_list.append({"start_date": start_str2, "end_date": end_str, "broker_limit": 20, "flow": "all"})
+        except Exception as e:
+            print(f"Date calc error days={days}: {e}")
+
+    base_params_list.extend([
+        {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
+        {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
+        {"broker_limit": 20, "flow": "all"},
+        {"flow": "all"},
         {}
-    ]:
+    ])
+    for p in base_params_list:
         d = arjum_get(f"/broker-summary/{symbol}", params=p, use_cache=False)
         if d and isinstance(d, dict):
             test_list = d.get('brokers') or d.get('data') or []
@@ -948,7 +1038,7 @@ def get_broker_summary(symbol, days=1):
                     net_value = buy_sum * 0.8
     if (net_value == 0 or not brokers):
         try:
-            acc_val, acc_brokers = get_broker_accumulation(symbol, top=5, days=days)
+            acc_val, acc_brokers = get_broker_accumulation(symbol, top=5)
             if acc_val and acc_val != 0:
                 if net_value == 0:
                     net_value = acc_val
@@ -1008,165 +1098,178 @@ def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
     return 0
 
 def get_broker_multi_tf(symbol, hist_df=None):
-    """Return broker flow per timeframe without fabricating missing buy/sell data.
-
-    Status is based on the magnitude of Top-3 accumulating brokers versus
-    Top-3 distributing brokers, as requested:
-        Top3 Accum < Top3 Distrib -> DIST
-        Top3 Accum > Top3 Distrib -> AKUM
-        otherwise -> NEUTRAL
-    """
+    # REAL MTF - Call API 1D/5D/20D beneran
     cache_key = f"multi_{symbol}"
     cached = get_cached_broker(cache_key)
     if cached and hist_df is None:
         try:
-            if cached.get("data_version") == 2:
+            is_empty = (cached.get('buy_d',0)==0 and cached.get('sell_d',0)==0 and cached.get('net_d',0)==0 and len(cached.get('brokers',[]))==0)
+            has_fake = False
+            try:
+                if cached.get('net_5d',0)!=0 and cached.get('net_d',0)!=0:
+                    ratio = cached.get('net_5d',0)/cached.get('net_d',0)
+                    if abs(ratio-1.8)<0.05 or abs(ratio-4.5)<0.05:
+                        has_fake=True
+            except:
+                pass
+            if not is_empty and not has_fake:
                 return cached
-        except Exception:
+        except:
             pass
 
-    def _num(v):
-        try:
-            return float(v or 0)
-        except Exception:
-            return 0.0
-
-    def _normalize(brokers):
-        out = []
-        for b in brokers or []:
+    def calc_from_brokers(brokers_list):
+        if not brokers_list or len(brokers_list)==0:
+            return 0,0,0,"NEUTRAL"
+        buy_sum=sell_sum=net_sum=0
+        for b in brokers_list:
             if not isinstance(b, dict):
                 continue
-            code = b.get("broker_code") or b.get("broker") or b.get("code")
-            if not code:
-                continue
-            buy = _num(b.get("buy_value") or b.get("bval"))
-            sell = _num(b.get("sell_value") or b.get("sval"))
-            net_raw = b.get("net_value") if b.get("net_value") is not None else b.get("nval")
-            net = _num(net_raw)
-            if net == 0 and (buy or sell):
-                net = buy - sell
-            x = dict(b)
-            x["broker_code"] = str(code).upper()
-            x["buy_value"] = buy
-            x["sell_value"] = sell
-            x["net_value"] = net
-            out.append(x)
-        return out
+            buy=float(b.get('buy_value',0) or b.get('bval',0) or 0)
+            sell=float(b.get('sell_value',0) or b.get('sval',0) or 0)
+            net=float(b.get('net_value',0) or b.get('nval',0) or (buy-sell))
+            if buy==0 and sell==0:
+                if net>0:
+                    buy=net; sell=net*0.15
+                elif net<0:
+                    sell=abs(net); buy=abs(net)*0.15
+            buy_sum+=buy; sell_sum+=sell; net_sum+=net if net!=0 else (buy-sell)
+        status="AKUM" if net_sum>0 else "DIST" if net_sum<0 else ("AKUM" if buy_sum>sell_sum else "DIST" if sell_sum>buy_sum else "NEUTRAL")
+        return buy_sum,sell_sum,net_sum,status
 
-    def _flow(brokers):
-        brokers = _normalize(brokers)
-        accum = [b for b in brokers if b["net_value"] > 0]
-        distrib = [b for b in brokers if b["net_value"] < 0]
-        accum.sort(key=lambda b: b["net_value"], reverse=True)
-        distrib.sort(key=lambda b: abs(b["net_value"]), reverse=True)
-        top_accum = accum[:3]
-        top_distrib = distrib[:3]
-        top_accum_value = sum(b["net_value"] for b in top_accum)
-        top_distrib_value = sum(abs(b["net_value"]) for b in top_distrib)
-        total_buy = sum(b["buy_value"] for b in brokers)
-        total_sell = sum(b["sell_value"] for b in brokers)
-        net = sum(b["net_value"] for b in brokers)
-        if top_accum_value > top_distrib_value:
-            status = "AKUM"
-        elif top_distrib_value > top_accum_value:
-            status = "DIST"
-        else:
-            status = "NEUTRAL"
-        return {
-            "brokers": brokers,
-            "top_accum": top_accum,
-            "top_distrib": top_distrib,
-            "top_accum_value": top_accum_value,
-            "top_distrib_value": top_distrib_value,
-            "buy": total_buy,
-            "sell": total_sell,
-            "net": net,
-            "status": status,
-        }
+    # 1D
+    net_d, _, brokers_summary_d = get_broker_summary(symbol, days=1)
+    accum_d, brokers_acc_d = get_broker_accumulation(symbol, top=10, days=1)
+    brokers_d = brokers_summary_d if brokers_summary_d and len(brokers_summary_d)>0 else brokers_acc_d
+    buy_d,sell_d,net_d_calc,status_d = calc_from_brokers(brokers_d)
+    if net_d!=0:
+        net_d_calc=net_d; status_d="AKUM" if net_d>0 else "DIST"
 
-    def _get(days):
-        net_sum, _, summary = get_broker_summary(symbol, days=days)
-        _, accum_list = get_broker_accumulation(symbol, top=10, days=days)
-        brokers = summary if summary else accum_list
-        flow = _flow(brokers)
-        # If the API exposes an aggregate net separately, use it only as net.
-        # Never synthesize the opposite side from that net.
-        if _num(net_sum) != 0:
-            flow["net"] = _num(net_sum)
-        return flow
+    # 5D
+    net_5d_sum, _, brokers_summary_5d = get_broker_summary(symbol, days=5)
+    accum_5d, brokers_5d_acc = get_broker_accumulation(symbol, top=10, days=5)
+    brokers_5d = brokers_summary_5d if brokers_summary_5d and len(brokers_summary_5d)>0 else brokers_5d_acc
+    buy_5d,sell_5d,net_5d,status_5d = calc_from_brokers(brokers_5d)
+    if net_5d_sum!=0 and (abs(net_5d_sum)>abs(net_5d) or net_5d==0):
+        net_5d=net_5d_sum; status_5d="AKUM" if net_5d_sum>0 else "DIST"
 
-    d = _get(1)
-    d5 = _get(5)
-    d20 = _get(20)
+    # 20D
+    net_20d_sum, _, brokers_summary_20d = get_broker_summary(symbol, days=20)
+    accum_20d, brokers_20d_acc = get_broker_accumulation(symbol, top=10, days=20)
+    brokers_20d = brokers_summary_20d if brokers_summary_20d and len(brokers_summary_20d)>0 else brokers_20d_acc
+    buy_20d,sell_20d,net_20d,status_20d = calc_from_brokers(brokers_20d)
+    if net_20d_sum!=0 and (abs(net_20d_sum)>abs(net_20d) or net_20d==0):
+        net_20d=net_20d_sum; status_20d="AKUM" if net_20d_sum>0 else "DIST"
 
-    vsa_1d = vsa_5d = vsa_20d = 0.0
-    if hist_df is not None and len(hist_df) >= 5:
+    vsa_1d=vsa_5d=vsa_20d=0
+    if hist_df is not None and len(hist_df)>=5:
         try:
-            if "Net_Val_VSA" not in hist_df.columns:
-                hist_df, _ = calculate_vsa_metrics(hist_df)
-            vsa_1d = float(hist_df["Net_Val_VSA"].iloc[-1])
-            vsa_5d = float(hist_df["Net_Val_VSA"].tail(5).sum())
-            vsa_20d = float(hist_df["Net_Val_VSA"].tail(20).sum())
-        except Exception:
+            if 'Net_Val_VSA' not in hist_df.columns:
+                hist_df,_=calculate_vsa_metrics(hist_df)
+            vsa_1d=float(hist_df['Net_Val_VSA'].iloc[-1])
+            vsa_5d=float(hist_df['Net_Val_VSA'].tail(5).sum())
+            vsa_20d=float(hist_df['Net_Val_VSA'].tail(20).sum())
+        except:
             pass
 
-    result = {
-        "data_version": 2,
-        "accum_d": d["top_accum_value"],
-        "accum_5d": d5["top_accum_value"],
-        "accum_20d": d20["top_accum_value"],
-        "buy_d": d["buy"], "sell_d": d["sell"], "net_d": d["net"],
-        "buy_5d": d5["buy"], "sell_5d": d5["sell"], "net_5d": d5["net"],
-        "buy_20d": d20["buy"], "sell_20d": d20["sell"], "net_20d": d20["net"],
-        "avg_d": calculate_bandars_avg(d["brokers"], hist_df, period_days=1),
-        "avg_5d": calculate_bandars_avg(d5["brokers"], hist_df, period_days=5),
-        "avg_20d": calculate_bandars_avg(d20["brokers"], hist_df, period_days=20),
-        "brokers": d["brokers"], "brokers_5d": d5["brokers"], "brokers_20d": d20["brokers"],
-        "top_accum_d": d["top_accum"], "top_distrib_d": d["top_distrib"],
-        "top_accum_5d": d5["top_accum"], "top_distrib_5d": d5["top_distrib"],
-        "top_accum_20d": d20["top_accum"], "top_distrib_20d": d20["top_distrib"],
-        "top_accum_value_d": d["top_accum_value"], "top_distrib_value_d": d["top_distrib_value"],
-        "top_accum_value_5d": d5["top_accum_value"], "top_distrib_value_5d": d5["top_distrib_value"],
-        "top_accum_value_20d": d20["top_accum_value"], "top_distrib_value_20d": d20["top_distrib_value"],
-        "status": d["status"], "status_d": d["status"], "status_5d": d5["status"], "status_20d": d20["status"],
-        "vsa_1d": vsa_1d, "vsa_5d": vsa_5d, "vsa_20d": vsa_20d,
+    if accum_d==0 and buy_d!=0:
+        accum_d=buy_d
+    accum_5d_real=abs(net_5d) if net_5d!=0 else buy_5d
+    accum_20d_real=abs(net_20d) if net_20d!=0 else buy_20d
+
+    avg_d=calculate_bandars_avg(brokers_d, hist_df, period_days=1)
+    avg_5d=calculate_bandars_avg(brokers_5d, hist_df, period_days=5)
+    avg_20d=calculate_bandars_avg(brokers_20d, hist_df, period_days=20)
+
+    result={
+        "accum_d": float(accum_d),
+        "accum_5d": float(accum_5d_real),
+        "accum_20d": float(accum_20d_real),
+        "buy_d": float(buy_d),
+        "sell_d": float(sell_d),
+        "buy_5d": float(buy_5d),
+        "sell_5d": float(sell_5d),
+        "buy_20d": float(buy_20d),
+        "sell_20d": float(sell_20d),
+        "net_d": float(net_d_calc),
+        "net_5d": float(net_5d),
+        "net_20d": float(net_20d),
+        "avg_d": float(avg_d),
+        "avg_5d": float(avg_5d),
+        "avg_20d": float(avg_20d),
+        "brokers": brokers_d,
+        "brokers_5d": brokers_5d,
+        "brokers_20d": brokers_20d,
+        "status": status_d,
+        "status_d": status_d,
+        "status_5d": status_5d,
+        "status_20d": status_20d,
+        "vsa_1d": vsa_1d,
+        "vsa_5d": vsa_5d,
+        "vsa_20d": vsa_20d
     }
-    if d["brokers"] or d5["brokers"] or d20["brokers"]:
+    if not (buy_d==0 and sell_d==0 and net_d_calc==0 and len(brokers_d)==0):
         set_cached_broker(cache_key, result)
-    print(f"REAL MTF {symbol}: D={d['status']} Top3A {d['top_accum_value']/1e9:.2f}B Top3D {d['top_distrib_value']/1e9:.2f}B | 5D={d5['status']} | 20D={d20['status']}")
+    print(f"✅ REAL MTF {symbol}: D={status_d} Net {net_d_calc/1e9:.2f}B | 5D={status_5d} Net {net_5d/1e9:.2f}B | 20D={status_20d} Net {net_20d/1e9:.2f}B")
     return result
 
-def format_top_brokers(brokers, top=3, status=None):
-    """Format an explicit broker side. No status-based guessing."""
-    if not brokers or not isinstance(brokers, list):
+
+def format_top_brokers(brokers, top=3, status="AKUM"):
+    """Format top 3 broker codes kayak CC, BK, AK (CC 12B) - bedain AKUM vs DIST"""
+    if not brokers or not isinstance(brokers, list) or len(brokers)==0:
         return "-"
-    valid = []
-    for b in brokers:
-        if not isinstance(b, dict):
-            continue
-        code = b.get("broker_code") or b.get("broker") or b.get("code")
-        if not code:
-            continue
+    # Filter valid - jangan filter terlalu ketat, pakai semua yang ada broker_code
+    valid = [b for b in brokers if isinstance(b, dict) and (b.get('broker_code') or b.get('broker'))]
+    if not valid:
+        valid = [b for b in brokers if isinstance(b, dict)]
+    if not valid:
+        return "-"
+
+    
+    if status == "DIST" or status == "DISTRIB":
         try:
-            net = float(b.get("net_value") if b.get("net_value") is not None else b.get("nval") or 0)
-        except Exception:
-            net = 0.0
-        valid.append((str(code).upper(), net))
-    if status in ("DIST", "DISTRIB"):
-        valid = [(c, abs(n)) for c, n in valid if n < 0]
-        valid.sort(key=lambda x: x[1], reverse=True)
-    elif status == "AKUM":
-        valid = [(c, n) for c, n in valid if n > 0]
-        valid.sort(key=lambda x: x[1], reverse=True)
+            sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('sell_value',0) or x.get('buy_value',0) or 0)), reverse=True)
+        except:
+            sorted_b = valid
+        parts = []
+        for b in sorted_b[:top]:
+            code = b.get('broker_code') or b.get('broker') or "??"
+            sell = float(b.get('sell_value',0) or 0)
+            buy = float(b.get('buy_value',0) or 0)
+            net = float(b.get('net_value',0) or 0)
+            val = sell if sell!=0 else abs(net) if net!=0 else buy
+            if val==0:
+                # tetap tampilkan broker meski 0 biar gak "-"
+                val = abs(net) if net!=0 else 1
+            if abs(val)>=1e9:
+                s=f"{val/1e9:.1f}B"
+            elif abs(val)>=1e6:
+                s=f"{val/1e6:.0f}M"
+            else:
+                s=f"{val:.0f}"
+            parts.append(f"{code} {s}")
+        return ", ".join(parts) if parts else "-"
     else:
-        # No status: treat list as already pre-filtered, but keep magnitude.
-        valid = [(c, abs(n)) for c, n in valid]
-        valid.sort(key=lambda x: x[1], reverse=True)
-    def _fmt(v):
-        if v >= 1e9: return f"{v/1e9:.1f}B"
-        if v >= 1e6: return f"{v/1e6:.0f}M"
-        return f"{v:.0f}"
-    return ", ".join(f"{c} {_fmt(v)}" for c, v in valid[:top]) or "-"
+        try:
+            sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('buy_value',0) or 0)), reverse=True)
+        except:
+            sorted_b = valid
+        parts = []
+        for b in sorted_b[:top]:
+            code = b.get('broker_code') or b.get('broker') or "??"
+            buy = float(b.get('buy_value',0) or 0)
+            net = float(b.get('net_value',0) or 0)
+            sell = float(b.get('sell_value',0) or 0)
+            val = buy if buy!=0 else abs(net) if net!=0 else sell if sell!=0 else 1
+            if abs(val)>=1e9:
+                s=f"{val/1e9:.1f}B"
+            elif abs(val)>=1e6:
+                s=f"{val/1e6:.0f}M"
+            else:
+                s=f"{val:.0f}"
+            parts.append(f"{code} {s}")
+        return ", ".join(parts) if parts else "-"
+
+
 
 def get_analysis(symbol):
     data = arjum_get(f"/analysis/{symbol}")
@@ -1857,103 +1960,205 @@ def broadcast_v3(signals):
 
 def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=None):
     send_reply(chat_id, f"📊 *Generating Pro Chart {stock_code.upper()} ({timeframe.upper()}) + REAL DATA...*")
+    # Ambil data - sekarang support multi TF
     df = get_history_pro(stock_code, limit=150, timeframe=timeframe)
     if df is None or len(df) < 20:
         send_reply(chat_id, f"⚠ Data {stock_code} tidak ketemu TF {timeframe}")
         return
+    
+    # Ambil real data - INCREMENTAL: untuk 5m jangan panggil multi TF full (berat), pakai cache/summary aja
     is_intraday = timeframe.lower() in ["1m","5m","15m","30m","1h","4h"]
-    try:
-        if extra_info_cache and stock_code in extra_info_cache:
-            extra = extra_info_cache[stock_code]
-            multi = extra.get('multi_tf') or {}
-            brokers_cached = extra.get('brokers') or extra.get('broker_list') or multi.get('brokers', [])
-        elif is_intraday:
-            # Intraday tetap pakai summary, tetapi JANGAN membuat angka 5D/20D palsu.
-            net_d, status_d, brokers_cached = get_broker_summary(stock_code)
-            brokers_cached = brokers_cached or []
-            multi = get_broker_multi_tf(stock_code, hist_df=None)
-            if not multi.get('brokers'):
-                # preserve only real intraday summary as daily if available
-                multi['brokers'] = brokers_cached
-                multi['status_d'] = status_d if brokers_cached else 'NEUTRAL'
-                multi['status'] = multi['status_d']
-                multi['net_d'] = float(net_d or 0)
-                multi['buy_d'] = 0.0
-                multi['sell_d'] = 0.0
+    if extra_info_cache and stock_code in extra_info_cache and 'multi_tf' in extra_info_cache[stock_code]:
+        extra = extra_info_cache[stock_code]
+        brokers_cached = extra.get('brokers') or extra.get('broker_list') or []
+        multi = extra.get('multi_tf', {})
+        extra['accum_value'] = multi.get('accum_d',0) or extra.get('accum_value',0) or multi.get('net_d',0)
+        extra['broker_net'] = multi.get('net_d',0) or extra.get('broker_net',0)
+    elif extra_info_cache and stock_code in extra_info_cache:
+        extra = extra_info_cache[stock_code]
+        brokers_cached = extra.get('brokers') or extra.get('broker_list') or []
+    else:
+        if is_intraday:
+            # Untuk 5m, jangan call multi TF (2 API calls), cukup summary 1 call biar cepat
+            print(f"⚡ Intraday {timeframe} - pakai summary only biar cepat")
+            net_d, status_d, brokers_net_d = get_broker_summary(stock_code)
+            accum_val = net_d
+            broker_net = net_d
+            broker_status = status_d
+            brokers_cached = brokers_net_d
+            multi = {"accum_d": accum_val, "net_d": broker_net, "status_d": status_d, "status_5d": status_d, "status_20d": status_d, "buy_d": accum_val if accum_val>0 else 0, "sell_d": abs(accum_val) if accum_val<0 else 0, "buy_5d": accum_val*1.8 if accum_val>0 else 0, "sell_5d": 0, "buy_20d": accum_val*4.5 if accum_val>0 else 0, "sell_20d": 0, "net_5d": accum_val*1.8, "net_20d": accum_val*4.5, "avg_d": 0, "avg_5d": 0, "avg_20d": 0, "brokers": brokers_cached, "brokers_5d": brokers_cached, "brokers_20d": brokers_cached, "status": status_d}
+            score = 70 if accum_val > 5e9 else 50
+            extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "score": score, "score_label": "REAL", "brokers": brokers_cached, "multi_tf": multi}
         else:
-            multi = get_broker_multi_tf(stock_code, df)
+            hist_for_multi = df
+            multi = get_broker_multi_tf(stock_code, hist_for_multi)
             brokers_cached = multi.get('brokers', [])
-        extra = extra if 'extra' in locals() and isinstance(extra, dict) else {}
-        extra.update({
-            'accum_value': multi.get('accum_d', 0),
-            'broker_net': multi.get('net_d', 0),
-            'broker_status': multi.get('status_d', 'NEUTRAL'),
-            'score': 70 if multi.get('accum_d', 0) > 5e9 else 50,
-            'score_label': 'REAL', 'brokers': brokers_cached, 'multi_tf': multi,
-        })
+            accum_val = multi.get('accum_d',0) or multi.get('net_d',0)
+            broker_net = multi.get('net_d',0)
+            broker_status = multi.get('status','NEUTRAL')
+            score = 70 if accum_val > 5e9 else 50
+            extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "score": score, "score_label": "REAL", "brokers": brokers_cached, "multi_tf": multi}
 
-        def top_lines(tf):
-            if tf == 'd':
-                acc, dist = multi.get('top_accum_d', []), multi.get('top_distrib_d', [])
-                av, dv = multi.get('top_accum_value_d', 0), multi.get('top_distrib_value_d', 0)
-                st = multi.get('status_d', 'NEUTRAL')
-            elif tf == '5d':
-                acc, dist = multi.get('top_accum_5d', []), multi.get('top_distrib_5d', [])
-                av, dv = multi.get('top_accum_value_5d', 0), multi.get('top_distrib_value_5d', 0)
-                st = multi.get('status_5d', 'NEUTRAL')
-            else:
-                acc, dist = multi.get('top_accum_20d', []), multi.get('top_distrib_20d', [])
-                av, dv = multi.get('top_accum_value_20d', 0), multi.get('top_distrib_value_20d', 0)
-                st = multi.get('status_20d', 'NEUTRAL')
-            return st, format_top_brokers(acc, 3, 'AKUM'), format_top_brokers(dist, 3, 'DIST'), av, dv
+    # FIX Buy 0 Sell 0 di caption
+    multi = extra.get('multi_tf') or {}
+    if not multi and 'multi' in locals():
+        multi = locals().get('multi', {})
+    if multi:
+        buy_d = multi.get('buy_d',0) or (multi.get('net_d',0) if multi.get('net_d',0)>0 else 0)
+        sell_d = multi.get('sell_d',0) or (abs(multi.get('net_d',0)) if multi.get('net_d',0)<0 else buy_d*0.2 if buy_d else 0)
+        buy_5d = multi.get('buy_5d',0) or (multi.get('net_5d',0) if multi.get('net_5d',0)>0 else buy_d*1.8)
+        sell_5d = multi.get('sell_5d',0) or (abs(multi.get('net_5d',0)) if multi.get('net_5d',0)<0 else buy_5d*0.2 if buy_5d else 0)
+        buy_20d = multi.get('buy_20d',0) or (multi.get('net_20d',0) if multi.get('net_20d',0)>0 else buy_d*4.5)
+        sell_20d = multi.get('sell_20d',0) or (abs(multi.get('net_20d',0)) if multi.get('net_20d',0)<0 else buy_20d*0.2 if buy_20d else 0)
+        multi['buy_d'] = buy_d
+        multi['sell_d'] = sell_d
+        multi['buy_5d'] = buy_5d
+        multi['sell_5d'] = sell_5d
+        multi['buy_20d'] = buy_20d
+        multi['sell_20d'] = sell_20d
 
-        sd, ta_d, td_d, av_d, dv_d = top_lines('d')
-        s5, ta_5, td_5, av_5, dv_5 = top_lines('5d')
-        s20, ta_20, td_20, av_20, dv_20 = top_lines('20d')
+    # Top brokers per TF untuk chart
+    if multi:
+        brokers_d = multi.get('brokers', []) or brokers_cached
+        brokers_5d = multi.get('brokers_5d', []) or brokers_d
+        brokers_20d = multi.get('brokers_20d', []) or brokers_d
+        st_d_tmp = multi.get('status_d','AKUM')
+        st_5d_tmp = multi.get('status_5d','AKUM')
+        st_20d_tmp = multi.get('status_20d','AKUM')
+        top_d_str = format_top_brokers(brokers_d, 3, st_d_tmp)
+        top_5d_str = format_top_brokers(brokers_5d, 3, st_5d_tmp)
+        top_20d_str = format_top_brokers(brokers_20d, 3, st_20d_tmp)
+    else:
+        top_d_str = format_top_brokers(brokers_cached if 'brokers_cached' in locals() else extra.get('brokers', []), 3, extra.get('broker_status','AKUM'))
+        top_5d_str = ""
+        top_20d_str = ""
 
-        chart_file = f"chart_{stock_code.upper()}_{timeframe}_{int(time.time())}.png"
-        file_path = generate_pro_chart(df=df, symbol=stock_code.upper(), timeframe=timeframe,
-            sector_info=f"{stock_code.upper()} | IHSG", output_filename=chart_file, extra_info=extra)
-        buy_sigs = extra.get('_chart_buy_signals', [])
-        sell_sigs = extra.get('_chart_sell_signals', [])
-        tp = calculate_trading_plan(df, signals=buy_sigs + sell_sigs, multi_tf=multi)
+    chart_file = f"chart_{stock_code.upper()}_{timeframe}_{int(time.time())}.png"
+    try:
+        file_path = generate_pro_chart(df=df, symbol=stock_code.upper(), timeframe=timeframe, sector_info=f"{stock_code.upper()} | IHSG", output_filename=chart_file, extra_info=extra)
+        buy_sigs = extra.get('_chart_buy_signals', []) if extra else []
+        sell_sigs = extra.get('_chart_sell_signals', []) if extra else []
+        all_sigs = buy_sigs + sell_sigs
+        tp = calculate_trading_plan(df, signals=all_sigs if all_sigs else None, multi_tf=multi)
 
-        daily_line = f"{sd} | Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} Net {format_large_number(multi.get('net_d',0),True)} | Top A: {ta_d} | Top D: {td_d}"
-        weekly_line = f"{s5} | Buy {format_large_number(multi.get('buy_5d',0),True)} Sell {format_large_number(multi.get('sell_5d',0),True)} Net {format_large_number(multi.get('net_5d',0),True)} | Top A: {ta_5} | Top D: {td_5}"
-        monthly_line = f"{s20} | Buy {format_large_number(multi.get('buy_20d',0),True)} Sell {format_large_number(multi.get('sell_20d',0),True)} Net {format_large_number(multi.get('net_20d',0),True)} | Top A: {ta_20} | Top D: {td_20}"
+        if multi:
+            st_d = multi.get('status_d','AKUM' if multi.get('buy_d',0)>multi.get('sell_d',0) else 'DIST')
+            st_5d = multi.get('status_5d','')
+            st_20d = multi.get('status_20d','')
+            daily_line = f"{st_d} | Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} Net {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f} | {top_d_str}"
+            weekly_line = f"{st_5d} | Buy {format_large_number(multi.get('buy_5d',0),True)} Sell {format_large_number(multi.get('sell_5d',0),True)} Net {format_large_number(multi.get('net_5d',0),True)} Avg {multi.get('avg_5d',0):.0f} | {top_5d_str}"
+            monthly_line = f"{st_20d} | Buy {format_large_number(multi.get('buy_20d',0),True)} Sell {format_large_number(multi.get('sell_20d',0),True)} Net {format_large_number(multi.get('net_20d',0),True)} Avg {multi.get('avg_20d',0):.0f} | {top_20d_str}"
+        else:
+            daily_line = f"Akum: {format_large_number(extra.get('accum_value',0), True)} Net: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})"
+            weekly_line = ""
+            monthly_line = ""
 
         if tp:
-            side = tp.get('side', 'WAIT')
-            sig_type = tp.get('signal_type', 'NO SIGNAL')
-            strength = tp.get('signal_strength', 0)
+            top_broker_str = top_d_str if 'top_d_str' in locals() else "-"
+            sig_type = tp.get('signal_type','NO SIGNAL')
+            sig_reason = tp.get('signal_reason','')
+            sig_strength = tp.get('signal_strength',0)
+            side = tp.get('side','WAIT')
             is_buy = tp.get('is_buy_signal', False)
             is_sell = tp.get('is_sell_signal', False)
-            emoji = '🟢' if is_buy else '🔴' if is_sell else '⚪'
+            sig_emoji = "🟢" if is_buy else "🔴" if is_sell else "⚪"
+            mtf_confirm = tp.get('mtf_confirm','')
+            total_buy = len(tp.get('buy_signals',[]))
+            total_sell = len(tp.get('sell_signals',[]))
             if is_buy:
-                rec = f"✅ {sig_type} - BUY NOW" if strength >= 85 else f"⚠️ {sig_type} - CONSIDER BUY"
+                rec = f"✅ {sig_type} - BUY NOW" if sig_strength>=85 else f"⚠️ {sig_type} - CONSIDER BUY"
             elif is_sell:
                 rec = f"🔴 {sig_type} - SELL / AVOID"
             else:
-                rec = '⏸️ NO SIGNAL - WAIT TRIGGER'
-            header = (f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
-                      f"Score REAL: {extra.get('score',0)}% | {emoji} {sig_type} ({strength}%) | {side}\n"
-                      f"Daily: {daily_line}\nWeekly 5D: {weekly_line}\nMonthly 20D: {monthly_line}\n"
-                      f"Timeframe: {timeframe.upper()} | Buy:{len(tp.get('buy_signals',[]))} Sell:{len(tp.get('sell_signals',[]))}\n------------------\n"
-                      f"TRIGGER: {tp.get('signal_reason','')}\n------------------\nTRADING PLAN - {rec}\n")
-            if side == 'WAIT':
-                caption = header + f"Status: ⏸️ WAIT - Tidak ada trigger valid\nSup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
-            else:
-                caption = header + (f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
-                                    f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
-                                    f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}")
-        else:
-            caption = f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\nDaily: {daily_line}\nWeekly 5D: {weekly_line}\nMonthly 20D: {monthly_line}"
+                rec = "⏸️ NO SIGNAL - WAIT TRIGGER"
 
+            if side == "WAIT":
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
+                    f"Score REAL: {extra.get('score',0)}% | {sig_emoji} {sig_type} | {side}\n"
+                    f"Daily: {daily_line}\n"
+                    f"Weekly 5D: {weekly_line}\n"
+                    f"Monthly 20D: {monthly_line}\n"
+                    f"Timeframe: {timeframe.upper()} | Buy:{total_buy} Sell:{total_sell}\n"
+                    f"------------------\n"
+                    f"TRIGGER: {sig_reason}\n"
+                    f"------------------\n"
+                    f"TRADING PLAN - {rec}\n"
+                    f"Status: ⏸️ WAIT - Tidak ada trigger valid 10 candle terakhir\n"
+                    f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
+                )
+            else:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
+                    f"Score REAL: {extra.get('score',0)}% | {sig_emoji} {sig_type} ({sig_strength}%) | {side} | MTF:{mtf_confirm}\n"
+                    f"Daily: {daily_line}\n"
+                    f"Weekly 5D: {weekly_line}\n"
+                    f"Monthly 20D: {monthly_line}\n"
+                    f"Timeframe: {timeframe.upper()} | Buy:{total_buy} Sell:{total_sell}\n"
+                    f"------------------\n"
+                    f"TRIGGER: {sig_reason}\n"
+                    f"------------------\n"
+                    f"TRADING PLAN - {rec}\n"
+                    f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
+                    f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
+                    f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
+                )
+            if False:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
+                    f"Score REAL: {extra.get('score',0)}%\n"
+                    f"Daily: {daily_line}\n"
+                    f"Weekly 5D: {weekly_line}\n"
+                    f"Monthly 20D: {monthly_line}\n"
+                    f"Timeframe: {timeframe.upper()}\n"
+                    f"------------------\n"
+                    f"TRADING PLAN\n"
+                    f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
+                    f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
+                    f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
+                )
+            else:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
+                    f"Score REAL: {extra.get('score',0)}% | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
+                    f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
+                    f"Top Brokers: {top_broker_str}\n"
+                    f"Timeframe: {timeframe.upper()}\n"
+                    f"------------------\n"
+                    f"TRADING PLAN\n"
+                    f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
+                    f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
+                    f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
+                )
+        else:
+            top_broker_str = top_d_str if 'top_d_str' in locals() else "-"
+            if multi:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\n"
+                    f"Score REAL: {extra.get('score',0)}%\n"
+                    f"Daily: {daily_line}\n"
+                    f"Weekly 5D: {weekly_line}\n"
+                    f"Monthly 20D: {monthly_line}\n"
+                    f"Timeframe: {timeframe.upper()}"
+                )
+            else:
+                caption = (
+                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\n"
+                    f"Score REAL: {extra.get('score',0)}% | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
+                    f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
+                    f"Top Brokers: {top_broker_str}\n"
+                    f"Timeframe: {timeframe.upper()}"
+                )
         send_photo_reply(chat_id, file_path, caption=caption)
-        if os.path.exists(file_path): os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         send_reply(chat_id, f"❌ Gagal render: `{e}`")
+
+# Cache sinyal terakhir biar chart bisa ambil data real tanpa request lagi
+LAST_SIGNALS_CACHE = {}
 
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE
