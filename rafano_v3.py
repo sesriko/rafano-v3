@@ -18,6 +18,24 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.gridspec as gridspec
 from concurrent.futures import ThreadPoolExecutor
+
+# ========== FREE INSTITUTIONAL - SQLite + Parallel (GRATIS tanpa VPS) ==========
+try:
+    import sys
+    FREE_PATH = "/mnt/data/institutional_upgrade_free"
+    if FREE_PATH not in sys.path:
+        sys.path.insert(0, FREE_PATH)
+    # Also check /content for Colab
+    if "/content" in sys.path or os.path.exists("/content"):
+        if "/content" not in sys.path:
+            sys.path.insert(0, "/content")
+    from rafano_db_free import db_free
+    FREE_DB_AVAILABLE = True
+    print("✅ FREE DB loaded - SQLite + Parallel GRATIS")
+except Exception as e:
+    FREE_DB_AVAILABLE = False
+    db_free = None
+    print(f"⚠ FREE DB not available: {e}")
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -2227,7 +2245,9 @@ def telegram_bot_listener():
                             parts = text.split()
                             if len(parts) >=2:
                                 sym = parts[1].upper()
-                                tf = parts[2] if len(parts)>=3 else "1d"
+                                raw_tf = parts[2] if len(parts)>=3 else "1d"
+                                tf_map = {"5":"5m","15":"15m","30":"30m","1h":"1h","4h":"4h","1":"1d","d":"1d","w":"1w","m":"1M","1d":"1d","1w":"1w","5m":"5m","15m":"15m","30m":"30m","1M":"1M"}
+                                tf = tf_map.get(raw_tf.lower(), raw_tf.lower())
                                 threading.Thread(target=process_chart_request, args=(chat_id, sym, tf, LAST_SIGNALS_CACHE)).start()
                             else:
                                 send_reply(chat_id, "⚠ Format: `/c <KODE> [TF]`")
@@ -2235,32 +2255,55 @@ def telegram_bot_listener():
                             parts = text.split()
                             if len(parts) >=2:
                                 sym = parts[1].upper()
-                                def broker_detail(target_chat, symbol):
+                                raw_tf = parts[2] if len(parts)>=3 else "1d"
+                                tf_map_b = {"5":"5m","15":"15m","30":"30m","1h":"1h","4h":"4h","d":"1d","w":"1w","m":"1M","1d":"1d","5m":"5m","15m":"15m","1h":"1h"}
+                                tf_b = tf_map_b.get(raw_tf.lower(), raw_tf.lower())
+                                def broker_detail(target_chat, symbol, timeframe):
                                     try:
                                         multi = get_broker_multi_tf(symbol)
                                         net_d, status_d, brokers = get_broker_summary(symbol)
                                         acc, brokers_acc = get_broker_accumulation(symbol, top=10)
-                                        msg = f"🏦 *BROKER DETAIL {symbol}* -- {get_now_wib().strftime('%d %b %H:%M')}\n"
-                                        msg += f"Status: {status_d} | Net: {format_large_number(net_d, True)}\n"
+                                        df_tf = get_history_pro(symbol, limit=50, timeframe=timeframe)
+                                        avg_price = df_tf['Close'].iloc[-1] if df_tf is not None and len(df_tf)>0 else 0
+                                        msg = f"🏦 *BROKER DETAIL {symbol} - TF {timeframe.upper()}*\n"
+                                        msg += f"Price: {safe_int(avg_price)} | Status: {status_d} | Net: {format_large_number(net_d, True)}\n"
                                         msg += f"Accum: {format_large_number(acc, True)}\n\n"
                                         if multi:
-                                            msg += f"Daily: {multi.get('status_d')} | Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} Net {format_large_number(multi.get('net_d',0),True)}\n"
-                                            msg += f"Weekly: {multi.get('status_5d')} | Net {format_large_number(multi.get('net_5d',0),True)}\n"
-                                            msg += f"Monthly: {multi.get('status_20d')} | Net {format_large_number(multi.get('net_20d',0),True)}\n\n"
-                                        msg += "*TOP BROKERS:*\n"
+                                            brokers_d = multi.get('brokers',[])
+                                            top_d = format_top_brokers(brokers_d, 3, multi.get('status_d','AKUM'))
+                                            msg += f"*DAILY (1D):* {multi.get('status_d')} | Net {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f}\n"
+                                            msg += f"  Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} | Top: {top_d}\n"
+                                            if brokers_d:
+                                                for b in brokers_d[:3]:
+                                                    bc = b.get('broker_code','??')
+                                                    msg += f"    - {bc}: Buy {format_large_number(b.get('buy_value',0),True)} Sell {format_large_number(b.get('sell_value',0),True)} Avg {b.get('avg_price',0):.0f} Net {format_large_number(b.get('net_value',0),True)}\n"
+                                            msg += "\n"
+                                            brokers_5d = multi.get('brokers_5d',[]) or brokers_d
+                                            top_5d = format_top_brokers(brokers_5d, 3, multi.get('status_5d','AKUM'))
+                                            msg += f"*WEEKLY (5D):* {multi.get('status_5d')} | Net {format_large_number(multi.get('net_5d',0),True)} Avg {multi.get('avg_5d',0):.0f} | Top: {top_5d}\n"
+                                            if brokers_5d:
+                                                for b in brokers_5d[:3]:
+                                                    msg += f"    - {b.get('broker_code','??')}: Avg {b.get('avg_price',0):.0f} Net {format_large_number(b.get('net_value',0),True)}\n"
+                                            msg += "\n"
+                                            brokers_20d = multi.get('brokers_20d',[]) or brokers_d
+                                            top_20d = format_top_brokers(brokers_20d, 3, multi.get('status_20d','AKUM'))
+                                            msg += f"*MONTHLY (20D):* {multi.get('status_20d')} | Net {format_large_number(multi.get('net_20d',0),True)} Avg {multi.get('avg_20d',0):.0f} | Top: {top_20d}\n"
+                                            if brokers_20d:
+                                                for b in brokers_20d[:3]:
+                                                    msg += f"    - {b.get('broker_code','??')}: Avg {b.get('avg_price',0):.0f} Net {format_large_number(b.get('net_value',0),True)}\n"
+                                        msg += "\n*TOP 10 BROKERS:*\n"
                                         for idx, b in enumerate(brokers[:10],1):
-                                            code = b.get('broker_code','??')
-                                            buy = format_large_number(b.get('buy_value',0), True)
-                                            sell = format_large_number(b.get('sell_value',0), True)
-                                            net = format_large_number(b.get('net_value',0), True)
                                             emoji = "🟢" if b.get('net_value',0)>0 else "🔴"
-                                            msg += f"{idx}. {emoji} {code} Buy {buy} Sell {sell} Net {net}\n"
+                                            msg += f"{idx}. {emoji} {b.get('broker_code','??')} Net {format_large_number(b.get('net_value',0),True)} Buy {format_large_number(b.get('buy_value',0),True)} Avg {b.get('avg_price',0):.0f}\n"
+                                        msg += f"\nTF: {timeframe.upper()} | Price TF: {safe_int(avg_price)}"
                                         send_reply(target_chat, msg)
                                     except Exception as e:
+                                        import traceback
+                                        traceback.print_exc()
                                         send_reply(target_chat, f"❌ Error broker {symbol}: {e}")
-                                threading.Thread(target=broker_detail, args=(chat_id, sym)).start()
+                                threading.Thread(target=broker_detail, args=(chat_id, sym, tf_b)).start()
                             else:
-                                send_reply(chat_id, "⚠ Format: `/b <KODE>` contoh `/b BBCA`")
+                                send_reply(chat_id, "⚠ Format: `/b <KODE> [TF]` contoh `/b BBCA` `/b BBCA 5` `/b BBCA 1h`")
                         elif first_word in ["/info","/i"]:
                             parts = text.split()
                             if len(parts) >=2:
@@ -2393,7 +2436,207 @@ def telegram_bot_listener():
                                 threading.Thread(target=compare_stocks, args=(chat_id, sym1, sym2)).start()
                             else:
                                 send_reply(chat_id, "⚠ Format: `/compare BBCA BBRI`")
+                        elif first_word in ["/s"]:
+                            parts = text.split()
+                            if len(parts) < 2:
+                                send_reply(chat_id, "📋 *SCREENER /s*\n\n`/s akum d` - Top 20 akum daily\n`/s akum w` - Top 20 akum weekly\n`/s akum m` - Top 20 akum monthly\n`/s dis d` - Top 20 dist daily\n`/s dis w` - Top 20 dist weekly\n`/s dis m` - Top 20 dist monthly\n`/s os` - Oversold RSI<30")
+                            else:
+                                sub = parts[1].lower()
+                                tf_arg = parts[2].lower() if len(parts)>=3 else "d"
+                                def screener_s(target_chat, kind, tf):
+                                    try:
+                                        sigs = scan_v3()
+                                        if not sigs:
+                                            sigs = list(LAST_SIGNALS_CACHE.values()) if LAST_SIGNALS_CACHE else []
+                                        if not sigs:
+                                            send_reply(target_chat, "⚠ Screener kosong, coba `/scan` dulu")
+                                            return
+                                        filtered = []
+                                        if kind == "os":
+                                            for item in sigs:
+                                                try:
+                                                    sym = item.get('symbol')
+                                                    df = get_history_pro(sym, limit=50, timeframe="1d")
+                                                    if df is None or len(df)<15:
+                                                        continue
+                                                    rsi = calculate_rsi(df['Close'], 14).iloc[-1]
+                                                    if rsi < 30:
+                                                        item['rsi'] = rsi
+                                                        filtered.append(item)
+                                                except:
+                                                    pass
+                                            filtered = sorted(filtered, key=lambda x: x.get('rsi', 50))
+                                            msg = f"📉 *OVERSOLD RSI<30* ({len(filtered)})\n\n"
+                                            for idx, it in enumerate(filtered[:20],1):
+                                                multi = it.get('multi_tf',{})
+                                                rsi = it.get('rsi',0)
+                                                msg += f"{idx}. *{it['symbol']}* -- {safe_int(it.get('close',0))} RSI {rsi:.1f} | {multi.get('status_d','')} Net {format_large_number(multi.get('net_d',0),True)}\n"
+                                            send_reply(target_chat, msg if filtered else "✅ Tidak ada oversold RSI<30")
+                                            return
+                                        want_akum = (kind == "akum")
+                                        tf_key_map = {"d": ("net_d","status_d","buy_d","sell_d","avg_d"), "w": ("net_5d","status_5d","buy_5d","sell_5d","avg_5d"), "m": ("net_20d","status_20d","buy_20d","sell_20d","avg_20d")}
+                                        net_key, status_key, buy_key, sell_key, avg_key = tf_key_map.get(tf, tf_key_map["d"])
+                                        for item in sigs:
+                                            multi = item.get('multi_tf',{})
+                                            status = multi.get(status_key,'')
+                                            net = multi.get(net_key,0)
+                                            if want_akum:
+                                                if status=="AKUM" and net>0:
+                                                    filtered.append(item)
+                                            else:
+                                                if status=="DIST" and net<0:
+                                                    filtered.append(item)
+                                        filtered = sorted(filtered, key=lambda x: abs(x.get('multi_tf',{}).get(net_key,0)), reverse=True)
+                                        tf_label = {"d":"DAILY 1D","w":"WEEKLY 5D","m":"MONTHLY 20D"}.get(tf, "DAILY")
+                                        kind_label = "AKUMULASI" if want_akum else "DISTRIBUSI"
+                                        msg = f"🏆 *TOP 20 {kind_label} - {tf_label}* ({len(filtered)})\n\n"
+                                        for idx, item in enumerate(filtered[:20],1):
+                                            multi = item.get('multi_tf',{})
+                                            net = multi.get(net_key,0)
+                                            buy = multi.get(buy_key,0)
+                                            sell = multi.get(sell_key,0)
+                                            avg = multi.get(avg_key,0)
+                                            status = multi.get(status_key,'')
+                                            emoji = "🟢" if status=="AKUM" else "🔴"
+                                            brokers = multi.get('brokers',[]) if tf=="d" else multi.get('brokers_5d',[]) if tf=="w" else multi.get('brokers_20d',[])
+                                            top = format_top_brokers(brokers, 3, status)
+                                            msg += f"{idx}. {emoji} *{item['symbol']}* -- {safe_int(item.get('close',0))} ({item.get('change_pct',0):+.2f}%)\n"
+                                            msg += f"   {status} | Buy {format_large_number(buy,True)} Sell {format_large_number(sell,True)} Net {format_large_number(net,True)} Avg {avg:.0f}\n"
+                                            msg += f"   Top: {top}\n\n"
+                                        kb = []
+                                        for it in filtered[:10]:
+                                            kb.append([{"text": f"Chart {it['symbol']}", "callback_data": f"chart_{it['symbol']}_1d"}])
+                                        send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb} if kb else None)
+                                    except Exception as e:
+                                        import traceback
+                                        traceback.print_exc()
+                                        send_reply(target_chat, f"❌ Error /s: {e}")
+                                threading.Thread(target=screener_s, args=(chat_id, sub, tf_arg)).start()
+
+                        elif first_word in ["/s"]:
+                            parts = text.split()
+                            if len(parts) < 2:
+                                send_reply(chat_id, "📋 *SCREENER /s*\n\n`/s akum d` - Top 20 akum daily\n`/s akum w` - Top 20 akum weekly\n`/s akum m` - Top 20 akum monthly\n`/s dis d` - Top 20 dist daily\n`/s dis w` - Top 20 dist weekly\n`/s dis m` - Top 20 dist monthly\n`/s os` - Oversold RSI<30\n`/s ob` - Overbought RSI>70\n`/s turbo` - Volume Spike TURBO")
+                            else:
+                                sub = parts[1].lower()
+                                tf_arg = parts[2].lower() if len(parts)>=3 else "d"
+                                def screener_s(target_chat, kind, tf):
+                                    try:
+                                        sigs = scan_v3()
+                                        if not sigs:
+                                            sigs = list(LAST_SIGNALS_CACHE.values()) if LAST_SIGNALS_CACHE else []
+                                        if not sigs:
+                                            send_reply(target_chat, "⚠ Screener kosong, coba `/scan` dulu")
+                                            return
+                                        filtered = []
+                                        if kind == "os":
+                                            for item in sigs:
+                                                try:
+                                                    sym = item.get('symbol')
+                                                    df = get_history_pro(sym, limit=50, timeframe="1d")
+                                                    if df is None or len(df)<15:
+                                                        continue
+                                                    rsi = calculate_rsi(df['Close'], 14).iloc[-1]
+                                                    if rsi < 30:
+                                                        item['rsi'] = rsi
+                                                        filtered.append(item)
+                                                except:
+                                                    pass
+                                            filtered = sorted(filtered, key=lambda x: x.get('rsi', 50))
+                                            msg = f"📉 *OVERSOLD RSI<30* ({len(filtered)})\n\n"
+                                            for idx, it in enumerate(filtered[:20],1):
+                                                multi = it.get('multi_tf',{})
+                                                rsi = it.get('rsi',0)
+                                                msg += f"{idx}. *{it['symbol']}* -- {safe_int(it.get('close',0))} RSI {rsi:.1f} | {multi.get('status_d','')} Net {format_large_number(multi.get('net_d',0),True)}\n"
+                                            send_reply(target_chat, msg if filtered else "✅ Tidak ada oversold RSI<30")
+                                            return
+                                        elif kind == "ob":
+                                            for item in sigs:
+                                                try:
+                                                    sym = item.get('symbol')
+                                                    df = get_history_pro(sym, limit=50, timeframe="1d")
+                                                    if df is None or len(df)<15:
+                                                        continue
+                                                    rsi = calculate_rsi(df['Close'], 14).iloc[-1]
+                                                    if rsi > 70:
+                                                        item['rsi'] = rsi
+                                                        filtered.append(item)
+                                                except:
+                                                    pass
+                                            filtered = sorted(filtered, key=lambda x: x.get('rsi', 50), reverse=True)
+                                            msg = f"📈 *OVERBOUGHT RSI>70* ({len(filtered)})\n\n"
+                                            for idx, it in enumerate(filtered[:20],1):
+                                                multi = it.get('multi_tf',{})
+                                                rsi = it.get('rsi',0)
+                                                msg += f"{idx}. *{it['symbol']}* -- {safe_int(it.get('close',0))} RSI {rsi:.1f} | {multi.get('status_d','')} Net {format_large_number(multi.get('net_d',0),True)}\n"
+                                            send_reply(target_chat, msg if filtered else "✅ Tidak ada overbought RSI>70")
+                                            return
+                                        elif kind == "turbo":
+                                            for item in sigs:
+                                                try:
+                                                    sym = item.get('symbol')
+                                                    df = get_history_pro(sym, limit=50, timeframe="1d")
+                                                    if df is None or len(df)<25:
+                                                        continue
+                                                    last_vol = df['Volume'].iloc[-1]
+                                                    v1 = df['Volume'].rolling(20).mean().iloc[-1]
+                                                    vchg = (last_vol / v1) if v1>0 else 0
+                                                    buy_pct = int(df['Buy_Pct'].iloc[-1]) if 'Buy_Pct' in df.columns else 50
+                                                    multi = item.get('multi_tf',{})
+                                                    status = multi.get('status_d','')
+                                                    if vchg >= 2.0 and buy_pct >= 60 and status == "AKUM":
+                                                        item['vchg'] = vchg
+                                                        item['buy_pct'] = buy_pct
+                                                        filtered.append(item)
+                                                except:
+                                                    pass
+                                            filtered = sorted(filtered, key=lambda x: x.get('vchg',0), reverse=True)
+                                            msg = f"🚀 *TURBO SPIKE - VOLUME EXPLOSION* ({len(filtered)})\nCriteria: Vchg ≥2.0x + Buy% ≥60% + AKUM\n\n"
+                                            for idx, it in enumerate(filtered[:20],1):
+                                                multi = it.get('multi_tf',{})
+                                                msg += f"{idx}. 🚀 *{it['symbol']}* -- {safe_int(it.get('close',0))} Vol {it.get('vchg',0):.1f}x Buy% {it.get('buy_pct',0)}% Net {format_large_number(multi.get('net_d',0),True)}\n"
+                                                msg += f"   Top: {format_top_brokers(multi.get('brokers',[]),3, multi.get('status_d','AKUM'))}\n\n"
+                                            send_reply(target_chat, msg if filtered else "Tidak ada TURBO saat ini")
+                                            return
+                                        want_akum = (kind == "akum")
+                                        tf_key_map = {"d": ("net_d","status_d","buy_d","sell_d","avg_d"), "w": ("net_5d","status_5d","buy_5d","sell_5d","avg_5d"), "m": ("net_20d","status_20d","buy_20d","sell_20d","avg_20d")}
+                                        net_key, status_key, buy_key, sell_key, avg_key = tf_key_map.get(tf, tf_key_map["d"])
+                                        for item in sigs:
+                                            multi = item.get('multi_tf',{})
+                                            status = multi.get(status_key,'')
+                                            net = multi.get(net_key,0)
+                                            if want_akum:
+                                                if status=="AKUM" and net>0:
+                                                    filtered.append(item)
+                                            else:
+                                                if status=="DIST" and net<0:
+                                                    filtered.append(item)
+                                        filtered = sorted(filtered, key=lambda x: abs(x.get('multi_tf',{}).get(net_key,0)), reverse=True)
+                                        tf_label = {"d":"DAILY 1D","w":"WEEKLY 5D","m":"MONTHLY 20D"}.get(tf, "DAILY")
+                                        kind_label = "AKUMULASI" if want_akum else "DISTRIBUSI"
+                                        msg = f"🏆 *TOP 20 {kind_label} - {tf_label}* ({len(filtered)})\n\n"
+                                        for idx, item in enumerate(filtered[:20],1):
+                                            multi = item.get('multi_tf',{})
+                                            net = multi.get(net_key,0)
+                                            buy = multi.get(buy_key,0)
+                                            sell = multi.get(sell_key,0)
+                                            avg = multi.get(avg_key,0)
+                                            status = multi.get(status_key,'')
+                                            emoji = "🟢" if status=="AKUM" else "🔴"
+                                            brokers = multi.get('brokers',[]) if tf=="d" else multi.get('brokers_5d',[]) if tf=="w" else multi.get('brokers_20d',[])
+                                            top = format_top_brokers(brokers, 3, status)
+                                            msg += f"{idx}. {emoji} *{item['symbol']}* -- {safe_int(item.get('close',0))} ({item.get('change_pct',0):+.2f}%)\n"
+                                            msg += f"   {status} | Buy {format_large_number(buy,True)} Sell {format_large_number(sell,True)} Net {format_large_number(net,True)} Avg {avg:.0f}\n"
+                                            msg += f"   Top: {top}\n\n"
+                                        send_reply(target_chat, msg)
+                                    except Exception as e:
+                                        import traceback
+                                        traceback.print_exc()
+                                        send_reply(target_chat, f"❌ Error /s: {e}")
+                                threading.Thread(target=screener_s, args=(chat_id, sub, tf_arg)).start()
                         elif first_word in ["/wl","/watchlist"]:
+
+
                             parts = text.split()
                             WATCHLIST_FILE = "/tmp/rafano_watchlist.json"
                             def load_wl():
