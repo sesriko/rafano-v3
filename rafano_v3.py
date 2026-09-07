@@ -186,33 +186,137 @@ def get_broker_summary(symbol, days=None):
     status="AKUM" if net>0 else "DIST" if net<0 else "NEUTRAL"
     return net, status, brokers
 
+
+
+def get_last_n_trading_days(n, ref_date=None):
+    """Return last n trading days, if today Sat/Sun ref=Friday. Use BBCA calendar"""
+    import datetime
+    if ref_date is None:
+        ref_date = datetime.datetime.now(TIMEZONE_WIB).date()
+        # If Sat (5) or Sun (6), move to Friday
+        if ref_date.weekday()==5:  # Saturday
+            ref_date = ref_date - datetime.timedelta(days=1)
+        elif ref_date.weekday()==6:  # Sunday
+            ref_date = ref_date - datetime.timedelta(days=2)
+    try:
+        import yfinance as yf
+        hist = yf.Ticker("BBCA.JK").history(period="6mo", interval="1d", timeout=10)
+        if hist is not None and len(hist)>=n:
+            # Filter <= ref_date
+            filtered = [d for d in hist.index if d.date() <= ref_date and d.weekday()<5]
+            last_n = filtered[-n:]
+            dates = [d.strftime("%Y-%m-%d") for d in last_n]
+            # If called tomorrow, ref_date will be tomorrow, so it auto adjusts
+            log(f"Trading calendar BBCA last {n}: {dates[0]}->{dates[-1]} ref {ref_date}")
+            return dates
+    except Exception as e:
+        log(f"trading days yf fail {e}")
+    # Fallback manual skip weekend
+    days=[]
+    cur=ref_date
+    while len(days)<n:
+        if cur.weekday()<5:
+            days.append(cur.strftime("%Y-%m-%d"))
+        cur = cur - datetime.timedelta(days=1)
+    days.reverse()
+    return days
+
+def get_broker_for_date(symbol, date_str):
+    symbol=sanitize_symbol(symbol)
+    cache_key = f"{symbol}_{date_str}"
+    cached = get_cached(cache_key, BROKER_CACHE, 3600)
+    if cached:
+        return cached
+    for pname in ["date", "trading_date", "trade_date"]:
+        data = arjum_get(f"/broker-summary/{symbol}", {pname: date_str, "broker_limit": 30})
+        if data:
+            blist = data.get('brokers') or data.get('data') or []
+            net=0; brokers=[]
+            for b in blist[:30]:
+                code=b.get('broker_code') or '??'
+                bv=float(b.get('bval',0) or b.get('buy_value',0) or 0)
+                sv=float(b.get('sval',0) or b.get('sell_value',0) or 0)
+                nv=float(b.get('nval',0) or b.get('net_value',0) or (bv-sv))
+                brokers.append({"broker_code":str(code).upper(),"buy_value":bv,"sell_value":sv,"net_value":nv,"avg_price":float(b.get('bavg',0) or 0)})
+                net+=nv
+            if brokers or net!=0:
+                status="AKUM" if net>0 else "DIST" if net<0 else "NEUTRAL"
+                set_cached(cache_key, (net,status,brokers), BROKER_CACHE)
+                return net,status,brokers
+    return 0, "NEUTRAL", []
+
+def get_broker_for_date(symbol, date_str):
+    symbol=sanitize_symbol(symbol)
+    cache_key = f"{symbol}_{date_str}"
+    cached = get_cached(cache_key, BROKER_CACHE, 3600)
+    if cached:
+        return cached
+    # Try date param
+    for pname in ["date", "trading_date", "trade_date"]:
+        data = arjum_get(f"/broker-summary/{symbol}", {pname: date_str, "broker_limit": 20})
+        if data:
+            blist = data.get('brokers') or data.get('data') or []
+            net=0; brokers=[]
+            for b in blist[:20]:
+                code=b.get('broker_code') or '??'
+                bv=float(b.get('bval',0) or b.get('buy_value',0) or 0)
+                sv=float(b.get('sval',0) or b.get('sell_value',0) or 0)
+                nv=float(b.get('nval',0) or b.get('net_value',0) or (bv-sv))
+                brokers.append({"broker_code":str(code).upper(),"buy_value":bv,"sell_value":sv,"net_value":nv,"avg_price":float(b.get('bavg',0) or 0)})
+                net+=nv
+            if brokers or net!=0:
+                status="AKUM" if net>0 else "DIST" if net<0 else "NEUTRAL"
+                set_cached(cache_key, (net,status,brokers), BROKER_CACHE)
+                log(f"Broker {symbol} {date_str} {status} Net {fmt_big(net,True)}")
+                return net,status,brokers
+    # Fallback: accumulation for that date if today, else empty
+    return 0, "NEUTRAL", []
+
 def get_broker_multi_tf(symbol, hist_df=None):
     symbol=sanitize_symbol(symbol)
-    def flow_for(days):
-        net,status,brokers=get_broker_summary(symbol, days=days)
-        # also get top accum
-        _, acc_brokers = get_broker_accumulation(symbol, top=10, days=days)
-        if not brokers: brokers=acc_brokers
-        # Top3 calc
-        accum=[b for b in brokers if b['net_value']>0]
-        distrib=[b for b in brokers if b['net_value']<0]
+    import datetime
+    dates_1 = get_last_n_trading_days(1)
+    dates_5 = get_last_n_trading_days(5)
+    dates_20 = get_last_n_trading_days(20)
+    log(f"TRADING DAYS {symbol} 1D:{dates_1} 5D:{dates_5[0]}->{dates_5[-1]} 20D:{dates_20[0]}->{dates_20[-1]}")
+
+    def aggregate_for_dates(date_list):
+        total_net=0; all_brokers={}
+        for d in date_list:
+            net,status,brokers = get_broker_for_date(symbol, d)
+            total_net+=net
+            for b in brokers:
+                code=b['broker_code']
+                if code not in all_brokers:
+                    all_brokers[code]={"broker_code":code,"buy_value":0,"sell_value":0,"net_value":0,"avg_price":0}
+                all_brokers[code]["buy_value"]+=b["buy_value"]
+                all_brokers[code]["sell_value"]+=b["sell_value"]
+                all_brokers[code]["net_value"]+=b["net_value"]
+        brokers_list=list(all_brokers.values())
+        accum=[b for b in brokers_list if b['net_value']>0]
+        distrib=[b for b in brokers_list if b['net_value']<0]
         accum.sort(key=lambda x: x['net_value'], reverse=True)
         distrib.sort(key=lambda x: abs(x['net_value']), reverse=True)
         top_a=accum[:3]; top_d=distrib[:3]
         top_a_val=sum(b['net_value'] for b in top_a)
         top_d_val=sum(abs(b['net_value']) for b in top_d)
-        buy=sum(b['buy_value'] for b in brokers)
-        sell=sum(b['sell_value'] for b in brokers)
-        # Status by Top3
-        if top_a_val > top_d_val: st="AKUM"
-        elif top_d_val > top_a_val: st="DIST"
-        else: st=status
-        return {"buy":buy,"sell":sell,"net":net,"status":st,"brokers":brokers,"top_a":top_a,"top_d":top_d,"top_a_val":top_a_val,"top_d_val":top_d_val}
-    d=flow_for(1); w=flow_for(5); m=flow_for(20)
-    log(f"FLOW FINAL {symbol} 1D: {d['status']} {fmt_big(d['top_a_val'])} { [b['broker_code'] for b in d['top_a']] } vs {fmt_big(d['top_d_val'])} {[b['broker_code'] for b in d['top_d']]} => {d['status']}")
+        buy=sum(b['buy_value'] for b in brokers_list)
+        sell=sum(b['sell_value'] for b in brokers_list)
+        status="AKUM" if top_a_val>top_d_val else "DIST" if top_d_val>top_a_val else "NEUTRAL"
+        return {"buy":buy,"sell":sell,"net":total_net,"status":status,"brokers":brokers_list,"top_a":top_a,"top_d":top_d,"top_a_val":top_a_val,"top_d_val":top_d_val,"dates":date_list}
+
+    d = aggregate_for_dates(dates_1)
+    w = aggregate_for_dates(dates_5)
+    m = aggregate_for_dates(dates_20)
+
+    log(f"FLOW DATE-BASED {symbol} 1D({dates_1[0]}) {d['status']} Net {fmt_big(d['net'],True)}")
+    log(f"FLOW DATE-BASED {symbol} 5D({dates_5[0]}->{dates_5[-1]}) {w['status']} Net {fmt_big(w['net'],True)}")
+    log(f"FLOW DATE-BASED {symbol} 20D({dates_20[0]}->{dates_20[-1]}) {m['status']} Net {fmt_big(m['net'],True)}")
+
     return {"d":d,"w":w,"m":m,"buy_d":d['buy'],"sell_d":d['sell'],"net_d":d['net'],"status_d":d['status'],"brokers":d['brokers'],"top_a_d":d['top_a'],"top_d_d":d['top_d'],
             "buy_5d":w['buy'],"sell_5d":w['sell'],"net_5d":w['net'],"status_5d":w['status'],"brokers_5d":w['brokers'],"top_a_5d":w['top_a'],"top_d_5d":w['top_d'],
             "buy_20d":m['buy'],"sell_20d":m['sell'],"net_20d":m['net'],"status_20d":m['status'],"brokers_20d":m['brokers'],"top_a_20d":m['top_a'],"top_d_20d":m['top_d']}
+
 
 def fmt_top(brokers):
     if not brokers: return "-"
@@ -310,20 +414,110 @@ def send_photo(chat_id, fp, cap=""):
         with open(fp,'rb') as f: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data={"chat_id":chat_id,"caption":cap,"parse_mode":"Markdown"}, files={"photo":f}, timeout=20)
     except Exception as e: log(f"photo err {e}")
 
+
+def calculate_technical(df):
+    """Return SMA, RSI, BB, MACD, ATR, Support/Resistance pivot"""
+    try:
+        close=df['Close']
+        high=df['High']; low=df['Low']
+        sma5=close.rolling(5).mean().iloc[-1]
+        sma20=close.rolling(20).mean().iloc[-1]
+        sma50=close.rolling(50).mean().iloc[-1]
+        # RSI 14
+        delta=close.diff()
+        gain=delta.where(delta>0,0).rolling(14).mean()
+        loss=-delta.where(delta<0,0).rolling(14).mean()
+        rs=gain/loss.replace(0,0.001)
+        rsi=100-(100/(1+rs))
+        rsi_val=rsi.iloc[-1]
+        # BB
+        bb_mid=close.rolling(20).mean().iloc[-1]
+        bb_std=close.rolling(20).std().iloc[-1]
+        bb_up=bb_mid+2*bb_std; bb_low=bb_mid-2*bb_std
+        # MACD
+        ema12=close.ewm(span=12).mean(); ema26=close.ewm(span=26).mean()
+        macd_line=ema12-ema26; signal=macd_line.ewm(span=9).mean()
+        macd_val=macd_line.iloc[-1]; sig_val=signal.iloc[-1]; hist=macd_val-sig_val
+        # ATR
+        tr1=high-low; tr2=(high-close.shift(1)).abs(); tr3=(low-close.shift(1)).abs()
+        tr=pd.concat([tr1,tr2,tr3],axis=1).max(axis=1)
+        atr=tr.rolling(14).mean().iloc[-1]
+        # Pivot support resistance daily
+        h=high.iloc[-1]; l=low.iloc[-1]; c=close.iloc[-1]
+        pp=(h+l+c)/3
+        r1=2*pp-l; s1=2*pp-h; r2=pp+(h-l); s2=pp-(h-l)
+        trend="Bullish" if c>sma20 and c>sma50 else "Bearish" if c<sma20 and c<sma50 else "Sideways"
+        return {
+            "sma5":sma5,"sma20":sma20,"sma50":sma50,
+            "rsi":rsi_val,"bb_up":bb_up,"bb_mid":bb_mid,"bb_low":bb_low,
+            "macd":macd_val,"signal":sig_val,"hist":hist,
+            "atr":atr,"pp":pp,"r1":r1,"r2":r2,"s1":s1,"s2":s2,"trend":trend
+        }
+    except Exception as e:
+        log(f"tech calc err {e}")
+        return {}
+
 def process_chart(chat_id, sym, tf="1d"):
     sym=sanitize_symbol(sym); tf=tf.lower() or "1d"
-    log(f"/c {sym} {tf}"); send_msg(chat_id, f"RAFANO V6 {sym} TF:{tf.upper()} generating...")
-    df=get_history_pro(sym,150,tf)
-    if df is None: send_msg(chat_id, f"Data {sym} {tf} tidak ketemu (mungkin delisted)"); return
+    log(f"/c {sym} {tf}")
+    send_msg(chat_id, f"RAFANO V6.4 {sym} TF:{tf.upper()} generating...")
+    df=get_history_pro(sym,200,tf)
+    if df is None:
+        send_msg(chat_id, f"Data {sym} {tf} tidak ketemu (mungkin delisted)")
+        return
     multi=get_broker_multi_tf(sym)
+    # Technical
+    tech=calculate_technical(df)
+    last=df['Close'].iloc[-1]; prev=df['Close'].iloc[-2] if len(df)>1 else last
+    open_p=df['Open'].iloc[-1]; high=df['High'].iloc[-1]; low=df['Low'].iloc[-1]
+    chg=last-prev; chg_pct=(last/prev-1)*100 if prev else 0
+    vol=df['Volume'].iloc[-1]; vol_val=last*vol
+    avg20=df['Volume'].rolling(20).mean().iloc[-1]; ratio=vol/avg20 if avg20 else 0
+
     out=f"chart_{sym}_{tf}_{int(time.time())}.png"
     path=gen_chart(df,sym,tf,multi,out)
     if path and os.path.exists(path):
-        d=multi['d']; cap=f"*{sym}* {int(df['Close'].iloc[-1])} TF:{tf.upper()}\nD {d['status']} Net {fmt_big(d['net'],True)} Top {fmt_top(d['top_a'])}\nW {multi['w']['status']} Net {fmt_big(multi['w']['net'],True)}\nM {multi['m']['status']} Net {fmt_big(multi['m']['net'],True)}"
+        d=multi['d']; w=multi['w']; m=multi['m']
+        # Full caption format requested
+        # PRICE ACTION
+        cap = f"*{sym}* {int(last)} TF:{tf.upper()}\n\n"
+        cap += f"📈 *PRICE ACTION*\n"
+        emoji = "🟢" if chg>=0 else "🔴"
+        cap += f"{emoji} Rp{int(last)} ({chg:+.0f} | {chg_pct:+.2f}%)\n"
+        cap += f"Prev: Rp{int(prev)} | Open: Rp{int(open_p)}\n"
+        cap += f"High: Rp{int(high)} | Low: Rp{int(low)}\n"
+        cap += f"Range: Rp{int(high-low)} ({(high-low)/last*100:.1f}%)\n"
+        if tech:
+            cap += f"Support & Resistance:\nDaily: R2 Rp{int(tech['r2'])} | R1 Rp{int(tech['r1'])} | P Rp{int(tech['pp'])} | S1 Rp{int(tech['s1'])} | S2 Rp{int(tech['s2'])}\n"
+        cap += f"\n📊 *TEKNIKAL*\n"
+        if tech:
+            cap += f"SMA5: Rp{int(tech['sma5'])} | SMA20: Rp{int(tech['sma20'])} | SMA50: Rp{int(tech['sma50'])}\n"
+            rsi_label="Overbought" if tech['rsi']>70 else "Oversold" if tech['rsi']<30 else "Neutral"
+            cap += f"RSI(14): {tech['rsi']:.0f} — {rsi_label}\n"
+            cap += f"BB(20,2): Upper Rp{int(tech['bb_up'])} | Mid Rp{int(tech['bb_mid'])} | Lower Rp{int(tech['bb_low'])}\n"
+            cap += f"MACD: {tech['macd']:.0f} | Signal {tech['signal']:.0f} | Hist {tech['hist']:.0f}\n"
+            cap += f"Trend: {'🟢' if 'Bullish' in tech['trend'] else '🔴'} {tech['trend']}\n"
+            cap += f"ATR(14): Rp{int(tech['atr'])} ({tech['atr']/last*100:.2f}%)\n"
+        cap += f"\n📊 *VOLUME*\n"
+        cap += f"Volume: {int(vol):,} lembar\n"
+        cap += f"Nilai: Rp{vol_val/1e9:.2f}B\n"
+        cap += f"Rata2 20d: {int(avg20):,} | Ratio: {ratio:.1f}x \n"
+        cap += f"Foreign: Buy 0 Sell 0 Net 0\n"
+        cap += f"\n🏦 *BROKER NETFLOW VALID*\n"
+        cap += f"Total {len(d['brokers'])} broker | Net: {fmt_big(d['net'],True)}\n"
+        cap += f"Daily: {d['status']} Buy {fmt_big(d['buy'],True)} Sell {fmt_big(d['sell'],True)} Net {fmt_big(d['net'],True)}\n"
+        cap += f"  Top Akum: {fmt_top(d['top_a'])}\n"
+        cap += f"  Top Dist: {fmt_top(d['top_d'])}\n"
+        # 5D
+        cap += f"5D ({w['dates'][0]}->{w['dates'][-1]}): {w['status']} Net {fmt_big(w['net'],True)}\n"
+        cap += f"  Akum: {fmt_top(w['top_a'])} | Dist: {fmt_top(w['top_d'])}\n"
+        cap += f"20D ({m['dates'][0]}->{m['dates'][-1]}): {m['status']} Net {fmt_big(m['net'],True)}\n"
+
         send_photo(chat_id, path, cap)
         try: os.remove(path)
         except: pass
-    else: send_msg(chat_id, f"Gagal render {sym}")
+    else:
+        send_msg(chat_id, f"Gagal render {sym}")
 
 def listener():
     log("RAFANO TRADER V6.1 FULL DASHBOARD - LISTENER STARTED - pad 14 - dashboard lengkap")
