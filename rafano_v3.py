@@ -240,7 +240,7 @@ def get_broker_for_date(symbol, date_str):
                 brokers.append({"broker_code":str(code).upper(),"buy_value":bv,"sell_value":sv,"net_value":nv,"avg_price":float(b.get('bavg',0) or 0)})
                 net+=nv
             if brokers or net!=0:
-                status="AKUM" if net>0 else "DIST" if net<0 else "NEUTRAL"
+                status="akum" if net>0 else "dist"
                 set_cached(cache_key, (net,status,brokers), BROKER_CACHE)
                 return net,status,brokers
     return 0, "NEUTRAL", []
@@ -265,11 +265,20 @@ def get_broker_for_date(symbol, date_str):
                 brokers.append({"broker_code":str(code).upper(),"buy_value":bv,"sell_value":sv,"net_value":nv,"avg_price":float(b.get('bavg',0) or 0)})
                 net+=nv
             if brokers or net!=0:
-                status="AKUM" if net>0 else "DIST" if net<0 else "NEUTRAL"
+                status="akum" if net>0 else "dist"
                 set_cached(cache_key, (net,status,brokers), BROKER_CACHE)
                 log(f"Broker {symbol} {date_str} {status} Net {fmt_big(net,True)}")
                 return net,status,brokers
-    # Fallback: accumulation for that date if today, else empty
+    # Fallback: try accumulation with days=1 for today
+    acc_val, brokers_acc = get_broker_accumulation(symbol, top=30, days=1)
+    if brokers_acc:
+        net=0; bl=[]
+        for b in brokers_acc:
+            code_b=b.get('broker_code') or '??'
+            bv=float(b.get('buy_value',0) or 0); sv=float(b.get('sell_value',0) or 0); nv=float(b.get('net_value',0) or (bv-sv))
+            bl.append({"broker_code":str(code_b).upper(),"buy_value":bv,"sell_value":sv,"net_value":nv,"avg_price":0})
+            net+=nv
+        return net, "akum" if net>0 else "dist", bl
     return 0, "NEUTRAL", []
 
 def get_broker_multi_tf(symbol, hist_df=None):
@@ -302,7 +311,11 @@ def get_broker_multi_tf(symbol, hist_df=None):
         top_d_val=sum(abs(b['net_value']) for b in top_d)
         buy=sum(b['buy_value'] for b in brokers_list)
         sell=sum(b['sell_value'] for b in brokers_list)
-        status="AKUM" if top_a_val>top_d_val else "DIST" if top_d_val>top_a_val else "NEUTRAL"
+        # LOGIC FINAL: Top3 Akum vs Top3 Dist
+        if top_a_val > top_d_val:
+            status="akum"
+        else:
+            status="dist"
         return {"buy":buy,"sell":sell,"net":total_net,"status":status,"brokers":brokers_list,"top_a":top_a,"top_d":top_d,"top_a_val":top_a_val,"top_d_val":top_d_val,"dates":date_list}
 
     d = aggregate_for_dates(dates_1)
@@ -358,7 +371,7 @@ def gen_chart(df, symbol, timeframe, multi, out="chart.png"):
     power="TURBO" if buy_pct>=85 and vchg1>=1.2 else "STRONG" if buy_pct>=70 or vchg1>=1.5 else "NORMAL" if buy_pct>=60 else "WEAK"
     safety="GOOD" if last>df['EMA200'].iloc[-1] else "BAD"
     plt.style.use('dark_background')
-    fig=plt.figure(figsize=(16,10),dpi=200,facecolor='#000000')
+    fig=plt.figure(figsize=(16,10),dpi=300,facecolor='#000000')
     gs=gridspec.GridSpec(4,1,height_ratios=[4.5,1.1,0.9,0.8],hspace=0.05)
     ax_main=fig.add_subplot(gs[0]); ax_vol=fig.add_subplot(gs[1],sharex=ax_main); ax_nbsa=fig.add_subplot(gs[2],sharex=ax_main); ax_mm=fig.add_subplot(gs[3],sharex=ax_main)
     fig.subplots_adjust(left=0.08,right=0.92,top=0.88,bottom=0.06)
@@ -403,7 +416,7 @@ def gen_chart(df, symbol, timeframe, multi, out="chart.png"):
         ax_nbsa.text(0.005,0.85,f"D {d['status']} Net {fmt_big(d['net'],True)} Top {fmt_top(d['top_a'])} | DIST {fmt_top(d['top_d'])}",transform=ax_nbsa.transAxes,color='white',fontsize=6,va='top')
         ax_nbsa.text(0.005,0.55,f"W {w['status']} Net {fmt_big(w['net'],True)} Top {fmt_top(w['top_a'])}",transform=ax_nbsa.transAxes,color='#aaa',fontsize=5,va='top')
         ax_mm.text(0.005,0.85,f"D {d['status']} | W {w['status']} Net {fmt_big(w['net'],True)} | M {m['status']} Net {fmt_big(m['net'],True)} | TF {tf_label}",transform=ax_mm.transAxes,color='white',fontsize=6,va='top')
-    plt.savefig(out,dpi=200,bbox_inches='tight',facecolor='#000000'); plt.close('all'); return out
+    plt.savefig(out,dpi=300,bbox_inches='tight',facecolor='#000000'); plt.close('all'); return out
 
 # TELEGRAM
 def send_msg(chat_id, text):
