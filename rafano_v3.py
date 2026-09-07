@@ -26,7 +26,8 @@ def log(m): print(f"[{datetime.datetime.now(TIMEZONE_WIB).strftime('%H:%M:%S')}]
 def sanitize_symbol(s):
     if not s: return ""
     s=str(s).upper().strip()
-    s=s.replace(".JK","").strip("'\" + '"`.,;:!@#$%^&*() ')
+    s=s.replace(".JK","")
+    s=s.replace("'","").replace('"',"").replace("`","")
     s=re.sub(r'[^A-Z0-9]', '', s)
     return s[:12]
 
