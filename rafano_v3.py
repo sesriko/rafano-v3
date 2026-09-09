@@ -487,12 +487,15 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="1d",sector_info="IHSG",output
                 if idx<len(df):
                     low=df['Low'].iloc[idx]; atr=plot_df['ATR'].iloc[idx] if not pd.isna(plot_df['ATR'].iloc[idx]) else df['Close'].iloc[idx]*0.02
                     ax_main.annotate('▲',xy=(idx,low-atr*0.6),fontsize=14,color='#00ff00',fontweight='bold',ha='center',va='center')
+                    lc='#00ff00' if 'BO EMA50' in sig['type'] else '#ffff00'
+                    ax_main.text(idx,low-atr*1.3,sig['type'],fontsize=7,color=lc,fontweight='bold',ha='center',va='top',bbox=dict(facecolor='black',alpha=0.75,edgecolor=lc,boxstyle='round,pad=0.3'))
         if sell_signals:
             for sig in sell_signals:
                 idx=sig['index']
                 if idx<len(df):
                     high=df['High'].iloc[idx]; atr=plot_df['ATR'].iloc[idx] if not pd.isna(plot_df['ATR'].iloc[idx]) else df['Close'].iloc[idx]*0.02
                     ax_main.annotate('▼',xy=(idx,high+atr*0.6),fontsize=14,color='#ff0000',fontweight='bold',ha='center',va='center')
+                    ax_main.text(idx,high+atr*1.3,sig['type'],fontsize=7,color='#ff4444',fontweight='bold',ha='center',va='bottom',bbox=dict(facecolor='black',alpha=0.75,edgecolor='#ff4444',boxstyle='round,pad=0.3'))
         if len(df)>15:
             bl=len(df)-15; br=len(df)-1; yl=df['Low'].iloc[-15:].min()*0.99; yh=df['High'].iloc[-15:].max()*1.01
             ax_main.plot([bl,br],[yh,yh],color='white',linestyle='--',linewidth=0.6,alpha=0.6); ax_main.plot([bl,br],[yl,yl],color='white',linestyle='--',linewidth=0.6,alpha=0.6)
@@ -903,7 +906,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.3.8 SCAN 300 SORT Rp Running...")
+    offset=0; print("🤖 V4.3.9 LABEL BUY RESTORED + SCAN 300 Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1064,7 +1067,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.3.8 SCAN 300 + SORT Rp GEDE")
+    print("🔥 RAFANO V4.3.9 LABEL BUY + SCAN 300")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
