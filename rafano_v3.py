@@ -600,7 +600,7 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False):
         for item in screener_data:
             sym=item.get('symbol') or item.get('code')
             if sym: candidates.append(sym.replace(".JK","").upper())
-        candidates=list(dict.fromkeys(candidates))[:limit_candidates]
+        candidates=list(dict.fromkeys([c.upper() for c in candidates]))[:limit_candidates]
     
     detected=[]
     def process_vol(sym):
@@ -625,18 +625,48 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False):
             try: multi=get_broker_multi_tf(sym, df)
             except: multi=None
             
-            # FILTER AKUM REAL ONLY
+            # FILTER AKUM REAL ONLY - LOOSE + VSA FALLBACK
             if akum_only:
-                if not multi: return None
-                # harus AKUM dan Net >0 dan source REAL (atau QUOTA tapi Net gede dari cache)
-                status = multi.get('status_d','')
-                net_d = multi.get('net_d',0)
-                src = multi.get('source_d','')
-                is_real = src.startswith('API_SUMMARY') or src=='QUOTA'  # QUOTA boleh kalau ada cache
-                if "AKUM" not in status or net_d <= 0: return None
-                if not is_real and net_d < 5_000_000_000: return None  # minimal 5B kalau bukan REAL
-                # tambahan: Buy% harus >60 biar bukan fake
-                if buy_pct < 60: return None
+                # Kalau ada data broker REAL AKUM -> lolos langsung
+                if multi:
+                    status = multi.get('status_d','')
+                    net_d = multi.get('net_d',0)
+                    src = multi.get('source_d','')
+                    # REAL AKUM atau CACHE dengan Net >0
+                    if "AKUM" in status and net_d > 0:
+                        # Buy% minimal 55 biar gak terlalu ketat
+                        if buy_pct >= 55:
+                            pass  # lolos
+                        else:
+                            return None
+                    else:
+                        # Tidak AKUM di broker, cek VSA fallback kalau quota habis
+                        # Kalau quota habis, pakai VSA sebagai proxy AKUM
+                        # Syarat VSA AKUM: Buy% >=70, candle hijau, chg >1%
+                        if not (buy_pct >= 70 and close >= open_ and chg_pct > 1.0):
+                            return None
+                        # kasih tag VSA AKUM
+                        multi = multi or {}
+                        multi['status_d'] = 'AKUM 🟢 (VSA)'
+                        multi['source_d'] = 'VSA_ESTIMATE'
+                else:
+                    # Tidak ada data broker sama sekali (quota habis / cache kosong)
+                    # Fallback VSA: Buy% >=75, hijau, naik >1.5%
+                    if not (buy_pct >= 75 and close >= open_ and chg_pct > 1.5):
+                        return None
+                    # buat dummy multi biar tampil
+                    multi = {
+                        'status_d': 'AKUM 🟢 (VSA)',
+                        'source_d': 'VSA_ESTIMATE',
+                        'net_d': v_last*close,
+                        'akum_d': v_last*close,
+                        'dist_d': 0,
+                        'net_5d': 0,
+                        'net_20d': 0,
+                        'brokers': [],
+                        'brokers_5d': [],
+                        'brokers_20d': []
+                    }
             
             # scoring untuk vol spike
             score=50
@@ -677,6 +707,12 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False):
             print(f"✅ {r['symbol']} Vol {r['vol_ratio']:.1f}x Buy {r['buy_pct']:.0f}% {r['change_pct']:+.1f}%")
         time.sleep(0.3)
     
+    # dedup by symbol keep highest ratio
+    seen={}
+    for d in detected:
+        if d['symbol'] not in seen or d['vol_ratio']>seen[d['symbol']]['vol_ratio']:
+            seen[d['symbol']]=d
+    detected=list(seen.values())
     detected.sort(key=lambda x: x['vol_ratio'], reverse=True)
     return detected
 
@@ -686,7 +722,7 @@ def broadcast_vol_spike(signals, threshold=2.0, akum_only=False):
         send_reply(TARGET_CHAT_ID, msg)
         return
     now=get_now_wib().strftime('%d %b %Y %H:%M WIB')
-    tag = f" + AKUM REAL" if akum_only else ""
+    tag = f" + AKUM (REAL+VSA)" if akum_only else ""
     header=f"*VOL SPIKE{tag} >{threshold}x* 🔥\n{now} | {len(signals)} saham\n{'='*30}\n\n"
     msg=header; kb=[]
     for idx,it in enumerate(signals,1):
@@ -699,11 +735,11 @@ def broadcast_vol_spike(signals, threshold=2.0, akum_only=False):
         line+="\n\n"
         kb.append([{"text": f"{it['symbol']} {it['vol_ratio']:.1f}x", "callback_data": f"chart_{it['symbol']}_1d"}])
         if len(msg)+len(line)>3500:
-            send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard": kb}); msg=line; kb=[]
+            send_reply(TARGET_CHAT_ID, msg, rm={"inline_keyboard": kb}); msg=line; kb=[]
         else:
             msg+=line
     if msg:
-        send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard": kb})
+        send_reply(TARGET_CHAT_ID, msg, rm={"inline_keyboard": kb})
 
 def scan_v3_full():
     print(f"[{get_now_wib()}] 🚀 SCAN RINGKAS...")
@@ -772,9 +808,9 @@ def broadcast_v3(signals):
         item=f"{idx}. *{it['symbol']}* {it['close']} ({it['change_pct']:+.1f}%) {it['score']}% \n   {bs}\n\n"
         kb.append([{"text":f"{it['symbol']}", "callback_data":f"chart_{it['symbol']}_1d"}])
         if len(msg)+len(item)>3500:
-            send_reply(TARGET_CHAT_ID,msg,reply_markup={"inline_keyboard":kb}); msg=item; kb=[]
+            send_reply(TARGET_CHAT_ID,msg,rm={"inline_keyboard":kb}); msg=item; kb=[]
         else: msg+=item
-    if msg: send_reply(TARGET_CHAT_ID,msg,reply_markup={"inline_keyboard":kb})
+    if msg: send_reply(TARGET_CHAT_ID,msg,rm={"inline_keyboard":kb})
 
 def process_chart_request(cid,code,tf="1d",cache=None):
     is_intra=is_intraday_tf(tf)
@@ -981,7 +1017,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.3.4 + VOL SPIKE + AKUM REAL")
+    print("🔥 RAFANO V4.3.6 VOL AKUM LOOSE + VSA")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
