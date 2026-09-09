@@ -1,7 +1,9 @@
 """
-RAFANO V4.3.2 - FIX NO SIGNAL GAK ADA ENTRY SL TP
-- Kalau WAIT 0% NO SIGNAL, Entry SL TP gak ditampilin
-- MDKA contoh sebelumnya jadi bersih
+RAFANO V4.3.3 + SCAN VOLUME SPIKE >2x
+- Fix NO SIGNAL = NO ENTRY (dari V4.3.2)
+- NEW: /scanvol /vol /vspike /volspike -> scan manual volume spike >2x
+- Contoh: /scanvol 2  -> spike >2x, /scanvol 3 -> >3x, /volspike -> default 2x
+- Broadcast pakai format ringkas + vol ratio + bandar
 """
 import os, time, datetime, threading, requests, pytz, numpy as np, pandas as pd, matplotlib.patches as patches, matplotlib.gridspec as gridspec
 from dotenv import load_dotenv
@@ -586,6 +588,123 @@ def calculate_score_v2(sym,hist,akum,dist,net,an):
     lab="VERY STRONG" if score>=85 else "STRONG BUY" if score>=70 else "WEAK BUY" if score>=50 else "WATCH" if score>=35 else "NO SIGNAL"
     return score,lab,rs
 
+# ==================== NEW: SCAN VOLUME SPIKE >2x ====================
+def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False):
+    mode = "AKUM REAL ONLY" if akum_only else "ALL"
+    print(f"[{get_now_wib()}] 🚀 SCAN VOLUME SPIKE >{threshold}x {mode} ...")
+    screener_data=get_screener_latest()
+    if not screener_data:
+        candidates=["BBCA","BBRI","BMRI","BBNI","BRIS","TLKM","ASII","ADRO","ANTM","MDKA","BRMS","BREN","CUAN","WIFI","BIPI","BULL","NIKL","DEWA","PGEO","RAJA","MEDC","ELSA","PGAS","PTBA","ITMG","ANTM","BRPT","TPIA","GOTO","BUKA","EMTK","AMMN","MBMA","NCKL","TINS","HRUM","INCO","ESSA","AKRA","INDY","SMGR","INTP","UNTR","AUTO","ICBP","INDF","MYOR","KLBF","SIDO","CPIN","JPFA","UNVR","BRIS","BNGA"]
+    else:
+        candidates=[]
+        for item in screener_data:
+            sym=item.get('symbol') or item.get('code')
+            if sym: candidates.append(sym.replace(".JK","").upper())
+        candidates=list(dict.fromkeys(candidates))[:limit_candidates]
+    
+    detected=[]
+    def process_vol(sym):
+        try:
+            df=get_history_pro(sym, limit=60, timeframe="1d")
+            if df is None or len(df)<25: return None
+            v_avg=df['Volume'].rolling(20).mean().iloc[-2]  # avg sebelum hari ini
+            v_last=df['Volume'].iloc[-1]
+            if v_avg==0 or pd.isna(v_avg): return None
+            ratio=v_last/v_avg
+            if ratio < threshold: return None
+            # tambahan filter: candle hijau atau minimal tidak merah dalam
+            close=df['Close'].iloc[-1]; open_=df['Open'].iloc[-1]
+            chg_pct=(close/df['Close'].iloc[-2]-1)*100 if len(df)>=2 else 0
+            # hitung VSA Buy%
+            df['V1']=df['Volume'].rolling(20).mean()
+            df,_=calculate_vsa_metrics(df)
+            buy_pct=df['Buy_Pct'].iloc[-1] if 'Buy_Pct' in df.columns else 50
+            
+            # broker info
+            multi=None
+            try: multi=get_broker_multi_tf(sym, df)
+            except: multi=None
+            
+            # FILTER AKUM REAL ONLY
+            if akum_only:
+                if not multi: return None
+                # harus AKUM dan Net >0 dan source REAL (atau QUOTA tapi Net gede dari cache)
+                status = multi.get('status_d','')
+                net_d = multi.get('net_d',0)
+                src = multi.get('source_d','')
+                is_real = src.startswith('API_SUMMARY') or src=='QUOTA'  # QUOTA boleh kalau ada cache
+                if "AKUM" not in status or net_d <= 0: return None
+                if not is_real and net_d < 5_000_000_000: return None  # minimal 5B kalau bukan REAL
+                # tambahan: Buy% harus >60 biar bukan fake
+                if buy_pct < 60: return None
+            
+            # scoring untuk vol spike
+            score=50
+            if ratio>=5: score+=30
+            elif ratio>=3: score+=20
+            elif ratio>=2: score+=10
+            if buy_pct>=70: score+=10
+            if chg_pct>3: score+=10
+            
+            label="VOL SPIKE"
+            if ratio>=5: label="TURBO SPIKE 🔥🔥"
+            elif ratio>=3: label="STRONG SPIKE 🔥"
+            
+            return {
+                "symbol": sym,
+                "close": int(close),
+                "change_pct": chg_pct,
+                "vol_ratio": ratio,
+                "vol_last": v_last,
+                "vol_avg": v_avg,
+                "buy_pct": buy_pct,
+                "score": score,
+                "score_label": label,
+                "broker_net": multi.get('net_d',0) if multi else 0,
+                "broker_status": multi.get('status_d','') if multi else '',
+                "multi_tf": multi,
+                "history_df": df,
+                "brokers": multi.get('brokers',[]) if multi else []
+            }
+        except Exception as e:
+            print(f"vol {sym} err {e}")
+            return None
+    
+    for sym in candidates:
+        r=process_vol(sym)
+        if r:
+            detected.append(r)
+            print(f"✅ {r['symbol']} Vol {r['vol_ratio']:.1f}x Buy {r['buy_pct']:.0f}% {r['change_pct']:+.1f}%")
+        time.sleep(0.3)
+    
+    detected.sort(key=lambda x: x['vol_ratio'], reverse=True)
+    return detected
+
+def broadcast_vol_spike(signals, threshold=2.0, akum_only=False):
+    if not signals:
+        msg = f"Vol Spike + AKUM REAL >{threshold}x: Tidak ada yang valid hari ini (filter ketat)." if akum_only else f"Vol Spike >{threshold}x: Tidak ada yang spike hari ini."
+        send_reply(TARGET_CHAT_ID, msg)
+        return
+    now=get_now_wib().strftime('%d %b %Y %H:%M WIB')
+    tag = f" + AKUM REAL" if akum_only else ""
+    header=f"*VOL SPIKE{tag} >{threshold}x* 🔥\n{now} | {len(signals)} saham\n{'='*30}\n\n"
+    msg=header; kb=[]
+    for idx,it in enumerate(signals,1):
+        multi=it.get('multi_tf') or {}
+        net=format_large_number(multi.get('net_d',0) or it.get('broker_net',0), True) if multi else format_large_number(it.get('broker_net',0),True)
+        status=multi.get('status_d','') if multi else it.get('broker_status','')
+        top=format_top_brokers(it.get('brokers',[]),2)
+        line=f"{idx}. *{it['symbol']}* {it['close']} ({it['change_pct']:+.1f}%) Vol {it['vol_ratio']:.1f}x Buy {it['buy_pct']:.0f}% \n   {status} Net {net}"
+        if top!="-": line+=f" | {top}"
+        line+="\n\n"
+        kb.append([{"text": f"{it['symbol']} {it['vol_ratio']:.1f}x", "callback_data": f"chart_{it['symbol']}_1d"}])
+        if len(msg)+len(line)>3500:
+            send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard": kb}); msg=line; kb=[]
+        else:
+            msg+=line
+    if msg:
+        send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard": kb})
+
 def scan_v3_full():
     print(f"[{get_now_wib()}] 🚀 SCAN RINGKAS...")
     sd=get_screener_latest()
@@ -612,7 +731,7 @@ def scan_v3_full():
             an=get_analysis(sym)
             sc,lab,rs=calculate_score_v2(sym,hd,akum,dist,net,an)
             if sc>=35:
-                prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc; chg=((lc/prev)-1)*100 if prev else 0
+                prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc; chg=(lc/prev-1)*100 if prev else 0
                 tp=calculate_trading_plan(hd,multi_tf=multi,timeframe="1d")
                 return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":akum,"dist_value":dist,"broker_net":net,"broker_status":st,"reasons":rs,"history_df":hd,"trading_plan":tp,"brokers":multi.get('brokers',[]),"multi_tf":multi}
         except: return None
@@ -691,12 +810,10 @@ def process_chart_request(cid,code,tf="1d",cache=None):
         else:
             bl="No broker"; wl=""
         
-        # ===== FIX NO SIGNAL = GAK ADA ENTRY SL TP =====
         is_no_signal = (tp is None) or (tp.get('signal_type')=='NO SIGNAL') or (tp.get('side')=='WAIT') or (tp.get('signal_strength',0)==0)
         
         if tp:
             if is_no_signal:
-                # NO SIGNAL: jangan tampilkan Entry SL TP
                 caption=(
                     f"*{code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
                     f"🟡 *{gl}* {ss}% | {tp.get('signal_type','NO SIGNAL')} | TF: {tfl}\n"
@@ -711,7 +828,6 @@ def process_chart_request(cid,code,tf="1d",cache=None):
                     f"Sup {tp['support']} Res {tp['resistance']} ATR {tp['atr']:.1f} | No Entry - Tunggu sinyal"
                 )
             else:
-                # ADA SIGNAL: tampilkan Entry SL TP
                 caption=(
                     f"*{code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
                     f"🟢 *{gl}* {ss}% | {tp.get('signal_type','')} | TF: {tfl}\n"
@@ -738,7 +854,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.3.2 NO SIGNAL FIX Running...")
+    offset=0; print("🤖 V4.3.4 VOL SPIKE + AKUM REAL Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -758,7 +874,7 @@ def telegram_bot_listener():
                 elif "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=txt.split()[0].lower() if txt else ""
                     if first in ["/start","/help"]:
-                        send_reply(chat_id,"🤖 *V4.3.2 NO SIGNAL FIX*\n`/c <KODE> [TF]` Chart\n`/b <KODE>` Bandar\n`/scan` All BUY\n`/quota` Cek")
+                        send_reply(chat_id,"🤖 *V4.3.4 VOL SPIKE + AKUM*\n`/c <KODE> [TF]` Chart\n`/b <KODE>` Bandar\n`/scan` All BUY\n`/scanvol [x]` Vol >x (semua)\n`/volakum [x]` Vol >x + AKUM REAL ONLY 🔥 filter fake\n`/quota` Cek")
                     elif first in ["/c","/chart"]:
                         parts=txt.split()
                         if len(parts)>=2:
@@ -795,7 +911,7 @@ def telegram_bot_listener():
                                 send_reply(chat_id,"🧹 Cleared")
                         except Exception as e: send_reply(chat_id,f"❌ {e}")
                     elif first in ["/scan","!scan","/scanall","/scanfull"]:
-                        send_reply(chat_id,"🔍 *SCAN 60...*")
+                        send_reply(chat_id,"🔍 *SCAN 60 saham...*")
                         def ms(tg=chat_id):
                             global LAST_SIGNALS_CACHE
                             sigs=scan_v3_full(); LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}; broadcast_v3(sigs)
@@ -819,6 +935,34 @@ def telegram_bot_listener():
                             LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
                             broadcast_v3(sigs)
                         threading.Thread(target=fs,args=(chat_id,)).start()
+                    # ===== SCAN VOL SPIKE =====
+                    elif first in ["/scanvol","/vol","/vspike","/volspike","/spike"]:
+                        parts=txt.split()
+                        try:
+                            thr=float(parts[1]) if len(parts)>=2 else 2.0
+                        except:
+                            thr=2.0
+                        if thr<1.5: thr=1.5
+                        if thr>10: thr=10
+                        send_reply(chat_id, f"🔥 *SCAN VOL SPIKE >{thr}x* (30-60 saham, 1-2 menit)...")
+                        def vol_scan(tg=chat_id, th=thr):
+                            sigs=scan_volume_spike(threshold=th, limit_candidates=60, akum_only=False)
+                            broadcast_vol_spike(sigs, threshold=th, akum_only=False)
+                        threading.Thread(target=vol_scan, args=(chat_id, thr)).start()
+                    # ===== NEW: VOL SPIKE + AKUM REAL ONLY =====
+                    elif first in ["/scanvolakum","/volakum","/vspikeakum","/vakum","/spikeakum"]:
+                        parts=txt.split()
+                        try:
+                            thr=float(parts[1]) if len(parts)>=2 else 2.0
+                        except:
+                            thr=2.0
+                        if thr<1.5: thr=1.5
+                        if thr>10: thr=10
+                        send_reply(chat_id, f"🔥 *SCAN VOL SPIKE + AKUM REAL >{thr}x* (filter fake pump, 2-3 menit)...")
+                        def volakum_scan(tg=chat_id, th=thr):
+                            sigs=scan_volume_spike(threshold=th, limit_candidates=60, akum_only=True)
+                            broadcast_vol_spike(sigs, threshold=th, akum_only=True)
+                        threading.Thread(target=volakum_scan, args=(chat_id, thr)).start()
         except Exception as e:
             print(f"Listener err {e}"); time.sleep(3)
 
@@ -837,7 +981,8 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.3.2 NO SIGNAL = NO ENTRY SL TP")
+    print("🔥 RAFANO V4.3.4 + VOL SPIKE + AKUM REAL")
     print("==========================================")
+    print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
     telegram_bot_listener()
