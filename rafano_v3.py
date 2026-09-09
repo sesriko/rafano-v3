@@ -589,7 +589,9 @@ def calculate_score_v2(sym,hist,akum,dist,net,an):
     return score,lab,rs
 
 # ==================== NEW: SCAN VOLUME SPIKE >2x ====================
-def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False):
+def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False, sort_by_rp=False):
+    # sort_by_rp = True untuk scanvolall, sort by Rp gede bukan ratio
+
     mode = "AKUM REAL ONLY" if akum_only else "ALL"
     print(f"[{get_now_wib()}] 🚀 SCAN VOLUME SPIKE >{threshold}x {mode} ...")
     screener_data=get_screener_latest()
@@ -687,6 +689,8 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False):
                 "vol_ratio": ratio,
                 "vol_last": v_last,
                 "vol_avg": v_avg,
+                "vol_rp": v_last*close,
+                "vol_avg_rp": v_avg*close,
                 "buy_pct": buy_pct,
                 "score": score,
                 "score_label": label,
@@ -714,16 +718,21 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False):
         if d['symbol'] not in seen or d['vol_ratio']>seen[d['symbol']]['vol_ratio']:
             seen[d['symbol']]=d
     detected=list(seen.values())
-    detected.sort(key=lambda x: x['vol_ratio'], reverse=True)
+    if sort_by_rp:
+        detected.sort(key=lambda x: x.get('vol_rp',0), reverse=True)
+    else:
+        detected.sort(key=lambda x: x['vol_ratio'], reverse=True)
     return detected
 
-def broadcast_vol_spike(signals, threshold=2.0, akum_only=False):
+def broadcast_vol_spike(signals, threshold=2.0, akum_only=False, sort_by_rp=False):
     if not signals:
         msg = f"Vol Spike + AKUM REAL >{threshold}x: Tidak ada yang valid hari ini (filter ketat)." if akum_only else f"Vol Spike >{threshold}x: Tidak ada yang spike hari ini."
         send_reply(TARGET_CHAT_ID, msg)
         return
     now=get_now_wib().strftime('%d %b %Y %H:%M WIB')
     tag = f" + AKUM (REAL+VSA)" if akum_only else ""
+    if sort_by_rp:
+        tag += " [SORT Rp]"
     header=f"*VOL SPIKE{tag} >{threshold}x* 🔥\n{now} | {len(signals)} saham\n{'='*30}\n\n"
     msg=header; kb=[]
     for idx,it in enumerate(signals,1):
@@ -731,7 +740,8 @@ def broadcast_vol_spike(signals, threshold=2.0, akum_only=False):
         net=format_large_number(multi.get('net_d',0) or it.get('broker_net',0), True) if multi else format_large_number(it.get('broker_net',0),True)
         status=multi.get('status_d','') if multi else it.get('broker_status','')
         top=format_top_brokers(it.get('brokers',[]),2)
-        line=f"{idx}. *{it['symbol']}* {it['close']} ({it['change_pct']:+.1f}%) Vol {it['vol_ratio']:.1f}x Buy {it['buy_pct']:.0f}% \n   {status} Net {net}"
+        rp_str=format_large_number(it.get('vol_rp',0), False)
+        line=f"{idx}. *{it['symbol']}* {it['close']} ({it['change_pct']:+.1f}%) Vol {it['vol_ratio']:.1f}x Rp {rp_str} Buy {it['buy_pct']:.0f}% \n   {status} Net {net}"
         if top!="-": line+=f" | {top}"
         line+="\n\n"
         kb.append([{"text": f"{it['symbol']} {it['vol_ratio']:.1f}x", "callback_data": f"chart_{it['symbol']}_1d"}])
@@ -891,7 +901,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.3.7 FULL UNIVERSE VOL SPIKE Running...")
+    offset=0; print("🤖 V4.3.8 SCAN 300 SORT Rp Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -911,7 +921,7 @@ def telegram_bot_listener():
                 elif "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=txt.split()[0].lower() if txt else ""
                     if first in ["/start","/help"]:
-                        send_reply(chat_id,"🤖 *V4.3.4 VOL SPIKE + AKUM*\n`/c <KODE> [TF]` Chart\n`/b <KODE>` Bandar\n`/scan` All BUY\n`/scanvol [x]` Vol >x (semua)\n`/volakum [x]` Vol >x + AKUM REAL ONLY 🔥 filter fake\n`/quota` Cek")
+                        send_reply(chat_id,"🤖 *V4.3.8 SCAN 300 SORT Rp*\n`/c <KODE> [TF]` Chart\n`/b <KODE>` Bandar\n`/scan` BUY 60\n`/scanvol [x] [n]` Vol >x (n=60-300)\n`/volakum [x] [n]` Vol + AKUM\n`/scanvolall [x]` 300 saham SORT Rp gede di atas 🔥\n`/volallakum [x]` 300 + AKUM + SORT Rp")
                     elif first in ["/c","/chart"]:
                         parts=txt.split()
                         if len(parts)>=2:
@@ -977,29 +987,63 @@ def telegram_bot_listener():
                         parts=txt.split()
                         try:
                             thr=float(parts[1]) if len(parts)>=2 else 2.0
+                            lim=int(parts[2]) if len(parts)>=3 else 60
                         except:
-                            thr=2.0
+                            thr=2.0; lim=60
                         if thr<1.5: thr=1.5
                         if thr>10: thr=10
-                        send_reply(chat_id, f"🔥 *SCAN VOL SPIKE >{thr}x* (30-60 saham, 1-2 menit)...")
-                        def vol_scan(tg=chat_id, th=thr):
-                            sigs=scan_volume_spike(threshold=th, limit_candidates=60, akum_only=False)
-                            broadcast_vol_spike(sigs, threshold=th, akum_only=False)
-                        threading.Thread(target=vol_scan, args=(chat_id, thr)).start()
-                    # ===== NEW: VOL SPIKE + AKUM REAL ONLY =====
+                        if lim<20: lim=20
+                        if lim>300: lim=300
+                        send_reply(chat_id, f"🔥 *SCAN VOL SPIKE >{thr}x* ({lim} saham, {lim//30+1} menit)...")
+                        def vol_scan(tg=chat_id, th=thr, l=lim):
+                            sigs=scan_volume_spike(threshold=th, limit_candidates=l, akum_only=False, sort_by_rp=False)
+                            broadcast_vol_spike(sigs, threshold=th, akum_only=False, sort_by_rp=False)
+                        threading.Thread(target=vol_scan, args=(chat_id, thr, lim)).start()
+                    # ===== VOL SPIKE + AKUM =====
                     elif first in ["/scanvolakum","/volakum","/vspikeakum","/vakum","/spikeakum"]:
+                        parts=txt.split()
+                        try:
+                            thr=float(parts[1]) if len(parts)>=2 else 2.0
+                            lim=int(parts[2]) if len(parts)>=3 else 60
+                        except:
+                            thr=2.0; lim=60
+                        if thr<1.5: thr=1.5
+                        if thr>10: thr=10
+                        if lim<20: lim=20
+                        if lim>300: lim=300
+                        send_reply(chat_id, f"🔥 *SCAN VOL + AKUM >{thr}x* ({lim} saham, filter fake)...")
+                        def volakum_scan(tg=chat_id, th=thr, l=lim):
+                            sigs=scan_volume_spike(threshold=th, limit_candidates=l, akum_only=True, sort_by_rp=False)
+                            broadcast_vol_spike(sigs, threshold=th, akum_only=True, sort_by_rp=False)
+                        threading.Thread(target=volakum_scan, args=(chat_id, thr, lim)).start()
+                    # ===== NEW: SCAN VOL ALL 300 + SORT BY Rp =====
+                    elif first in ["/scanvolall","/volall","/vall","/scanallvol"]:
                         parts=txt.split()
                         try:
                             thr=float(parts[1]) if len(parts)>=2 else 2.0
                         except:
                             thr=2.0
-                        if thr<1.5: thr=1.5
+                        if thr<1.0: thr=1.0
                         if thr>10: thr=10
-                        send_reply(chat_id, f"🔥 *SCAN VOL SPIKE + AKUM REAL >{thr}x* (filter fake pump, 2-3 menit)...")
-                        def volakum_scan(tg=chat_id, th=thr):
-                            sigs=scan_volume_spike(threshold=th, limit_candidates=60, akum_only=True)
-                            broadcast_vol_spike(sigs, threshold=th, akum_only=True)
-                        threading.Thread(target=volakum_scan, args=(chat_id, thr)).start()
+                        send_reply(chat_id, f"🔥🔥 *SCAN VOL ALL 300 SAHAM >{thr}x SORT BY Rp* (5-7 menit, yang duit gede di atas)...")
+                        def volall_scan(tg=chat_id, th=thr):
+                            # 300 saham, sort by Rp
+                            sigs=scan_volume_spike(threshold=th, limit_candidates=300, akum_only=False, sort_by_rp=True)
+                            broadcast_vol_spike(sigs, threshold=th, akum_only=False, sort_by_rp=True)
+                        threading.Thread(target=volall_scan, args=(chat_id, thr)).start()
+                    elif first in ["/scanvolallakum","/volallakum","/vallakum"]:
+                        parts=txt.split()
+                        try:
+                            thr=float(parts[1]) if len(parts)>=2 else 2.0
+                        except:
+                            thr=2.0
+                        if thr<1.0: thr=1.0
+                        if thr>10: thr=10
+                        send_reply(chat_id, f"🔥🔥 *SCAN VOL ALL 300 + AKUM REAL >{thr}x SORT BY Rp* (paling valid)...")
+                        def volallakum_scan(tg=chat_id, th=thr):
+                            sigs=scan_volume_spike(threshold=th, limit_candidates=300, akum_only=True, sort_by_rp=True)
+                            broadcast_vol_spike(sigs, threshold=th, akum_only=True, sort_by_rp=True)
+                        threading.Thread(target=volallakum_scan, args=(chat_id, thr)).start()
         except Exception as e:
             print(f"Listener err {e}"); time.sleep(3)
 
@@ -1018,7 +1062,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.3.7 FULL 150 SAHAM + VOL AKUM")
+    print("🔥 RAFANO V4.3.8 SCAN 300 + SORT Rp GEDE")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
