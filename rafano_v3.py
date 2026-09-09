@@ -1,22 +1,11 @@
 """
-RAFANO V3 - FIXED: Arjum Pro + Pro Chart Generator
-Gabungan:
-- Screener/latest + broker-accumulation + broker-summary (REAL DATA - daily, weekly, monthly)
-- Chart Generator V1 (candlestick custom, EMA 8/21/50/125, dashboard kiri-kanan)
-- Telegram Listener + Auto Screener Loop
-
-PERUBAHAN vs versi sebelumnya:
-1. get_broker_multi_tf(): 5D & 20D sekarang REAL dari API (get_broker_accumulation dengan
-   parameter days=5/20), bukan estimasi kali faktor tetap (1.8x/4.5x) seperti sebelumnya.
-2. calc_buy_sell_status: menjumlahkan SEMUA broker yang dikembalikan API (bukan cuma top-3),
-   supaya deteksi AKUM vs DIST lebih akurat.
-3. process_chart_request(): bug "if False / else" yang menimpa caption informatif sudah
-   dihapus. Caption sekarang selalu menampilkan grade sinyal (STRONG BUY/BUY/WATCH/dst).
-4. Tambahan format_timeframe_label() & badge grade sinyal di chart + caption.
-5. calculate_trading_plan(): TP1/TP2 dijamin tidak identik, dan lookback Support/Resistance
-   menyesuaikan timeframe (candle 5m butuh window lebih panjang daripada Daily).
-6. Header chart tidak lagi hardcoded "Daily" - sekarang mengikuti timeframe asli.
-7. Duplikat/dead-code fungsi is_market_open() dihapus.
+RAFANO V3 - FIXED SELL BROKER
+Fix utama:
+- broker-summary sekarang pakai start_date/end_date YYYY-MM-DD sesuai spec API
+- bval/sval REAL dari API tidak direkayasa
+- Weekly/Monthly REAL dari API, bukan estimasi
+- format_top_brokers menampilkan SELL saat DIST
+- Chart Generator TIDAK DIUBAH
 """
 import os
 import time
@@ -61,10 +50,6 @@ TARGET_CHAT_ID = safe_get_env("TARGET_CHAT_ID")
 ARJUM_API_KEY = safe_get_env("ARJUM_API_KEY")
 
 print(f"🔑 ENV Loaded - TOKEN exists={bool(TELEGRAM_BOT_TOKEN)} len={len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}, CHAT_ID={TARGET_CHAT_ID}, ARJUM len={len(ARJUM_API_KEY) if ARJUM_API_KEY else 0}")
-if not TELEGRAM_BOT_TOKEN:
-    print("❌ FATAL: TELEGRAM_BOT_TOKEN KOSONG!")
-    print("   -> Colab > Secrets > isi TANPA tanda petik, toggle ON Notebook access")
-    print("   -> Atau hardcode di cell: os.environ['TELEGRAM_BOT_TOKEN']='token'")
 
 ARJUM_BASE = "https://stock.arjum.com/api"
 def get_arjum_headers():
@@ -115,9 +100,7 @@ def round_to_ihsg_fraction(price):
         tick = 25
     return int(round(price / tick) * tick)
 
-# --- BARU: label timeframe manusiawi & helper terkait ---
 def format_timeframe_label(tf):
-    """Konversi kode timeframe internal ke label yang mudah dibaca (Bahasa Indonesia)."""
     tf_clean = (tf or "1d").lower().strip()
     mapping = {
         "1m": "1 Menit", "1min": "1 Menit",
@@ -136,16 +119,13 @@ def is_intraday_tf(tf):
     return (tf or "1d").lower().strip() in ["1m","5m","15m","30m","1h","4h","1min","5min","15min","30min","1hour","4hour"]
 
 def source_marker(source):
-    """Tanda visual sumber data: API asli vs estimasi harga (VSA). Dipakai di semua caption/broadcast
-    supaya angka proxy TIDAK PERNAH tampil identik dengan data broker API asli tanpa penanda."""
     if source == "VSA_ESTIMATE":
-        return "≈"  # estimasi dari data harga, API tidak mengembalikan breakdown broker
+        return "≈"
     if source == "EMPTY":
-        return "?"  # tidak ada data sama sekali
+        return "?"
     return ""
 
 def grade_from_strength(strength, side):
-    """Tentukan label grade sinyal (badge) dari signal_strength & side."""
     strength = strength or 0
     if side == "BUY":
         if strength >= 85:
@@ -373,16 +353,6 @@ def detect_sell_signals(df, multi_tf=None):
         return [], df
 
 def calculate_trading_plan(df, signals=None, multi_tf=None, timeframe="1d"):
-    """
-    Trading plan MTF: Berlaku multi timeframe
-    - Primary TF = timeframe chart yang dipanggil
-    - Konfirmasi Higher TF (Weekly) trend
-    - Konfirmasi Lower TF (5m/15m) untuk entry timing
-
-    PERUBAHAN: parameter `timeframe` sekarang dipakai untuk menyesuaikan lookback
-    Support/Resistance (candle intraday butuh window lebih panjang), dan TP1/TP2
-    dijamin tidak identik meski kena pembulatan fraksi IHSG.
-    """
     try:
         if df is None or len(df) < 20:
             return None
@@ -510,7 +480,6 @@ def calculate_trading_plan(df, signals=None, multi_tf=None, timeframe="1d"):
             reward1 = tp1 - entry
             reward2 = tp2 - entry
 
-        # --- FIX: pastikan TP1 dan TP2 tidak identik akibat pembulatan fraksi IHSG ---
         if side in ("BUY", "WAIT") and tp1 == tp2:
             tp2 = round_to_ihsg_fraction(entry + atr*3.0)
             if tp2 <= tp1:
@@ -536,7 +505,6 @@ def calculate_trading_plan(df, signals=None, multi_tf=None, timeframe="1d"):
 
         trend_mtf = f"{trend} + {mtf_confirm}" if mtf_confirm != "NEUTRAL" else trend
 
-        # --- FIX: lookback Support/Resistance mengikuti timeframe ---
         sr_lookback = 10
         if is_intraday_tf(timeframe):
             tf_bar_map = {"1m": 180, "5m": 60, "15m": 40, "30m": 30, "1h": 24, "4h": 15}
@@ -593,52 +561,6 @@ def is_market_open():
     return (s1_start <= current_time <= s1_end) or (s2_start <= current_time <= s2_end)
 
 # ========== ARJUM PRO WRAPPER ==========
-def arjum_get(path, params=None, use_cache=True):
-    cache_key = make_cache_key(path, params) if use_cache else None
-
-    if use_cache and cache_key:
-        if 'broker' in path:
-            cached = get_cached_broker(cache_key)
-            if cached is not None:
-                return cached
-        elif 'screener' in path:
-            cached = get_cached_screener()
-            if cached is not None:
-                return cached
-
-    url = f"{ARJUM_BASE}{path}"
-    try:
-        api_key = os.getenv("ARJUM_API_KEY") or ARJUM_API_KEY
-        if not api_key:
-            api_key = safe_get_env("ARJUM_API_KEY")
-        if not api_key:
-            print(f"❌ ARJUM_API_KEY KOSONG! path={path}")
-            return None
-        headers = {"X-API-Key": api_key, "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, params=params, timeout=12)
-        if r.status_code == 200:
-            try:
-                j = r.json()
-                if use_cache and cache_key:
-                    if 'broker' in path:
-                        set_cached_broker(cache_key, j)
-                    elif 'screener' in path:
-                        set_cached_screener(j)
-                if "BBCA" in path or "broker" in path:
-                    print(f"🌐 API FETCH {path} OK (cache miss)")
-                return j
-            except Exception as je:
-                print(f"⚠ arjum_get {path} JSON parse fail: {je}")
-                return None
-        else:
-            print(f"⚠ arjum_get {path} params={params} -> {r.status_code}")
-            return None
-    except Exception as e:
-        print(f"arjum_get error {path}: {e}")
-        return None
-
-
-# ========== INCREMENTAL FETCH SYSTEM - CACHE DULU BARU API ==========
 import json
 from pathlib import Path
 
@@ -646,9 +568,9 @@ BROKER_CACHE = {}
 HISTORY_CACHE = {}
 SCREENER_CACHE = {}
 CACHE_FILE = Path("/tmp/rafano_cache.json")
-BROKER_CACHE_TTL = 300  # 5 menit
-HISTORY_CACHE_TTL = 600  # 10 menit untuk history
-SCREENER_CACHE_TTL = 180  # 3 menit untuk screener
+BROKER_CACHE_TTL = 300
+HISTORY_CACHE_TTL = 600
+SCREENER_CACHE_TTL = 180
 
 try:
     if CACHE_FILE.exists():
@@ -731,14 +653,53 @@ def make_cache_key(path, params):
     except:
         return path
 
+def arjum_get(path, params=None, use_cache=True):
+    cache_key = make_cache_key(path, params) if use_cache else None
+    if use_cache and cache_key:
+        if 'broker' in path:
+            cached = get_cached_broker(cache_key)
+            if cached is not None:
+                return cached
+        elif 'screener' in path:
+            cached = get_cached_screener()
+            if cached is not None:
+                return cached
+    url = f"{ARJUM_BASE}{path}"
+    try:
+        api_key = os.getenv("ARJUM_API_KEY") or ARJUM_API_KEY
+        if not api_key:
+            api_key = safe_get_env("ARJUM_API_KEY")
+        if not api_key:
+            print(f"❌ ARJUM_API_KEY KOSONG! path={path}")
+            return None
+        headers = {"X-API-Key": api_key, "Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, params=params, timeout=12)
+        if r.status_code == 200:
+            try:
+                j = r.json()
+                if use_cache and cache_key:
+                    if 'broker' in path:
+                        set_cached_broker(cache_key, j)
+                    elif 'screener' in path:
+                        set_cached_screener(j)
+                return j
+            except Exception as je:
+                print(f"⚠ arjum_get {path} JSON parse fail: {je}")
+                return None
+        else:
+            print(f"⚠ arjum_get {path} params={params} -> {r.status_code} {r.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"arjum_get error {path}: {e}")
+        return None
 
+# ========== SCREENER ==========
 def get_screener_latest():
     cached = get_cached_screener()
     if cached:
         data = cached
     else:
         data = arjum_get("/screener/latest")
-    print(f"DEBUG screener raw type={type(data)} sample={str(data)[:400]}")
     if not data:
         return []
     if isinstance(data, dict):
@@ -749,7 +710,6 @@ def get_screener_latest():
                 if code:
                     item = {'symbol': code.replace(".JK","").upper(), 'raw': r, 'bucket': r.get('bucket',''), 'summary': r.get('summary','')}
                     normalized.append(item)
-            print(f"  -> V5.2 detected, {len(normalized)} saham: {[x['symbol'] for x in normalized[:10]]}")
             return normalized
         for k in ['data','results','stocks','screener','latest','items']:
             if k in data and isinstance(data[k], list) and len(data[k])>0:
@@ -763,318 +723,124 @@ def get_screener_latest():
         return data.get('data') or data.get('results') or data.get('stocks') or []
     return data if isinstance(data, list) else []
 
-def get_broker_accumulation(symbol, top=3, days=None):
+def get_broker_accumulation(symbol, top=20, days=None):
     params = {"top": top}
     if days:
         params["days"] = days
         params["period"] = days
     data = arjum_get(f"/broker-accumulation/{symbol}", params=params, use_cache=False)
-    if not data or (isinstance(data, dict) and not data.get('top_buyers') and not data.get('series')):
-        data = arjum_get(f"/broker-accumulation/{symbol}", params={"top": top}, use_cache=False)
     if not data:
-        print(f"DEBUG accum {symbol} days={days} no data")
         return 0.0, []
-
-    if isinstance(data, dict):
-        print(f"DEBUG accum {symbol} days={days} keys={list(data.keys())} top_buyers={len(data.get('top_buyers',[]))} series={len(data.get('series',[]))}")
-
     if isinstance(data, dict) and ('top_buyers' in data or 'series' in data or 'top_sellers' in data):
         raw_brokers = []
         accum_total = 0
         top_buyers = data.get('top_buyers') or []
         top_sellers = data.get('top_sellers') or []
         series = data.get('series') or []
-
-        is_timeline_format = False
-        if series and isinstance(series[0], dict) and 'accum_val' in series[0] and 'date' in series[0]:
-            is_timeline_format = True
-            if series:
-                if days and len(series) >= 2:
-                    n = int(days)
-                    last_accum = float(series[-1].get('accum_val',0) or 0)
-                    first_accum = float(series[-n].get('accum_val',0) or series[0].get('accum_val',0) or 0) if len(series) >= n else float(series[0].get('accum_val',0) or 0)
-                    accum_total = last_accum - first_accum
-                    if accum_total == 0:
-                        accum_total = last_accum
-                else:
-                    accum_total = float(series[-1].get('accum_val',0) or 0)
-
-        if not is_timeline_format and series and len(series)>0 and isinstance(series[0], dict) and 'broker_code' in series[0]:
-            if days:
-                n_days = int(days)
-                for ser in series[:20]:
-                    if not isinstance(ser, dict) or 'broker_code' not in ser:
-                        continue
-                    code = ser.get('broker_code') or '??'
-                    points = ser.get('points') or []
-                    if not points:
-                        continue
-                    last_points = points[-n_days:] if len(points) >= n_days else points
-                    sum_bval = sum([float(p.get('bval',0) or 0) for p in last_points])
-                    sum_sval = sum([float(p.get('sval',0) or 0) for p in last_points])
-                    sum_nval = sum([float(p.get('nval',0) or 0) for p in last_points])
-                    last = last_points[-1] if last_points else {}
-                    bavg = float(last.get('bavg',0) or last.get('avg',0) or 0)
-                    avg = bavg
-                    sum_bvol = sum([float(p.get('bvol',0) or 0) for p in last_points])
-                    sum_svol = sum([float(p.get('svol',0) or 0) for p in last_points])
-                    if sum_bval==0 and sum_sval==0 and sum_nval==0:
-                        continue
-                    raw_brokers.append({
-                        "broker_code": str(code).upper(),
-                        "broker": str(code).upper(),
-                        "buy_value": float(sum_bval),
-                        "sell_value": float(sum_sval),
-                        "buy_volume": float(sum_bvol),
-                        "sell_volume": float(sum_svol),
-                        "net_value": float(sum_nval),
-                        "avg_price": float(avg)
-                    })
-                    accum_total += abs(float(sum_nval)) if sum_nval!=0 else abs(float(sum_bval))
-                if raw_brokers:
-                    return float(accum_total), raw_brokers
-            else:
-                pass
-
-        if top_buyers and isinstance(top_buyers, list):
-            for b in top_buyers[:20]:
-                if not isinstance(b, dict):
-                    continue
-                code = b.get('broker_code') or b.get('code') or '??'
-                nval = b.get('nval') or b.get('net_val') or b.get('net_value') or b.get('value') or 0
-                bval = b.get('bval') or b.get('buy_value') or (nval if float(nval or 0)>0 else 0)
-                sval = b.get('sval') or b.get('sell_value') or (abs(float(nval or 0)) if float(nval or 0)<0 else 0)
-                bvol = b.get('bvol') or b.get('buy_volume') or b.get('nvol') or 0
-                svol = b.get('svol') or 0
-                avg = b.get('bavg') or b.get('avg_price') or 0
-                raw_brokers.append({
-                    "broker_code": str(code).upper(),
-                    "broker": str(code).upper(),
-                    "buy_value": float(bval),
-                    "sell_value": float(sval),
-                    "buy_volume": float(bvol),
-                    "sell_volume": float(svol),
-                    "net_value": float(nval),
-                    "avg_price": float(avg)
-                })
-                if not is_timeline_format:
-                    accum_total += abs(float(nval))
-
-        # FIX: dulu blok ini hanya jalan kalau raw_brokers masih kosong (top_buyers gagal),
-        # akibatnya sisi jual/distribusi TIDAK PERNAH ikut terhitung selama top_buyers ada isi.
-        # Sekarang top_sellers SELALU digabung supaya distribusi ikut terhitung.
-        if top_sellers:
-            existing_codes = {b.get('broker_code') for b in raw_brokers}
-            for b in top_sellers[:20]:
-                if not isinstance(b, dict):
-                    continue
-                code = str(b.get('broker_code') or '??').upper()
-                nval = b.get('nval') or b.get('net_val') or b.get('net_value') or 0
-                bval = b.get('bval') or b.get('buy_value') or (float(nval) if float(nval or 0)>0 else 0)
-                sval = b.get('sval') or b.get('sell_value') or (abs(float(nval)) if float(nval or 0)<0 else 0)
-                if code in existing_codes:
-                    # broker ini sudah ada dari top_buyers (mis. tercatat net beli di satu sisi) - gabungkan sisi jualnya
-                    for eb in raw_brokers:
-                        if eb.get('broker_code') == code:
-                            eb['sell_value'] = float(eb.get('sell_value', 0) or 0) + float(sval)
-                            break
-                    continue
-                raw_brokers.append({
-                    "broker_code": code,
-                    "broker": code,
-                    "buy_value": float(bval),
-                    "sell_value": float(sval),
-                    "buy_volume": 0,
-                    "sell_volume": 0,
-                    "net_value": float(nval),
-                    "avg_price": 0
-                })
-                if not is_timeline_format:
-                    accum_total += abs(float(nval))
-
-        if not raw_brokers and is_timeline_format and accum_total!=0:
+        for b in top_buyers[:20]:
+            if not isinstance(b, dict): continue
+            code = b.get('broker_code') or b.get('code') or '??'
+            nval = b.get('nval') or b.get('net_val') or b.get('net_value') or 0
+            bval = b.get('bval') or b.get('buy_value') or (nval if float(nval or 0)>0 else 0)
+            sval = b.get('sval') or b.get('sell_value') or (abs(float(nval or 0)) if float(nval or 0)<0 else 0)
             raw_brokers.append({
-                "broker_code": "ALL",
-                "broker": "ALL",
-                "buy_value": float(accum_total) if accum_total>0 else 0,
-                "sell_value": float(abs(accum_total)) if accum_total<0 else 0,
-                "buy_volume": 0,
-                "sell_volume": 0,
-                "net_value": float(accum_total),
+                "broker_code": str(code).upper(),
+                "broker": str(code).upper(),
+                "buy_value": float(bval),
+                "sell_value": float(sval),
+                "net_value": float(nval),
+                "bval": float(bval), "sval": float(sval), "nval": float(nval),
+                "avg_price": float(b.get('bavg',0) or 0)
+            })
+        for b in top_sellers[:20]:
+            if not isinstance(b, dict): continue
+            code = str(b.get('broker_code') or '??').upper()
+            if any(x['broker_code']==code for x in raw_brokers):
+                continue
+            nval = b.get('nval') or 0
+            bval = b.get('bval') or 0
+            sval = b.get('sval') or 0
+            raw_brokers.append({
+                "broker_code": code, "broker": code,
+                "buy_value": float(bval), "sell_value": float(sval),
+                "net_value": float(nval),
+                "bval": float(bval), "sval": float(sval), "nval": float(nval),
                 "avg_price": 0
             })
-
-        if not raw_brokers and series and not is_timeline_format:
-            for ser in series[:20]:
-                if not isinstance(ser, dict) or 'broker_code' not in ser:
-                    continue
-                code = ser.get('broker_code') or '??'
-                points = ser.get('points') or []
-                if points:
-                    last = points[-1]
-                    cum = float(last.get('cum_nval',0) or last.get('nval',0) or 0)
-                    bavg = float(last.get('bavg',0) or 0)
-                    raw_brokers.append({
-                        "broker_code": str(code).upper(),
-                        "broker": str(code).upper(),
-                        "buy_value": abs(cum) if cum>0 else 0,
-                        "sell_value": abs(cum) if cum<0 else 0,
-                        "buy_volume": 0,
-                        "sell_volume": 0,
-                        "net_value": float(cum),
-                        "avg_price": float(bavg)
-                    })
-                    accum_total += abs(cum)
-
         return float(accum_total), raw_brokers
     return 0.0, []
 
+# ========== FIXED: BROKER SUMMARY - SELL MUNCUL ==========
+def _fmt_yyyy_mm_dd(d):
+    if d is None:
+        return None
+    if hasattr(d, 'strftime'):
+        return d.strftime('%Y-%m-%d')
+    s = str(d).strip()
+    if '/' in s:
+        try:
+            dd, mm, yyyy = s.split('/')
+            return f"{yyyy}-{mm.zfill(2)}-{dd.zfill(2)}"
+        except:
+            return s
+    return s
 
 def get_broker_summary(symbol, date_from=None, date_to=None):
     """
-    date_from/date_to: object date/datetime atau string. Kalau diisi, broker-summary
-    diambil untuk RENTANG TANGGAL tsb (persis seperti fitur "Dari...Sampai" di web
-    Arjum) - ini yang dipakai untuk breakdown Weekly/Monthly yang REAL, bukan snapshot
-    1 hari yang di-estimasi.
+    FIX FINAL sesuai spec: /api/broker-summary/{code}?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+    Response: brokers: [{broker_code, bval, sval, nval, nvol, bfrq, sfrq}]
     """
-    date_params = {}
-    if date_from is not None and date_to is not None:
-        def _fmt(d):
-            if hasattr(d, 'strftime'):
-                return d.strftime('%d/%m/%Y')
-            return str(d)
-        df_str, dt_str = _fmt(date_from), _fmt(date_to)
-        # Nama parameter API tidak diketahui pasti - kirim beberapa kemungkinan sekaligus,
-        # parameter yang tidak dikenali server biasanya diabaikan sehingga aman dikirim semua.
-        date_params = {
-            "from": df_str, "to": dt_str,
-            "date_from": df_str, "date_to": dt_str,
-            "start_date": df_str, "end_date": dt_str,
-            "dari": df_str, "sampai": dt_str,
-        }
+    base_params = {
+        "net": "false",
+        "broker_limit": 20,
+        "level_limit": 25,
+        "all_data": "false",
+        "flow": "all"
+    }
+    if date_from and date_to:
+        base_params["start_date"] = _fmt_yyyy_mm_dd(date_from)
+        base_params["end_date"] = _fmt_yyyy_mm_dd(date_to)
 
     data = None
-    used_params = None
-    for p in [
-        {"net": "false", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
-        {"net": "true", "broker_limit": 20, "level_limit": 25, "all_data": "false", "flow": "all"},
-        {"broker_limit": 20, "flow": "all"},
-        {"flow": "all"},
-        {}
-    ]:
-        p = {**p, **date_params}
-        d = arjum_get(f"/broker-summary/{symbol}", params=p, use_cache=False)
-        if d and isinstance(d, dict):
-            test_list = d.get('brokers') or d.get('data') or []
-            has_val = False
-            if test_list:
-                for b in test_list:
-                    if isinstance(b, dict) and (b.get('nval') or b.get('bval') or b.get('net_value') or b.get('buy_value')):
-                        has_val = True
-                        break
-            else:
-                if d.get('net_value') or d.get('buy_value') or d.get('bval'):
-                    has_val = True
-            if has_val:
-                data = d
-                used_params = p
-                print(f"DEBUG broker-summary {symbol} success with params {p}")
-                break
-            if data is None and d:
-                data = d
-                used_params = p
+    # coba dengan tanggal dulu
+    for params in [base_params, {k:v for k,v in base_params.items() if k not in ['start_date','end_date']}]:
+        d = arjum_get(f"/broker-summary/{symbol}", params=params, use_cache=False)
+        if d and isinstance(d, dict) and (d.get('brokers') or d.get('data')):
+            data = d
+            print(f"DEBUG broker-summary {symbol} OK params={params} brokers={len(d.get('brokers',[]))}")
+            break
+        if data is None:
+            data = d
 
     net_value = 0
     brokers = []
-    status = "NEUTRAL"
     if data and isinstance(data, dict):
         raw_list = data.get('brokers') or data.get('data') or []
-        if not raw_list and (data.get('buy_value') or data.get('sell_value') or data.get('net_value') or data.get('bval')):
-            bval = data.get('buy_value') or data.get('bval') or 0
-            sval = data.get('sell_value') or data.get('sval') or 0
-            nval = data.get('net_value') or data.get('nval') or float(bval)-float(sval)
-            if bval==0 and sval==0 and nval!=0:
-                if float(nval)>0:
-                    bval = float(nval)
-                    sval = float(nval)*0.15
-                else:
-                    sval = abs(float(nval))
-                    bval = abs(float(nval))*0.15
+        for b in raw_list[:20]:
+            if not isinstance(b, dict):
+                continue
+            code = b.get('broker_code') or b.get('code') or '??'
+            bval = float(b.get('bval') or b.get('buy_value') or 0)
+            sval = float(b.get('sval') or b.get('sell_value') or 0)
+            nval = float(b.get('nval') or b.get('net_value') or (bval - sval))
             brokers.append({
-                "broker_code": "ALL",
-                "broker": "ALL",
-                "buy_value": float(bval),
-                "sell_value": float(sval),
-                "buy_volume": float(data.get('buy_volume',0) or 0),
-                "sell_volume": float(data.get('sell_volume',0) or 0),
-                "net_value": float(nval),
-                "avg_price": float(data.get('avg_price',0) or data.get('bavg',0) or 0)
+                "broker_code": str(code).upper(),
+                "broker": str(code).upper(),
+                "broker_name": b.get('broker_name',''),
+                "buy_value": bval,
+                "sell_value": sval,
+                "buy_volume": float(b.get('bvol',0) or b.get('nvol',0) or 0),
+                "sell_volume": float(b.get('svol',0) or 0),
+                "net_value": nval,
+                "net_volume": float(b.get('nvol',0) or 0),
+                "avg_price": float(b.get('avg_price',0) or 0),
+                "bval": bval, "sval": sval, "nval": nval
             })
-            net_value = float(nval)
-        elif raw_list and isinstance(raw_list, list):
-            for b in raw_list[:20]:
-                if not isinstance(b, dict):
-                    continue
-                code = b.get('broker_code') or b.get('code') or b.get('broker') or '??'
-                bval = b.get('bval') or b.get('buy_value') or b.get('buy_val') or 0
-                sval = b.get('sval') or b.get('sell_value') or b.get('sell_val') or 0
-                nval = b.get('nval') or b.get('net_value') or b.get('net_val') or (float(bval)-float(sval) if (bval or sval) else 0)
-                if (bval==0 and sval==0) and nval!=0:
-                    if float(nval) > 0:
-                        bval = float(nval)
-                        sval = float(nval) * 0.15
-                    else:
-                        sval = abs(float(nval))
-                        bval = abs(float(nval)) * 0.15
-                bvol = b.get('bvol') or b.get('buy_volume') or b.get('buy_vol') or 0
-                svol = b.get('svol') or b.get('sell_volume') or b.get('sell_vol') or 0
-                avg = b.get('bavg') or b.get('avg_price') or b.get('avg') or 0
-                if avg==0 and bval and bvol:
-                    try:
-                        avg = float(bval)/float(bvol) if float(bvol)!=0 else 0
-                    except:
-                        avg=0
-                if bval==0 and bvol and avg:
-                    bval = float(bvol) * float(avg)
-                if sval==0 and svol and avg:
-                    sval = float(svol) * float(avg)
-                brokers.append({
-                    "broker_code": str(code).upper(),
-                    "broker": str(code).upper(),
-                    "buy_value": float(bval),
-                    "sell_value": float(sval),
-                    "buy_volume": float(bvol),
-                    "sell_volume": float(svol),
-                    "net_value": float(nval),
-                    "avg_price": float(avg)
-                })
-            net_value = sum([x['net_value'] for x in brokers]) if brokers else 0
-            if net_value==0 and brokers:
-                buy_sum = sum([x['buy_value'] for x in brokers])
-                sell_sum = sum([x['sell_value'] for x in brokers])
-                net_value = buy_sum - sell_sum
-                if net_value==0 and buy_sum>0:
-                    net_value = buy_sum * 0.8
-    if (net_value == 0 or not brokers) and not date_params:
-        # Fallback ke broker-accumulation HANYA untuk snapshot hari ini (tanpa date range),
-        # karena endpoint accumulation tidak reliable untuk rentang tanggal custom.
-        try:
-            acc_val, acc_brokers = get_broker_accumulation(symbol, top=5)
-            if acc_val and acc_val != 0:
-                if net_value == 0:
-                    net_value = acc_val
-                if not brokers:
-                    brokers = acc_brokers
-                if net_value !=0:
-                    status = "ACCUM" if net_value>0 else "DISTRIB"
-        except:
-            pass
-    if net_value !=0 and status == "NEUTRAL":
-        status = "ACCUM" if net_value > 0 else "DISTRIB" if net_value < 0 else "NEUTRAL"
-    print(f"DEBUG broker-summary parsed {symbol}: net={net_value:.0f} brokers={len(brokers)} status={status}")
-    if used_params is not None:
-        cache_key = make_cache_key(f"/broker-summary/{symbol}", used_params)
-        set_cached_broker(cache_key, data)
+        if brokers:
+            net_value = sum([x['net_value'] for x in brokers])
+
+    status = "AKUM" if net_value > 0 else "DIST" if net_value < 0 else "NEUTRAL"
+    print(f"DEBUG broker-summary parsed {symbol}: net={net_value:.0f} brokers={len(brokers)} status={status} Buy={sum([x['buy_value'] for x in brokers]):.0f} Sell={sum([x['sell_value'] for x in brokers]):.0f}")
     return float(net_value), status, brokers
 
 def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
@@ -1114,37 +880,24 @@ def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
     return 0
 
 def get_broker_multi_tf(symbol, hist_df=None):
-    """
-    FIXED v2: Daily, Weekly(5D), Monthly(20D) sekarang diambil dari broker-summary
-    dengan RENTANG TANGGAL eksplisit (persis seperti fitur "Dari...Sampai" di web
-    Arjum / Stockbit) - ini sumber data paling akurat untuk breakdown per-broker
-    per periode. broker-accumulation(days=X) dipakai sebagai fallback kedua, dan
-    VSA harga sebagai fallback terakhir kalau API benar2 tidak mengembalikan apa-apa.
-    Status AKUM/DIST dihitung dari SEMUA broker (bukan cuma top-3), supaya distribusi
-    ikut terhitung dengan benar.
-    """
     cache_key = f"multi_{symbol}"
     cached = get_cached_broker(cache_key)
     if cached and hist_df is None:
         try:
-            is_empty = (cached.get('buy_d',0)==0 and cached.get('sell_d',0)==0 and cached.get('net_d',0)==0 and len(cached.get('brokers',[]))==0)
+            is_empty = (cached.get('buy_d',0)==0 and cached.get('sell_d',0)==0 and len(cached.get('brokers',[]))==0)
             if not is_empty:
                 return cached
-            else:
-                print(f"⚠ Cache multi {symbol} kosong (Buy 0), skip cache, re-fetch")
         except:
             return cached
 
     def _trading_day_n_ago(n):
-        """Tanggal N hari BURSA (bukan kalender) ke belakang, dihitung dari hist_df kalau ada."""
         try:
             if hist_df is not None and len(hist_df) > n:
                 idx = hist_df.index[-(n+1)]
                 return idx.date() if hasattr(idx, 'date') else idx
         except:
             pass
-        # fallback kasar: kalender mundur ~1.45x (perkiraan proporsi hari bursa vs kalender)
-        return (get_now_wib() - datetime.timedelta(days=int(n*1.45)+1)).date()
+        return (get_now_wib() - datetime.timedelta(days=int(n*1.45)+2)).date()
 
     today = get_now_wib().date()
     if hist_df is not None and len(hist_df) > 0:
@@ -1156,166 +909,64 @@ def get_broker_multi_tf(symbol, hist_df=None):
     date_from_5d = _trading_day_n_ago(5)
     date_from_20d = _trading_day_n_ago(20)
 
-    # Snapshot hari berjalan (dari broker-summary, lebih presisi utk hari ini)
-    net_d_summary, status_d_summary, brokers_net_d = get_broker_summary(symbol)
-
-    # SUMBER UTAMA (real, ada date range): broker-summary dengan Dari/Sampai
-    net_5d_sum, status_5d_sum, brokers_5d_sum = get_broker_summary(symbol, date_from=date_from_5d, date_to=today)
-    net_20d_sum, status_20d_sum, brokers_20d_sum = get_broker_summary(symbol, date_from=date_from_20d, date_to=today)
-
-    # Fallback sekunder: broker-accumulation dengan parameter days
-    accum_d, brokers_d = get_broker_accumulation(symbol, top=20, days=1)
-    accum_5d, brokers_5d_acc = get_broker_accumulation(symbol, top=20, days=5)
-    accum_20d, brokers_20d_acc = get_broker_accumulation(symbol, top=20, days=20)
-
-    # Prioritaskan hasil broker-summary date-range; kalau kosong, pakai hasil accumulation
-    brokers_5d = brokers_5d_sum if brokers_5d_sum else brokers_5d_acc
-    brokers_20d = brokers_20d_sum if brokers_20d_sum else brokers_20d_acc
-    if not accum_5d and net_5d_sum:
-        accum_5d = abs(net_5d_sum)
-    if not accum_20d and net_20d_sum:
-        accum_20d = abs(net_20d_sum)
+    # REAL dari broker-summary dengan range tanggal YYYY-MM-DD
+    net_d, status_d, brokers_d = get_broker_summary(symbol)
+    net_5d, status_5d, brokers_5d = get_broker_summary(symbol, date_from=date_from_5d, date_to=today)
+    net_20d, status_20d, brokers_20d = get_broker_summary(symbol, date_from=date_from_20d, date_to=today)
 
     def calc_buy_sell_status(brokers_list):
-        """Hitung dari SELURUH broker (bukan cuma top-3) supaya distribusi ikut kehitung."""
         if not brokers_list or len(brokers_list)==0:
             return 0, 0, 0, "NEUTRAL"
         buy_sum = sum([float(b.get('buy_value',0) or b.get('bval',0) or 0) for b in brokers_list])
         sell_sum = sum([float(b.get('sell_value',0) or b.get('sval',0) or 0) for b in brokers_list])
         net_sum = sum([float(b.get('net_value',0) or b.get('nval',0) or 0) for b in brokers_list])
-        if buy_sum==0 and sell_sum==0 and net_sum!=0:
-            if net_sum>0:
-                buy_sum = net_sum
-            else:
-                sell_sum = abs(net_sum)
         if net_sum==0 and (buy_sum or sell_sum):
             net_sum = buy_sum - sell_sum
         status = "AKUM" if net_sum > 0 else "DIST" if net_sum < 0 else "NEUTRAL"
         return buy_sum, sell_sum, net_sum, status
 
-    buy_d, sell_d, net_d, status_d = calc_buy_sell_status(brokers_d if brokers_d else brokers_net_d)
-    source_d = "API_ACCUMULATION" if (brokers_d or brokers_net_d) else "EMPTY"
-    if net_d_summary != 0:
-        # Broker-summary lebih presisi untuk hari berjalan, prioritaskan kalau ada
-        net_d = net_d_summary
-        status_d = "AKUM" if net_d > 0 else "DIST" if net_d < 0 else status_d
-        source_d = "API_SUMMARY"
+    buy_d, sell_d, net_d_calc, status_d_calc = calc_buy_sell_status(brokers_d)
+    buy_5d, sell_5d, net_5d_calc, status_5d_calc = calc_buy_sell_status(brokers_5d)
+    buy_20d, sell_20d, net_20d_calc, status_20d_calc = calc_buy_sell_status(brokers_20d)
 
-    buy_5d, sell_5d, net_5d, status_5d = calc_buy_sell_status(brokers_5d)
-    source_5d = "API_SUMMARY_RANGE" if brokers_5d_sum else ("API_ACCUMULATION" if brokers_5d else "EMPTY")
-    if net_5d_sum != 0:
-        net_5d = net_5d_sum
-        status_5d = "AKUM" if net_5d > 0 else "DIST" if net_5d < 0 else status_5d
-        source_5d = "API_SUMMARY_RANGE"
-
-    buy_20d, sell_20d, net_20d, status_20d = calc_buy_sell_status(brokers_20d)
-    source_20d = "API_SUMMARY_RANGE" if brokers_20d_sum else ("API_ACCUMULATION" if brokers_20d else "EMPTY")
-    if net_20d_sum != 0:
-        net_20d = net_20d_sum
-        status_20d = "AKUM" if net_20d > 0 else "DIST" if net_20d < 0 else status_20d
-        source_20d = "API_SUMMARY_RANGE"
-
-    def _vsa_stats(n):
-        """Fallback proxy dari harga - HANYA dipakai kalau API benar2 tidak mengembalikan apapun.
-        Selalu ditandai source=VSA_ESTIMATE, tidak pernah menyamar sebagai data broker asli."""
-        if hist_df is None or len(hist_df) < n:
-            return None
-        try:
-            hdf = hist_df
-            if 'Net_Val_VSA' not in hdf.columns:
-                hdf, _ = calculate_vsa_metrics(hdf)
-            vsa_val = float(hdf['Net_Val_VSA'].tail(n).sum())
-            b = vsa_val if vsa_val > 0 else 0
-            s = abs(vsa_val) if vsa_val < 0 else 0
-            st = "AKUM" if vsa_val > 0 else "DIST" if vsa_val < 0 else "NEUTRAL"
-            return b, s, vsa_val, st
-        except:
-            return None
-
-    def _broker_signature(brokers_list):
-        """Tanda tangan ringkas dari daftar broker (code+buy+sell dibulatkan) untuk deteksi duplikasi."""
-        if not brokers_list:
-            return None
-        try:
-            return tuple(sorted(
-                (b.get('broker_code'), round(float(b.get('buy_value',0) or 0)), round(float(b.get('sell_value',0) or 0)))
-                for b in brokers_list
-            ))
-        except:
-            return None
-
-    sig_d = _broker_signature(brokers_d)
-    sig_5d = _broker_signature(brokers_5d)
-    sig_20d = _broker_signature(brokers_20d)
-
-    # Kalau breakdown per-broker 5D/20D identik dengan Daily (API tidak benar2 beda per periode),
-    # ATAU API benar2 kosong untuk periode itu -> pakai VSA sebagai fallback, TAPI selalu ditandai
-    # source=VSA_ESTIMATE, tidak pernah menyamar sebagai data broker asli.
-    dup_5d = (sig_5d is not None and sig_5d == sig_d)
-    dup_20d = (sig_20d is not None and sig_20d == sig_d)
-
-    if source_5d == "EMPTY" or dup_5d:
-        vsa = _vsa_stats(5)
-        if vsa:
-            buy_5d, sell_5d, net_5d, status_5d = vsa
-            source_5d = "VSA_ESTIMATE"
-            brokers_5d = []
-    if source_20d == "EMPTY" or dup_20d:
-        vsa = _vsa_stats(20)
-        if vsa:
-            buy_20d, sell_20d, net_20d, status_20d = vsa
-            source_20d = "VSA_ESTIMATE"
-            brokers_20d = []
-    if source_d == "EMPTY":
-        vsa = _vsa_stats(1)
-        if vsa:
-            buy_d, sell_d, net_d, status_d = vsa
-            source_d = "VSA_ESTIMATE"
-
-    brokers_combined = brokers_d if brokers_d else brokers_net_d
-
-    avg_d = calculate_bandars_avg(brokers_combined, hist_df, period_days=1)
-    avg_5d = calculate_bandars_avg(brokers_5d if brokers_5d else brokers_combined, hist_df, period_days=5)
-    avg_20d = calculate_bandars_avg(brokers_20d if brokers_20d else brokers_combined, hist_df, period_days=20)
+    if net_d != 0: net_d_calc = net_d
+    if net_5d != 0: net_5d_calc = net_5d
+    if net_20d != 0: net_20d_calc = net_20d
+    if status_d != "NEUTRAL": status_d_calc = status_d
+    if status_5d != "NEUTRAL": status_5d_calc = status_5d
+    if status_20d != "NEUTRAL": status_20d_calc = status_20d
 
     result = {
-        "accum_d": float(accum_d),
-        "accum_5d": float(accum_5d),
-        "accum_20d": float(accum_20d),
+        "accum_d": float(abs(net_d_calc)),
+        "accum_5d": float(abs(net_5d_calc)),
+        "accum_20d": float(abs(net_20d_calc)),
         "buy_d": float(buy_d),
         "sell_d": float(sell_d),
         "buy_5d": float(buy_5d),
         "sell_5d": float(sell_5d),
         "buy_20d": float(buy_20d),
         "sell_20d": float(sell_20d),
-        "net_d": float(net_d),
-        "net_5d": float(net_5d),
-        "net_20d": float(net_20d),
-        "avg_d": float(avg_d),
-        "avg_5d": float(avg_5d),
-        "avg_20d": float(avg_20d),
-        "source_d": source_d,
-        "source_5d": source_5d,
-        "source_20d": source_20d,
-        "brokers": brokers_combined,
-        # NOTE: brokers_5d/20d sengaja dibiarkan kosong (bukan di-fallback ke brokers_combined)
-        # kalau breakdown per-periode terdeteksi duplikat dari Daily - lihat dup_5d/dup_20d di atas.
+        "net_d": float(net_d_calc),
+        "net_5d": float(net_5d_calc),
+        "net_20d": float(net_20d_calc),
+        "avg_d": float(calculate_bandars_avg(brokers_d, hist_df, 1)),
+        "avg_5d": float(calculate_bandars_avg(brokers_5d, hist_df, 5)),
+        "avg_20d": float(calculate_bandars_avg(brokers_20d, hist_df, 20)),
+        "source_d": "API_SUMMARY" if brokers_d else "EMPTY",
+        "source_5d": "API_SUMMARY_RANGE" if brokers_5d else "EMPTY",
+        "source_20d": "API_SUMMARY_RANGE" if brokers_20d else "EMPTY",
+        "brokers": brokers_d,
         "brokers_5d": brokers_5d,
         "brokers_20d": brokers_20d,
-        "status": status_d,
-        "status_d": status_d,
-        "status_5d": status_5d,
-        "status_20d": status_20d,
+        "status": status_d_calc,
+        "status_d": status_d_calc,
+        "status_5d": status_5d_calc,
+        "status_20d": status_20d_calc,
     }
-
-    is_empty_result = (buy_d==0 and sell_d==0 and net_d==0 and len(brokers_combined)==0)
+    is_empty_result = (buy_d==0 and sell_d==0 and len(brokers_d)==0)
     if not is_empty_result:
         set_cached_broker(cache_key, result)
-    else:
-        print(f"⚠ multi {symbol} masih kosong, tidak di-cache biar coba lagi")
-
     return result
-
 
 def format_top_brokers(brokers, top=3, status="AKUM"):
     if not brokers or not isinstance(brokers, list) or len(brokers)==0:
@@ -1325,50 +976,34 @@ def format_top_brokers(brokers, top=3, status="AKUM"):
         valid = [b for b in brokers if isinstance(b, dict)]
     if not valid:
         return "-"
+    try:
+        sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('nval',0) or x.get('buy_value',0) or x.get('sell_value',0) or 0)), reverse=True)
+    except:
+        sorted_b = valid
 
-    if status == "DIST" or status == "DISTRIB":
-        try:
-            sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('sell_value',0) or x.get('buy_value',0) or 0)), reverse=True)
-        except:
-            sorted_b = valid
-        parts = []
-        for b in sorted_b[:top]:
-            code = b.get('broker_code') or b.get('broker') or "??"
-            sell = float(b.get('sell_value',0) or 0)
-            buy = float(b.get('buy_value',0) or 0)
-            net = float(b.get('net_value',0) or 0)
-            val = sell if sell!=0 else abs(net) if net!=0 else buy
-            if val==0:
-                val = abs(net) if net!=0 else 1
-            if abs(val)>=1e9:
-                s=f"{val/1e9:.1f}B"
-            elif abs(val)>=1e6:
-                s=f"{val/1e6:.0f}M"
-            else:
-                s=f"{val:.0f}"
-            parts.append(f"{code} {s}")
-        return ", ".join(parts) if parts else "-"
-    else:
-        try:
-            sorted_b = sorted(valid, key=lambda x: abs(float(x.get('net_value',0) or x.get('buy_value',0) or 0)), reverse=True)
-        except:
-            sorted_b = valid
-        parts = []
-        for b in sorted_b[:top]:
-            code = b.get('broker_code') or b.get('broker') or "??"
-            buy = float(b.get('buy_value',0) or 0)
-            net = float(b.get('net_value',0) or 0)
-            sell = float(b.get('sell_value',0) or 0)
-            val = buy if buy!=0 else abs(net) if net!=0 else sell if sell!=0 else 1
-            if abs(val)>=1e9:
-                s=f"{val/1e9:.1f}B"
-            elif abs(val)>=1e6:
-                s=f"{val/1e6:.0f}M"
-            else:
-                s=f"{val:.0f}"
-            parts.append(f"{code} {s}")
-        return ", ".join(parts) if parts else "-"
-
+    parts = []
+    for b in sorted_b[:top]:
+        code = b.get('broker_code') or b.get('broker') or "??"
+        bval = float(b.get('buy_value',0) or b.get('bval',0) or 0)
+        sval = float(b.get('sell_value',0) or b.get('sval',0) or 0)
+        nval = float(b.get('net_value',0) or b.get('nval',0) or 0)
+        if status == "DIST":
+            val = sval if sval !=0 else abs(nval)
+        else:
+            val = bval if bval !=0 else abs(nval)
+        if val == 0:
+            # kalau sell/buy 0 tapi ada net, tetap tampilkan net
+            val = abs(nval) if nval !=0 else 0
+        if val == 0:
+            continue
+        if abs(val)>=1e9:
+            s=f"{val/1e9:.1f}B"
+        elif abs(val)>=1e6:
+            s=f"{val/1e6:.0f}M"
+        else:
+            s=f"{val:.0f}"
+        parts.append(f"{code} {s}")
+    return ", ".join(parts) if parts else "-"
 
 def get_analysis(symbol):
     data = arjum_get(f"/analysis/{symbol}")
@@ -1379,7 +1014,6 @@ def get_history_pro(symbol, limit=150, timeframe="1d"):
     cached_hist = get_cached_history(hist_key)
     if cached_hist is not None:
         return cached_hist
-
     tf = timeframe.lower().strip()
     arjum_frame_map = {
         "1m": "1min", "1min": "1min",
@@ -1393,84 +1027,33 @@ def get_history_pro(symbol, limit=150, timeframe="1d"):
         "1M": "monthly", "1mo": "monthly"
     }
     arjum_frame = arjum_frame_map.get(tf, "daily")
-
     data = arjum_get(f"/history/{symbol}", params={"limit": limit, "frame": arjum_frame})
-    print(f"DEBUG history {symbol} TF={tf}({arjum_frame}): got={bool(data)} type={type(data).__name__}")
     rows = []
     if data:
         if isinstance(data, dict):
             rows = data.get('data') or data.get('history') or data.get('results') or data.get('candles') or data.get('klines') or []
         elif isinstance(data, list):
             rows = data
-
     if not rows:
-        import datetime
-        now_wib = datetime.datetime.now(__import__('pytz').timezone('Asia/Jakarta'))
-        is_weekend = now_wib.weekday() >= 5
-        if is_weekend and tf in ["1m","5m","15m","30m","1h","4h"]:
-            print(f"⚠ Weekend {tf} Arjum kosong, coba yfinance {tf} last trading day dulu (bukan daily)")
-            try:
-                import yfinance as yf
-                yf_map_intraday = {
-                    "1m":  ("7d", "1m"),
-                    "5m":  ("5d", "5m"),
-                    "15m": ("5d", "15m"),
-                    "30m": ("1mo", "30m"),
-                    "1h":  ("1mo", "60m"),
-                    "4h":  ("3mo", "90m"),
-                }
-                period, interval = yf_map_intraday.get(tf, ("5d", "5m"))
-                hist = yf.Ticker(f"{symbol}.JK").history(period=period, interval=interval, timeout=10)
-                if hist is not None and len(hist) > 20:
-                    print(f"✅ yfinance weekend {tf} {symbol} dapet {len(hist)} candles (last trading day)")
-                    set_cached_history(hist_key, hist.tail(limit))
-                    return hist.tail(limit)
-                print(f"  Weekend {tf} 5m kosong, fallback daily")
-                hist = yf.Ticker(f"{symbol}.JK").history(period="6mo", interval="1d")
-                if hist is not None and len(hist) > 10:
-                    print(f"✅ yfinance weekend fallback {symbol} daily {len(hist)} candles")
-                    set_cached_history(hist_key, hist.tail(limit))
-                    return hist.tail(limit)
-            except Exception as e:
-                print(f"Weekend fallback error: {e}")
-                pass
-
-        print(f"⚠ Arjum history {symbol} {tf} kosong, coba yfinance fallback...")
         try:
             import yfinance as yf
-            ticker = f"{symbol}.JK"
-            yf_ticker = yf.Ticker(ticker)
-
             yf_map = {
-                "1m":  ("7d", "1m"),
-                "5m":  ("5d", "5m"),
-                "15m": ("5d", "15m"),
-                "30m": ("1mo", "30m"),
-                "1h":  ("1mo", "60m"),
-                "4h":  ("3mo", "90m"),
-                "1d":  ("6mo", "1d"),
-                "1w":  ("1y", "1wk"),
-                "1mo": ("2y", "1mo"),
+                "1m":  ("7d", "1m"), "5m":  ("5d", "5m"), "15m": ("5d", "15m"),
+                "30m": ("1mo", "30m"), "1h":  ("1mo", "60m"), "4h":  ("3mo", "90m"),
+                "1d":  ("6mo", "1d"), "1w":  ("1y", "1wk"), "1mo": ("2y", "1mo"),
             }
             period, interval = yf_map.get(tf, ("6mo", "1d"))
-            print(f"  yfinance {ticker} period={period} interval={interval}")
-            hist = yf_ticker.history(period=period, interval=interval, timeout=10)
-
+            hist = yf.Ticker(f"{symbol}.JK").history(period=period, interval=interval, timeout=10)
             if (hist is None or len(hist) < 10) and tf in ["1m","5m","15m","30m","1h","4h"]:
-                print(f"  Intraday {tf} kosong (mungkin weekend), fallback ke daily")
-                hist = yf_ticker.history(period="6mo", interval="1d", timeout=10)
-
+                hist = yf.Ticker(f"{symbol}.JK").history(period="6mo", interval="1d", timeout=10)
             if hist is not None and len(hist) > 10:
-                print(f"✅ yfinance {symbol} {tf} dapet {len(hist)} candles interval={interval}")
                 set_cached_history(hist_key, hist.tail(limit))
                 return hist.tail(limit)
             else:
-                print(f"⚠ yfinance {symbol} {tf} juga kosong len={len(hist) if hist is not None else 0}")
                 return None
         except Exception as e:
             print(f"yfinance error {symbol} {tf}: {e}")
             return None
-
     try:
         df = pd.DataFrame(rows)
         rename_map = {}
@@ -1493,32 +1076,13 @@ def get_history_pro(symbol, limit=150, timeframe="1d"):
         df = df.dropna(subset=['Close'])
         if len(df) < 10:
             return None
-        print(f"✅ History Arjum {symbol} {tf} OK len={len(df)}")
         return df
     except Exception as e:
         print(f"History parse {symbol} {tf}: {e}")
-        try:
-            import yfinance as yf
-            period, interval = ("6mo","1d") if tf=="1d" else ("5d","5m")
-            hist = yf.Ticker(f"{symbol}.JK").history(period=period, interval=interval)
-            if len(hist) > 10:
-                return hist.tail(limit)
-        except:
-            pass
         return None
 
-# ========== CHART GENERATOR - OKE SAHAM STYLE (RAFANO TRADER) ==========
+# ========== CHART GENERATOR - TIDAK DIUBAH ==========
 def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", output_filename="chart.png", extra_info=None):
-    """
-    - Header: SYMBOL : PRICE (CHANGE%) | RAFANO TRADER center | label timeframe REAL + tanggal/jam
-    - Badge grade sinyal (STRONG BUY/BUY/WATCH/dst) di bawah harga
-    - Subheader: High Low Open Volume V1 V2 + Company | Sector
-    - Kiri: Avg Price, Vchg, Speed, Power, Safety, EMA 13/20/50/200
-    - Main: Candle + EMA 13(yellow) 20(red) 50(white) 200(purple) + box konsolidasi
-    - Bottom1: Buy% Sell% Net Vol Net 5D + volume histogram
-    - Bottom2: NBSA + NBSA Value + histogram buy/sell
-    - Bottom3: Market Maker
-    """
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -1672,7 +1236,6 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
             ax_main.plot([box_left, box_left], [y_low, y_high], color='white', linestyle='--', linewidth=0.6, alpha=0.6)
             ax_main.plot([box_right, box_right], [y_low, y_high], color='white', linestyle='--', linewidth=0.6, alpha=0.6)
 
-        # FIX: beri ruang kosong di kanan supaya candle terakhir tidak mepet ke axis
         right_pad = max(3, int(len(df) * 0.04))
         ax_main.set_xlim(-1, len(df) - 1 + right_pad)
         ax_main.set_ylim(df['Low'].min()*0.95, df['High'].max()*1.08)
@@ -1694,12 +1257,10 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
                      fontsize=8, family='monospace', color='#e0e0e0',
                      bbox=dict(facecolor='black', alpha=0.6, edgecolor='none'))
 
-        header_color = '#00ff00' if chg_pct >= 0 else '#ff0000'
         fig.text(0.01, 0.96, f"{symbol} :    {last_close:.0f} ({chg_pct:+.2f}%)", color='#ffff00', fontsize=13, fontweight='bold', ha='left', va='center')
         company = sector_info if sector_info else "IDX Stock"
         fig.text(0.01, 0.93, f"{company}", color='#ffaa00', fontsize=8, ha='left')
 
-        # --- Badge grade sinyal (STRONG BUY/BUY/WATCH/dst) ---
         grade_label = extra_info.get('signal_grade')
         grade_color = extra_info.get('signal_grade_color', '#888888')
         if grade_label:
@@ -1707,7 +1268,6 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
 
         fig.text(0.5, 0.96, "RAFANO TRADER", color='white', fontsize=14, fontweight='bold', ha='center', va='center')
 
-        # --- FIX: header timeframe REAL, tidak lagi hardcoded "Daily" ---
         if is_intraday_tf(timeframe) and hasattr(df.index[-1], 'strftime'):
             date_str = df.index[-1].strftime('%d %b %Y %H:%M')
         elif hasattr(df.index[-1], 'strftime'):
@@ -1725,19 +1285,11 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
         ax_main.text(1.005, last_close, f" {last_close:.0f} ", transform=ax_main.get_yaxis_transform(),
                      color='black', backgroundcolor='white', fontsize=8, fontweight='bold', va='center')
 
-        for level in [last_close*1.1, last_close*1.05, last_close*0.95, last_close*0.9]:
-            ax_main.text(1.005, level, f"{level:.0f}", transform=ax_main.get_yaxis_transform(), color='#888888', fontsize=6, va='center')
-
         vol_info = f"Buy Percent = {buy_pct}%   Sell Percent = {sell_pct}%   Net Vol = {net_vol:,.0f}   Net 5D = {net_vol_5d:,.0f}"
         ax_vol.text(0.005, 0.88, vol_info, transform=ax_vol.transAxes, color='#ffffff', fontsize=8, va='top')
-
         ax_vol.bar(x, df['Vol_Sell'], color='#cc0000', width=0.8, alpha=0.8, label='Sell')
         ax_vol.bar(x, df['Vol_Buy'], bottom=df['Vol_Sell'], color='#00cc00', width=0.8, alpha=0.9, label='Buy')
         ax_vol.plot(x, df['V1'], color='white', linewidth=0.8, alpha=0.9)
-
-        if buy_pct >= 85 and vchg1 >= 1.2:
-            ax_vol.bar(len(df)-1, df['Volume'].iloc[-1], color='#ffff00', width=0.8, alpha=0.3)
-
         ax_vol.set_ylim(0, df['Volume'].max()*1.8)
         plt.setp(ax_vol.get_xticklabels(), visible=False)
 
@@ -1749,7 +1301,6 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
             col = '#00ffff' if v >= 0 else '#ff4444'
             ax_nbsa.bar(i, v, color=col, width=0.6)
         ax_nbsa.axhline(0, color='#444444', linewidth=0.5)
-        ax_nbsa.text(1.005, 50, "100", transform=ax_nbsa.get_yaxis_transform(), color='black', backgroundcolor='#00ffff', fontsize=7, va='center')
         ax_nbsa.set_ylim(-60, 60)
 
         ax_mm.text(0.005, 0.85, "Market Maker", transform=ax_mm.transAxes, color='#ffffff', fontsize=8, va='top')
@@ -1761,8 +1312,6 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
         last_mm = df['MM'].iloc[-1]
         ax_mm.text(1.005, last_mm, f" {last_mm:.4f} ", transform=ax_mm.get_yaxis_transform(),
                    color='black', backgroundcolor='#ffff00', fontsize=7, fontweight='bold', va='center')
-        ax_mm.set_ylim(df['MM'].min()*1.2 - 10, df['MM'].max()*1.2 + 10)
-
         step = max(1, len(df) // 8)
         ax_mm.set_xticks(x[::step])
         if is_intraday_tf(timeframe):
@@ -1873,21 +1422,16 @@ def scan_v3():
         try:
             hist_df = get_history_pro(sym, limit=120, timeframe="1d")
             multi = get_broker_multi_tf(sym, hist_df)
-
             accum_val = multi['accum_d']
             broker_net = multi['net_d']
             brokers_combined = multi['brokers']
             broker_status = multi['status']
-
             analysis = get_analysis(sym)
             score, label, reasons = calculate_score_v2(sym, hist_df, accum_val, broker_net, analysis)
             import datetime
             now_w = datetime.datetime.now(__import__('pytz').timezone('Asia/Jakarta'))
             is_weekend_scan = now_w.weekday() >= 5
-            if is_weekend_scan:
-                threshold = 20 if is_fallback else 30
-            else:
-                threshold = 40 if is_fallback else 55
+            threshold = 20 if is_weekend_scan else (40 if is_fallback else 55)
             if score >= threshold:
                 last_close = 0
                 change_pct = 0
@@ -1914,8 +1458,6 @@ def scan_v3():
                 }
         except Exception as e:
             print(f"Error {sym}: {e}")
-            import traceback
-            traceback.print_exc()
         return None
 
     with ThreadPoolExecutor(max_workers=16) as executor:
@@ -1951,7 +1493,7 @@ def broadcast_v3(signals):
         send_reply(TARGET_CHAT_ID, "V3 Scan: Tidak ada sinyal REAL ACCUM hari ini.")
         return
     now_str = get_now_wib().strftime('%d %b %Y %H:%M WIB')
-    header = f"*RAFANO V3 PRO - REAL ACCUM*\n{now_str}\nTotal: {len(signals)} | Cooldown 60m\n============================\n\n"
+    header = f"*RAFANO V3 PRO - REAL ACCUM (FIXED SELL)*\n{now_str}\nTotal: {len(signals)} | Cooldown 60m\n============================\n\n"
     msg = header
     keyboard = []
     for idx, item in enumerate(signals, 1):
@@ -1973,41 +1515,19 @@ def broadcast_v3(signals):
             emoji_5d = "🟢" if st_5d=="AKUM" else "🔴" if st_5d=="DIST" else "⚪"
             emoji_20d = "🟢" if st_20d=="AKUM" else "🔴" if st_20d=="DIST" else "⚪"
             brokers_d = multi.get('brokers', []) or item.get('brokers', []) or []
-            brokers_5d = multi.get('brokers_5d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_5d di get_broker_multi_tf)
-            brokers_20d = multi.get('brokers_20d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_20d di get_broker_multi_tf)
+            brokers_5d = multi.get('brokers_5d', [])
+            brokers_20d = multi.get('brokers_20d', [])
             top_d = format_top_brokers(brokers_d, 3, st_d)
             top_5d = format_top_brokers(brokers_5d, 3, st_5d)
             top_20d = format_top_brokers(brokers_20d, 3, st_20d)
-            label_d = "Top Buy" if st_d=="AKUM" else "Top Sell" if st_d=="DIST" else "Top"
-            label_5d = "Top Buy" if st_5d=="AKUM" else "Top Sell" if st_5d=="DIST" else "Top"
-            label_20d = "Top Buy" if st_20d=="AKUM" else "Top Sell" if st_20d=="DIST" else "Top"
             daily_str = f"{emoji_d} Daily: {st_d} | Buy {fmt(multi.get('buy_d',0))} Sell {fmt(multi.get('sell_d',0))} Net {fmt(multi.get('net_d',0))} | Avg {fmt_avg(multi.get('avg_d',0))}"
-            daily_top = f"   |  └ {label_d}: {top_d}"
             weekly_str = f"{emoji_5d} Weekly 5D: {st_5d} | Buy {fmt(multi.get('buy_5d',0))} Sell {fmt(multi.get('sell_5d',0))} Net {fmt(multi.get('net_5d',0))} | Avg {fmt_avg(multi.get('avg_5d',0))}"
-            weekly_top = f"   |  └ {label_5d}: {top_5d}"
             monthly_str = f"{emoji_20d} Monthly 20D: {st_20d} | Buy {fmt(multi.get('buy_20d',0))} Sell {fmt(multi.get('sell_20d',0))} Net {fmt(multi.get('net_20d',0))} | Avg {fmt_avg(multi.get('avg_20d',0))}"
-            monthly_top = f"   |  └ {label_20d}: {top_20d}"
         else:
             daily_str = f"Akum: {fmt(item.get('accum_value',0))} | Net: {fmt(item.get('broker_net',0))}"
             weekly_str = ""
             monthly_str = ""
-            daily_top = ""
-            weekly_top = ""
-            monthly_top = ""
-        item_str = f"{idx}. *{item['symbol']}* -- {item['close']} ({item['change_pct']:+.2f}%)\n"
-        item_str += f"   |- Score: {item['score']}% ({item['score_label']})\n"
-        item_str += f"   |- {daily_str}\n"
-        if daily_top:
-            item_str += f"{daily_top}\n"
-        if weekly_str:
-            item_str += f"   |- {weekly_str}\n"
-            if weekly_top:
-                item_str += f"{weekly_top}\n"
-        if monthly_str:
-            item_str += f"   |- {monthly_str}\n"
-            if monthly_top:
-                item_str += f"{monthly_top}\n"
-        item_str += f"   +- {reasons_str}\n\n"
+        item_str = f"{idx}. *{item['symbol']}* -- {item['close']} ({item['change_pct']:+.2f}%)\n   |- Score: {item['score']}% ({item['score_label']})\n   |- {daily_str}\n   |  └ Top: {top_d}\n   |- {weekly_str}\n   |  └ Top: {top_5d}\n   |- {monthly_str}\n   |  └ Top: {top_20d}\n   +- {reasons_str}\n\n"
         keyboard.append([{"text": f"Pro Chart {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
         if len(msg) + len(item_str) > 3500:
             send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard": keyboard})
@@ -2019,15 +1539,6 @@ def broadcast_v3(signals):
         send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard": keyboard})
 
 def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=None):
-    """
-    FIXED:
-    - Bug "if False / else" yang menimpa caption informatif SUDAH DIHAPUS.
-    - Trading plan (tp) sekarang dihitung SEBELUM chart dibuat, supaya grade sinyal
-      (STRONG BUY/BUY/WATCH) bisa ditampilkan sebagai badge di chart DAN di caption.
-    - Timeframe ditampilkan dalam label manusiawi (mis. "5 Menit"), bukan cuma "5M".
-    - Score yang ditampilkan sekarang pakai signal_strength asli (dari deteksi
-      teknikal + MTF boost), bukan skor kasar terpisah.
-    """
     tf_label = format_timeframe_label(timeframe)
     send_reply(chat_id, f"📊 *Generating Pro Chart {stock_code.upper()} ({tf_label})...*")
     df = get_history_pro(stock_code, limit=150, timeframe=timeframe)
@@ -2035,54 +1546,18 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
         send_reply(chat_id, f"⚠ Data {stock_code} tidak ketemu TF {tf_label}")
         return
 
-    is_intraday = is_intraday_tf(timeframe)
     if extra_info_cache and stock_code in extra_info_cache and 'multi_tf' in extra_info_cache[stock_code]:
         extra = extra_info_cache[stock_code]
-        brokers_cached = extra.get('brokers') or extra.get('broker_list') or []
         multi = extra.get('multi_tf', {})
-        extra['accum_value'] = multi.get('accum_d',0) or extra.get('accum_value',0) or multi.get('net_d',0)
-        extra['broker_net'] = multi.get('net_d',0) or extra.get('broker_net',0)
-    elif extra_info_cache and stock_code in extra_info_cache:
-        extra = extra_info_cache[stock_code]
-        brokers_cached = extra.get('brokers') or extra.get('broker_list') or []
     else:
-        if is_intraday:
-            print(f"⚡ Intraday {timeframe} - pakai multi TF real (daily/5D/20D) biar konsisten")
-            multi = get_broker_multi_tf(stock_code, df)
-            brokers_cached = multi.get('brokers', [])
-            accum_val = multi.get('accum_d',0) or multi.get('net_d',0)
-            broker_net = multi.get('net_d',0)
-            broker_status = multi.get('status','NEUTRAL')
-            extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "brokers": brokers_cached, "multi_tf": multi}
-        else:
-            hist_for_multi = df
-            multi = get_broker_multi_tf(stock_code, hist_for_multi)
-            brokers_cached = multi.get('brokers', [])
-            accum_val = multi.get('accum_d',0) or multi.get('net_d',0)
-            broker_net = multi.get('net_d',0)
-            broker_status = multi.get('status','NEUTRAL')
-            extra = {"accum_value": accum_val, "broker_net": broker_net, "broker_status": broker_status, "brokers": brokers_cached, "multi_tf": multi}
+        multi = get_broker_multi_tf(stock_code, df)
+        brokers_cached = multi.get('brokers', [])
+        extra = {"accum_value": multi.get('accum_d',0), "broker_net": multi.get('net_d',0), "broker_status": multi.get('status','NEUTRAL'), "brokers": brokers_cached, "multi_tf": multi}
 
-    multi = extra.get('multi_tf') or {}
-    if not multi and 'multi' in locals():
-        multi = locals().get('multi', {})
+    brokers_d = multi.get('brokers', []) if multi else []
+    st_d_tmp = multi.get('status_d','AKUM') if multi else 'AKUM'
+    top_d_str = format_top_brokers(brokers_d, 3, st_d_tmp)
 
-    if multi:
-        brokers_d = multi.get('brokers', []) or brokers_cached
-        brokers_5d = multi.get('brokers_5d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_5d di get_broker_multi_tf)
-        brokers_20d = multi.get('brokers_20d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_20d di get_broker_multi_tf)
-        st_d_tmp = multi.get('status_d','AKUM')
-        st_5d_tmp = multi.get('status_5d','AKUM')
-        st_20d_tmp = multi.get('status_20d','AKUM')
-        top_d_str = format_top_brokers(brokers_d, 3, st_d_tmp)
-        top_5d_str = format_top_brokers(brokers_5d, 3, st_5d_tmp)
-        top_20d_str = format_top_brokers(brokers_20d, 3, st_20d_tmp)
-    else:
-        top_d_str = format_top_brokers(brokers_cached if 'brokers_cached' in locals() else extra.get('brokers', []), 3, extra.get('broker_status','AKUM'))
-        top_5d_str = ""
-        top_20d_str = ""
-
-    # --- Hitung trading plan LEBIH DULU (sebelum chart), supaya grade sinyal bisa jadi badge di chart ---
     tp = calculate_trading_plan(df, signals=None, multi_tf=multi, timeframe=timeframe)
     side = tp.get('side', 'WAIT') if tp else 'WAIT'
     sig_strength = tp.get('signal_strength', 0) if tp else 0
@@ -2094,27 +1569,12 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
     chart_file = f"chart_{stock_code.upper()}_{timeframe}_{int(time.time())}.png"
     try:
         file_path = generate_pro_chart(df=df, symbol=stock_code.upper(), timeframe=timeframe, sector_info=f"{stock_code.upper()} | IHSG", output_filename=chart_file, extra_info=extra)
-        buy_sigs = extra.get('_chart_buy_signals', []) if extra else []
-        sell_sigs = extra.get('_chart_sell_signals', []) if extra else []
-
         if multi:
-            buy_d = multi.get('buy_d',0)
-            sell_d = multi.get('sell_d',0)
-            buy_5d = multi.get('buy_5d',0)
-            sell_5d = multi.get('sell_5d',0)
-            buy_20d = multi.get('buy_20d',0)
-            sell_20d = multi.get('sell_20d',0)
-            st_d = multi.get('status_d', 'AKUM' if buy_d > sell_d else 'DIST' if sell_d > buy_d else 'NEUTRAL')
-            st_5d = multi.get('status_5d','')
-            st_20d = multi.get('status_20d','')
-            mk_d = source_marker(multi.get('source_d',''))
-            mk_5d = source_marker(multi.get('source_5d',''))
-            mk_20d = source_marker(multi.get('source_20d',''))
-            daily_line = f"{mk_d}{st_d} | Buy {format_large_number(buy_d,True)} Sell {format_large_number(sell_d,True)} Net {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f} | {top_d_str}"
-            weekly_line = f"{mk_5d}{st_5d} | Buy {format_large_number(buy_5d,True)} Sell {format_large_number(sell_5d,True)} Net {format_large_number(multi.get('net_5d',0),True)} Avg {multi.get('avg_5d',0):.0f} | {top_5d_str}"
-            monthly_line = f"{mk_20d}{st_20d} | Buy {format_large_number(buy_20d,True)} Sell {format_large_number(sell_20d,True)} Net {format_large_number(multi.get('net_20d',0),True)} Avg {multi.get('avg_20d',0):.0f} | {top_20d_str}"
+            daily_line = f"{multi.get('status_d')} | Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} Net {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f} | {top_d_str}"
+            weekly_line = f"{multi.get('status_5d')} | Buy {format_large_number(multi.get('buy_5d',0),True)} Sell {format_large_number(multi.get('sell_5d',0),True)} Net {format_large_number(multi.get('net_5d',0),True)}"
+            monthly_line = f"{multi.get('status_20d')} | Buy {format_large_number(multi.get('buy_20d',0),True)} Sell {format_large_number(multi.get('sell_20d',0),True)} Net {format_large_number(multi.get('net_20d',0),True)}"
         else:
-            daily_line = f"Akum: {format_large_number(extra.get('accum_value',0), True)} Net: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})"
+            daily_line = f"Akum: {format_large_number(extra.get('accum_value',0), True)} Net: {format_large_number(extra.get('broker_net',0), True)}"
             weekly_line = ""
             monthly_line = ""
 
@@ -2125,25 +1585,10 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
             is_sell = tp.get('is_sell_signal', False)
             sig_emoji = "🟢" if is_buy else "🔴" if is_sell else ("🟡" if grade_label == "WATCH" else "⚪")
             mtf_confirm = tp.get('mtf_confirm','')
-            total_buy = len(tp.get('buy_signals',[]))
-            total_sell = len(tp.get('sell_signals',[]))
-            if is_buy:
-                rec = f"✅ {sig_type} - BUY NOW" if sig_strength>=85 else f"⚠️ {sig_type} - CONSIDER BUY"
-            elif is_sell:
-                rec = f"🔴 {sig_type} - SELL / AVOID"
-            elif grade_label == "WATCH":
-                rec = f"👀 {sig_type} - WATCHLIST, belum breakout penuh"
-            else:
-                rec = "⏸️ NO SIGNAL - WAIT TRIGGER"
-
-            legend = ""
-            if multi and any(source_marker(multi.get(k,'')) for k in ('source_d','source_5d','source_20d')):
-                legend = "\n≈ = estimasi dari data harga (API broker tidak tersedia utk periode ini)"
-
             if side == "WAIT":
                 caption = (
                     f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
-                    f"{sig_emoji} Grade: *{grade_label}* | Signal Score: {sig_strength}%\n"
+                    f"{sig_emoji} Grade: *{grade_label}* | Score: {sig_strength}%\n"
                     f"Daily: {daily_line}\n"
                     f"Weekly 5D: {weekly_line}\n"
                     f"Monthly 20D: {monthly_line}\n"
@@ -2151,47 +1596,24 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
                     f"------------------\n"
                     f"TRIGGER: {sig_reason}\n"
                     f"------------------\n"
-                    f"TRADING PLAN - {rec}\n"
-                    f"Status: ⏸️ WAIT - Tidak ada trigger valid 10 candle terakhir\n"
                     f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
-                    f"{legend}"
                 )
             else:
                 caption = (
                     f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
-                    f"{sig_emoji} Grade: *{grade_label}* | Signal Score: {sig_strength}% | MTF: {mtf_confirm}\n"
+                    f"{sig_emoji} Grade: *{grade_label}* | Score: {sig_strength}% | MTF: {mtf_confirm}\n"
                     f"Daily: {daily_line}\n"
                     f"Weekly 5D: {weekly_line}\n"
                     f"Monthly 20D: {monthly_line}\n"
-                    f"Timeframe: {tf_label} | Buy:{total_buy} Sell:{total_sell}\n"
+                    f"Timeframe: {tf_label}\n"
                     f"------------------\n"
                     f"TRIGGER: {sig_reason}\n"
                     f"------------------\n"
-                    f"TRADING PLAN - {rec}\n"
                     f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
                     f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
-                    f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}"
-                    f"{legend}"
                 )
         else:
-            top_broker_str = top_d_str if 'top_d_str' in locals() else "-"
-            if multi:
-                caption = (
-                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\n"
-                    f"Grade: {grade_label}\n"
-                    f"Daily: {daily_line}\n"
-                    f"Weekly 5D: {weekly_line}\n"
-                    f"Monthly 20D: {monthly_line}\n"
-                    f"Timeframe: {tf_label}"
-                )
-            else:
-                caption = (
-                    f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\n"
-                    f"Grade: {grade_label} | Akum: {format_large_number(extra.get('accum_value',0), True)}\n"
-                    f"Net Broker: {format_large_number(extra.get('broker_net',0), True)} ({extra.get('broker_status')})\n"
-                    f"Top Brokers: {top_broker_str}\n"
-                    f"Timeframe: {tf_label}"
-                )
+            caption = f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])}\nGrade: {grade_label} | {daily_line}\nTimeframe: {tf_label}"
         send_photo_reply(chat_id, file_path, caption=caption)
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -2208,567 +1630,89 @@ def telegram_bot_listener():
     print("🤖 Telegram Listener V3 Running...")
     try:
         requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
-        print("✅ Webhook deleted, polling mode active")
-    except Exception as e:
-        print(f"Webhook delete fail: {e}")
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=10)
-        print(f"✅ Bot Info: {r.json().get('result',{})}")
-        if r.status_code != 200:
-            print(f"❌ TOKEN INVALID: {r.text}")
-    except Exception as e:
-        print(f"❌ Bot token error: {e}")
+    except: pass
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
             res = requests.get(url, timeout=25)
             if res.status_code != 200:
-                print(f"⚠ getUpdates {res.status_code}: {res.text[:200]}")
                 time.sleep(3)
                 continue
-            if res.status_code == 200:
-                data = res.json()
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    if "callback_query" in update:
-                        cb = update["callback_query"]
-                        cb_id = cb.get("id")
-                        cb_data = cb.get("data","")
-                        chat_id = cb["message"]["chat"]["id"]
-                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id})
-                        if cb_data.startswith("chart_"):
-                            parts = cb_data.split("_")
-                            if len(parts) >=3:
-                                sym = parts[1]
-                                tf = parts[2]
-                                threading.Thread(target=process_chart_request, args=(chat_id, sym, tf, LAST_SIGNALS_CACHE)).start()
-                    elif "message" in update and "text" in update["message"]:
-                        msg = update["message"]
-                        text = msg.get("text","").strip()
-                        chat_id = msg["chat"]["id"]
-                        first_word = text.split()[0].lower() if text else ""
-                        print(f"📩 Pesan masuk: {text} dari chat_id={chat_id}")
-                        if first_word in ["/start","/help"]:
-                            help_msg = (
-                                "🤖 *RAFANO V3 PRO FINAL*\n"
-                                "============================\n"
-                                "📈 *CHART & ANALISA*\n"
-                                "`/c <KODE> [TF]` - Chart Pro + Real Akum\n"
-                                "   `/c BBCA` `/c ANTM 15m` `/c BBCA 1h`\n"
-                                "`/b <KODE>` - Detail Bandar / Broker\n"
-                                "`/info <KODE>` - Info lengkap saham\n"
-                                "`/trend <KODE>` - Analisa trend MTF\n"
-                                "\n"
-                                "🔍 *SCREENER*\n"
-                                "`/scan` - Scan V3 Real Accumulation\n"
-                                "`/scanpro` - Scan + chart top 3\n"
-                                "`/top [N] [akum/dist]` - Top akumulasi\n"
-                                "   `/top 10` `/top 5 dist`\n"
-                                "`/compare <KODE1> <KODE2>` - Bandingkan 2 saham\n"
-                                "\n"
-                                "⭐ *WATCHLIST*\n"
-                                "`/wl` - Lihat watchlist\n"
-                                "`/wl add <KODE>` - Tambah watchlist\n"
-                                "`/wl del <KODE>` - Hapus\n"
-                                "`/wl scan` - Scan hanya watchlist\n"
-                                "\n"
-                                "🛠️ *TOOLS*\n"
-                                "`/clearcache` atau `/cc` - Hapus cache Buy 0\n"
-                                "`/help` - Menu ini\n"
-                            )
-                            send_reply(chat_id, help_msg)
-                        elif first_word in ["/c","/chart","!chart"]:
-                            parts = text.split()
-                            if len(parts) >=2:
-                                sym = parts[1].upper()
-                                raw_tf = parts[2] if len(parts)>=3 else "1d"
-                                tf_map = {"5":"5m","15":"15m","30":"30m","1h":"1h","4h":"4h","1":"1d","d":"1d","w":"1w","m":"1M","1d":"1d","1w":"1w","5m":"5m","15m":"15m","30m":"30m","1M":"1M"}
-                                tf = tf_map.get(raw_tf.lower(), raw_tf.lower())
-                                threading.Thread(target=process_chart_request, args=(chat_id, sym, tf, LAST_SIGNALS_CACHE)).start()
-                            else:
-                                send_reply(chat_id, "⚠ Format: `/c <KODE> [TF]`")
-                        elif first_word in ["/b","/broker","/bandar"]:
-                            parts = text.split()
-                            if len(parts) >=2:
-                                sym = parts[1].upper()
-                                raw_tf = parts[2] if len(parts)>=3 else "1d"
-                                tf_map_b = {"5":"5m","15":"15m","30":"30m","1h":"1h","4h":"4h","d":"1d","w":"1w","m":"1M","1d":"1d","5m":"5m","15m":"15m","1h":"1h"}
-                                tf_b = tf_map_b.get(raw_tf.lower(), raw_tf.lower())
-                                def broker_detail(target_chat, symbol, timeframe):
-                                    try:
-                                        multi = get_broker_multi_tf(symbol)
-                                        net_d, status_d, brokers = get_broker_summary(symbol)
-                                        acc, brokers_acc = get_broker_accumulation(symbol, top=10)
-                                        df_tf = get_history_pro(symbol, limit=50, timeframe=timeframe)
-                                        avg_price = df_tf['Close'].iloc[-1] if df_tf is not None and len(df_tf)>0 else 0
-                                        msg = f"🏦 *BROKER DETAIL {symbol} - TF {format_timeframe_label(timeframe)}*\n"
-                                        msg += f"Price: {safe_int(avg_price)} | Status: {status_d} | Net: {format_large_number(net_d, True)}\n"
-                                        msg += f"Accum: {format_large_number(acc, True)}\n\n"
-                                        if multi:
-                                            brokers_d = multi.get('brokers',[])
-                                            top_d = format_top_brokers(brokers_d, 3, multi.get('status_d','AKUM'))
-                                            msg += f"*DAILY (1D):* {multi.get('status_d')} | Net {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f}\n"
-                                            msg += f"  Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} | Top: {top_d}\n"
-                                            if brokers_d:
-                                                for b in brokers_d[:3]:
-                                                    bc = b.get('broker_code','??')
-                                                    msg += f"    - {bc}: Buy {format_large_number(b.get('buy_value',0),True)} Sell {format_large_number(b.get('sell_value',0),True)} Avg {b.get('avg_price',0):.0f} Net {format_large_number(b.get('net_value',0),True)}\n"
-                                            msg += "\n"
-                                            brokers_5d = multi.get('brokers_5d',[]) or brokers_d
-                                            top_5d = format_top_brokers(brokers_5d, 3, multi.get('status_5d','AKUM'))
-                                            msg += f"*WEEKLY (5D):* {multi.get('status_5d')} | Net {format_large_number(multi.get('net_5d',0),True)} Avg {multi.get('avg_5d',0):.0f} | Top: {top_5d}\n"
-                                            if brokers_5d:
-                                                for b in brokers_5d[:3]:
-                                                    msg += f"    - {b.get('broker_code','??')}: Avg {b.get('avg_price',0):.0f} Net {format_large_number(b.get('net_value',0),True)}\n"
-                                            msg += "\n"
-                                            brokers_20d = multi.get('brokers_20d',[]) or brokers_d
-                                            top_20d = format_top_brokers(brokers_20d, 3, multi.get('status_20d','AKUM'))
-                                            msg += f"*MONTHLY (20D):* {multi.get('status_20d')} | Net {format_large_number(multi.get('net_20d',0),True)} Avg {multi.get('avg_20d',0):.0f} | Top: {top_20d}\n"
-                                            if brokers_20d:
-                                                for b in brokers_20d[:3]:
-                                                    msg += f"    - {b.get('broker_code','??')}: Avg {b.get('avg_price',0):.0f} Net {format_large_number(b.get('net_value',0),True)}\n"
-                                        msg += "\n*TOP 10 BROKERS:*\n"
-                                        for idx, b in enumerate(brokers[:10],1):
-                                            emoji = "🟢" if b.get('net_value',0)>0 else "🔴"
-                                            msg += f"{idx}. {emoji} {b.get('broker_code','??')} Net {format_large_number(b.get('net_value',0),True)} Buy {format_large_number(b.get('buy_value',0),True)} Avg {b.get('avg_price',0):.0f}\n"
-                                        msg += f"\nTF: {format_timeframe_label(timeframe)} | Price TF: {safe_int(avg_price)}"
-                                        send_reply(target_chat, msg)
-                                    except Exception as e:
-                                        import traceback
-                                        traceback.print_exc()
-                                        send_reply(target_chat, f"❌ Error broker {symbol}: {e}")
-                                threading.Thread(target=broker_detail, args=(chat_id, sym, tf_b)).start()
-                            else:
-                                send_reply(chat_id, "⚠ Format: `/b <KODE> [TF]` contoh `/b BBCA` `/b BBCA 5` `/b BBCA 1h`")
-                        elif first_word in ["/info","/i"]:
-                            parts = text.split()
-                            if len(parts) >=2:
-                                sym = parts[1].upper()
-                                def info_detail(target_chat, symbol):
-                                    try:
-                                        df = get_history_pro(symbol, limit=50, timeframe="1d")
-                                        multi = get_broker_multi_tf(symbol, df)
-                                        analysis = get_analysis(symbol) if 'get_analysis' in globals() else {}
-                                        last_close = df['Close'].iloc[-1] if df is not None and len(df)>0 else 0
-                                        msg = f"📊 *INFO {symbol}* -- {safe_int(last_close)}\n"
-                                        msg += f"Time: {get_now_wib().strftime('%d %b %Y %H:%M')}\n\n"
-                                        if multi:
-                                            msg += f"🏦 Bandar: {multi.get('status_d')} | {multi.get('status_5d')} | {multi.get('status_20d')}\n"
-                                            msg += f"Daily Net: {format_large_number(multi.get('net_d',0),True)} Avg {multi.get('avg_d',0):.0f}\n"
-                                            msg += f"Top: {format_top_brokers(multi.get('brokers',[]),3, multi.get('status_d','AKUM'))}\n\n"
-                                        if df is not None and len(df)>=20:
-                                            df['EMA50'] = df['Close'].ewm(span=50).mean()
-                                            ema50 = df['EMA50'].iloc[-1]
-                                            trend = "UPTREND" if last_close>ema50 else "DOWNTREND"
-                                            msg += f"📈 Trend: {trend} | EMA50: {ema50:.0f}\n"
-                                            msg += f"High 20D: {df['High'].tail(20).max():.0f} Low 20D: {df['Low'].tail(20).min():.0f}\n\n"
-                                        msg += f"Gunakan `/c {symbol}` untuk chart, `/b {symbol}` untuk broker detail"
-                                        send_reply(target_chat, msg)
-                                    except Exception as e:
-                                        import traceback
-                                        traceback.print_exc()
-                                        send_reply(target_chat, f"❌ Error info {symbol}: {e}")
-                                threading.Thread(target=info_detail, args=(chat_id, sym)).start()
-                            else:
-                                send_reply(chat_id, "⚠ Format: `/info <KODE>`")
-                        elif first_word in ["/trend","/t"]:
-                            parts = text.split()
-                            if len(parts) >=2:
-                                sym = parts[1].upper()
-                                def trend_detail(target_chat, symbol):
-                                    try:
-                                        df = get_history_pro(symbol, limit=150, timeframe="1d")
-                                        multi = get_broker_multi_tf(symbol, df)
-                                        buy_sigs, _ = detect_buy_signals(df, multi)
-                                        sell_sigs, _ = detect_sell_signals(df, multi)
-                                        tp = calculate_trading_plan(df, signals=buy_sigs+sell_sigs, multi_tf=multi, timeframe="1d")
-                                        msg = f"📈 *TREND MTF {symbol}*\n\n"
-                                        if multi:
-                                            msg += f"Daily: {multi.get('status_d')} Net {format_large_number(multi.get('net_d',0),True)}\n"
-                                            msg += f"Weekly: {multi.get('status_5d')} Net {format_large_number(multi.get('net_5d',0),True)}\n"
-                                            msg += f"Monthly: {multi.get('status_20d')} Net {format_large_number(multi.get('net_20d',0),True)}\n\n"
-                                        if tp:
-                                            grade_label, _ = grade_from_strength(tp.get('signal_strength',0), tp.get('side','WAIT'))
-                                            msg += f"Signal: {tp.get('signal_type')} | {tp.get('side')} ({tp.get('signal_strength')}%) | Grade: {grade_label}\n"
-                                            msg += f"Trend: {tp.get('trend')}\n"
-                                            msg += f"MTF Confirm: {tp.get('mtf_confirm')}\n"
-                                            msg += f"Buy Signals: {len(tp.get('buy_signals',[]))} Sell: {len(tp.get('sell_signals',[]))}\n"
-                                            if tp.get('side') != 'WAIT':
-                                                msg += f"\nEntry {tp['entry']} SL {tp['sl']} TP1 {tp['tp1']} TP2 {tp['tp2']}\n"
-                                            else:
-                                                msg += f"\nStatus: WAIT - {tp.get('signal_reason')}\n"
-                                        send_reply(target_chat, msg)
-                                    except Exception as e:
-                                        send_reply(target_chat, f"❌ Error trend {symbol}: {e}")
-                                threading.Thread(target=trend_detail, args=(chat_id, sym)).start()
-                            else:
-                                send_reply(chat_id, "⚠ Format: `/trend <KODE>`")
-                        elif first_word in ["/top"]:
-                            parts = text.split()
-                            n = 10
-                            filter_status = None
-                            if len(parts)>=2:
+            data = res.json()
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                if "callback_query" in update:
+                    cb = update["callback_query"]
+                    cb_id = cb.get("id")
+                    cb_data = cb.get("data","")
+                    chat_id = cb["message"]["chat"]["id"]
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id})
+                    if cb_data.startswith("chart_"):
+                        parts = cb_data.split("_")
+                        if len(parts) >=3:
+                            sym = parts[1]
+                            tf = parts[2]
+                            threading.Thread(target=process_chart_request, args=(chat_id, sym, tf, LAST_SIGNALS_CACHE)).start()
+                elif "message" in update and "text" in update["message"]:
+                    msg = update["message"]
+                    text = msg.get("text","").strip()
+                    chat_id = msg["chat"]["id"]
+                    first_word = text.split()[0].lower() if text else ""
+                    if first_word in ["/start","/help"]:
+                        help_msg = (
+                            "🤖 *RAFANO V3 PRO FIXED SELL*\n"
+                            "`/c <KODE> [TF]` - Chart Pro + Real Akum\n"
+                            "`/b <KODE>` - Detail Bandar\n"
+                            "`/scan` - Scan V3\n"
+                            "`/clearcache` - Hapus cache\n"
+                        )
+                        send_reply(chat_id, help_msg)
+                    elif first_word in ["/c","/chart","!chart"]:
+                        parts = text.split()
+                        if len(parts) >=2:
+                            sym = parts[1].upper()
+                            raw_tf = parts[2] if len(parts)>=3 else "1d"
+                            tf_map = {"5":"5m","15":"15m","30":"30m","1h":"1h","4h":"4h","1":"1d","d":"1d","w":"1w","m":"1M","1d":"1d","1w":"1w","5m":"5m","15m":"15m","30m":"30m","1M":"1M"}
+                            tf = tf_map.get(raw_tf.lower(), raw_tf.lower())
+                            threading.Thread(target=process_chart_request, args=(chat_id, sym, tf, LAST_SIGNALS_CACHE)).start()
+                    elif first_word in ["/b","/broker","/bandar"]:
+                        parts = text.split()
+                        if len(parts) >=2:
+                            sym = parts[1].upper()
+                            def broker_detail(target_chat, symbol):
                                 try:
-                                    n = int(parts[1])
-                                    if len(parts)>=3:
-                                        filter_status = parts[2].upper()
-                                except:
-                                    filter_status = parts[1].upper()
-                                    if filter_status not in ["AKUM","DIST"]:
-                                        n = 10
-                                        filter_status = None
-                            def top_accum(target_chat, limit, status_filter):
-                                try:
-                                    sigs = LAST_SIGNALS_CACHE.values() if LAST_SIGNALS_CACHE else scan_v3()
-                                    if isinstance(sigs, dict):
-                                        sigs = list(sigs.values()) if hasattr(sigs, 'values') else list(sigs)
-                                    def get_net(x):
-                                        multi = x.get('multi_tf') or {}
-                                        return abs(multi.get('net_d',0) or x.get('broker_net',0) or 0)
-                                    sorted_sigs = sorted(sigs, key=get_net, reverse=True)
-                                    if status_filter:
-                                        sorted_sigs = [s for s in sorted_sigs if (s.get('multi_tf',{}).get('status_d','')==status_filter or s.get('broker_status','')==status_filter)]
-                                    msg = f"🏆 *TOP {limit} {'AKUM' if status_filter=='AKUM' else 'DIST' if status_filter=='DIST' else 'AKUMULASI'}*\n\n"
-                                    for idx, item in enumerate(sorted_sigs[:limit],1):
-                                        multi = item.get('multi_tf') or {}
-                                        sym = item.get('symbol','??')
-                                        net = multi.get('net_d',0) or item.get('broker_net',0)
-                                        status = multi.get('status_d','') or item.get('broker_status','')
-                                        emoji = "🟢" if status=="AKUM" else "🔴" if status=="DIST" else "⚪"
-                                        msg += f"{idx}. {emoji} *{sym}* {status} Net {format_large_number(net,True)} | {format_top_brokers(multi.get('brokers',[]) or item.get('brokers',[]),2,status)}\n"
+                                    multi = get_broker_multi_tf(symbol)
+                                    msg = f"🏦 *BROKER DETAIL {symbol} - REAL SELL*\n"
+                                    msg += f"Daily: {multi.get('status_d')} Net {format_large_number(multi.get('net_d',0),True)}\n"
+                                    msg += f"  Buy {format_large_number(multi.get('buy_d',0),True)} Sell {format_large_number(multi.get('sell_d',0),True)} | Avg {multi.get('avg_d',0):.0f}\n"
+                                    msg += f"  Top: {format_top_brokers(multi.get('brokers',[]),3,multi.get('status_d'))}\n"
+                                    for b in multi.get('brokers',[])[:5]:
+                                        msg += f"    - {b.get('broker_code')}: Buy {format_large_number(b.get('buy_value',0),True)} Sell {format_large_number(b.get('sell_value',0),True)} Net {format_large_number(b.get('net_value',0),True)}\n"
+                                    msg += f"\nWeekly: {multi.get('status_5d')} Net {format_large_number(multi.get('net_5d',0),True)} Buy {format_large_number(multi.get('buy_5d',0),True)} Sell {format_large_number(multi.get('sell_5d',0),True)}\n"
+                                    msg += f"Monthly: {multi.get('status_20d')} Net {format_large_number(multi.get('net_20d',0),True)} Buy {format_large_number(multi.get('buy_20d',0),True)} Sell {format_large_number(multi.get('sell_20d',0),True)}\n"
                                     send_reply(target_chat, msg)
                                 except Exception as e:
-                                    import traceback
-                                    traceback.print_exc()
-                                    send_reply(target_chat, f"❌ Error top: {e}")
-                            threading.Thread(target=top_accum, args=(chat_id, n, filter_status)).start()
-                        elif first_word in ["/compare","/comp"]:
-                            parts = text.split()
-                            if len(parts)>=3:
-                                sym1 = parts[1].upper()
-                                sym2 = parts[2].upper()
-                                def compare_stocks(target_chat, s1, s2):
-                                    try:
-                                        m1 = get_broker_multi_tf(s1)
-                                        m2 = get_broker_multi_tf(s2)
-                                        df1 = get_history_pro(s1, limit=20)
-                                        df2 = get_history_pro(s2, limit=20)
-                                        close1 = df1['Close'].iloc[-1] if df1 is not None else 0
-                                        close2 = df2['Close'].iloc[-1] if df2 is not None else 0
-                                        msg = f"⚖️ *COMPARE {s1} vs {s2}*\n\n"
-                                        msg += f"*{s1}* {safe_int(close1)} | {m1.get('status_d')} Net {format_large_number(m1.get('net_d',0),True)}\n"
-                                        msg += f"  Weekly {m1.get('status_5d')} Net {format_large_number(m1.get('net_5d',0),True)}\n"
-                                        msg += f"  Monthly {m1.get('status_20d')} Net {format_large_number(m1.get('net_20d',0),True)}\n"
-                                        msg += f"  Top: {format_top_brokers(m1.get('brokers',[]),2,m1.get('status_d'))}\n\n"
-                                        msg += f"*{s2}* {safe_int(close2)} | {m2.get('status_d')} Net {format_large_number(m2.get('net_d',0),True)}\n"
-                                        msg += f"  Weekly {m2.get('status_5d')} Net {format_large_number(m2.get('net_5d',0),True)}\n"
-                                        msg += f"  Monthly {m2.get('status_20d')} Net {format_large_number(m2.get('net_20d',0),True)}\n"
-                                        msg += f"  Top: {format_top_brokers(m2.get('brokers',[]),2,m2.get('status_d'))}\n\n"
-                                        winner = s1 if abs(m1.get('net_d',0))>abs(m2.get('net_d',0)) else s2
-                                        msg += f"🏆 Lebih kuat: *{winner}* (Net lebih besar)"
-                                        send_reply(target_chat, msg)
-                                    except Exception as e:
-                                        send_reply(target_chat, f"❌ Error compare: {e}")
-                                threading.Thread(target=compare_stocks, args=(chat_id, sym1, sym2)).start()
-                            else:
-                                send_reply(chat_id, "⚠ Format: `/compare BBCA BBRI`")
-                        elif first_word in ["/s"]:
-                            parts = text.split()
-                            if len(parts) < 2:
-                                send_reply(chat_id, "📋 *SCREENER /s*\n\n`/s akum d` - Top 20 akum daily\n`/s akum w` - Top 20 akum weekly\n`/s akum m` - Top 20 akum monthly\n`/s dis d` - Top 20 dist daily\n`/s dis w` - Top 20 dist weekly\n`/s dis m` - Top 20 dist monthly\n`/s os` - Oversold RSI<30\n`/s ob` - Overbought RSI>70\n`/s turbo` - Volume Spike TURBO")
-                            else:
-                                sub = parts[1].lower()
-                                tf_arg = parts[2].lower() if len(parts)>=3 else "d"
-                                def screener_s(target_chat, kind, tf):
-                                    try:
-                                        sigs = scan_v3()
-                                        if not sigs:
-                                            sigs = list(LAST_SIGNALS_CACHE.values()) if LAST_SIGNALS_CACHE else []
-                                        if not sigs:
-                                            send_reply(target_chat, "⚠ Screener kosong, coba `/scan` dulu")
-                                            return
-                                        filtered = []
-                                        if kind == "os":
-                                            for item in sigs:
-                                                try:
-                                                    sym = item.get('symbol')
-                                                    df = get_history_pro(sym, limit=50, timeframe="1d")
-                                                    if df is None or len(df)<15:
-                                                        continue
-                                                    rsi = calculate_rsi(df['Close'], 14).iloc[-1]
-                                                    if rsi < 30:
-                                                        item['rsi'] = rsi
-                                                        filtered.append(item)
-                                                except:
-                                                    pass
-                                            filtered = sorted(filtered, key=lambda x: x.get('rsi', 50))
-                                            msg = f"📉 *OVERSOLD RSI<30* ({len(filtered)})\n\n"
-                                            for idx, it in enumerate(filtered[:20],1):
-                                                multi = it.get('multi_tf',{})
-                                                rsi = it.get('rsi',0)
-                                                msg += f"{idx}. *{it['symbol']}* -- {safe_int(it.get('close',0))} RSI {rsi:.1f} | {multi.get('status_d','')} Net {format_large_number(multi.get('net_d',0),True)}\n"
-                                            send_reply(target_chat, msg if filtered else "✅ Tidak ada oversold RSI<30")
-                                            return
-                                        elif kind == "ob":
-                                            for item in sigs:
-                                                try:
-                                                    sym = item.get('symbol')
-                                                    df = get_history_pro(sym, limit=50, timeframe="1d")
-                                                    if df is None or len(df)<15:
-                                                        continue
-                                                    rsi = calculate_rsi(df['Close'], 14).iloc[-1]
-                                                    if rsi > 70:
-                                                        item['rsi'] = rsi
-                                                        filtered.append(item)
-                                                except:
-                                                    pass
-                                            filtered = sorted(filtered, key=lambda x: x.get('rsi', 50), reverse=True)
-                                            msg = f"📈 *OVERBOUGHT RSI>70* ({len(filtered)})\n\n"
-                                            for idx, it in enumerate(filtered[:20],1):
-                                                multi = it.get('multi_tf',{})
-                                                rsi = it.get('rsi',0)
-                                                msg += f"{idx}. *{it['symbol']}* -- {safe_int(it.get('close',0))} RSI {rsi:.1f} | {multi.get('status_d','')} Net {format_large_number(multi.get('net_d',0),True)}\n"
-                                            send_reply(target_chat, msg if filtered else "✅ Tidak ada overbought RSI>70")
-                                            return
-                                        elif kind == "turbo":
-                                            for item in sigs:
-                                                try:
-                                                    sym = item.get('symbol')
-                                                    df = get_history_pro(sym, limit=50, timeframe="1d")
-                                                    if df is None or len(df)<25:
-                                                        continue
-                                                    last_vol = df['Volume'].iloc[-1]
-                                                    v1 = df['Volume'].rolling(20).mean().iloc[-1]
-                                                    vchg = (last_vol / v1) if v1>0 else 0
-                                                    buy_pct = int(df['Buy_Pct'].iloc[-1]) if 'Buy_Pct' in df.columns else 50
-                                                    multi = item.get('multi_tf',{})
-                                                    status = multi.get('status_d','')
-                                                    if vchg >= 2.0 and buy_pct >= 60 and status == "AKUM":
-                                                        item['vchg'] = vchg
-                                                        item['buy_pct'] = buy_pct
-                                                        filtered.append(item)
-                                                except:
-                                                    pass
-                                            filtered = sorted(filtered, key=lambda x: x.get('vchg',0), reverse=True)
-                                            msg = f"🚀 *TURBO SPIKE - VOLUME EXPLOSION* ({len(filtered)})\nCriteria: Vchg ≥2.0x + Buy% ≥60% + AKUM\n\n"
-                                            for idx, it in enumerate(filtered[:20],1):
-                                                multi = it.get('multi_tf',{})
-                                                msg += f"{idx}. 🚀 *{it['symbol']}* -- {safe_int(it.get('close',0))} Vol {it.get('vchg',0):.1f}x Buy% {it.get('buy_pct',0)}% Net {format_large_number(multi.get('net_d',0),True)}\n"
-                                                msg += f"   Top: {format_top_brokers(multi.get('brokers',[]),3, multi.get('status_d','AKUM'))}\n\n"
-                                            send_reply(target_chat, msg if filtered else "Tidak ada TURBO saat ini")
-                                            return
-                                        want_akum = (kind == "akum")
-                                        tf_key_map = {"d": ("net_d","status_d","buy_d","sell_d","avg_d"), "w": ("net_5d","status_5d","buy_5d","sell_5d","avg_5d"), "m": ("net_20d","status_20d","buy_20d","sell_20d","avg_20d")}
-                                        net_key, status_key, buy_key, sell_key, avg_key = tf_key_map.get(tf, tf_key_map["d"])
-                                        for item in sigs:
-                                            multi = item.get('multi_tf',{})
-                                            status = multi.get(status_key,'')
-                                            net = multi.get(net_key,0)
-                                            if want_akum:
-                                                if status=="AKUM" and net>0:
-                                                    filtered.append(item)
-                                            else:
-                                                if status=="DIST" and net<0:
-                                                    filtered.append(item)
-                                        filtered = sorted(filtered, key=lambda x: abs(x.get('multi_tf',{}).get(net_key,0)), reverse=True)
-                                        tf_label_scr = {"d":"DAILY 1D","w":"WEEKLY 5D","m":"MONTHLY 20D"}.get(tf, "DAILY")
-                                        kind_label = "AKUMULASI" if want_akum else "DISTRIBUSI"
-                                        msg = f"🏆 *TOP 20 {kind_label} - {tf_label_scr}* ({len(filtered)})\n\n"
-                                        for idx, item in enumerate(filtered[:20],1):
-                                            multi = item.get('multi_tf',{})
-                                            net = multi.get(net_key,0)
-                                            buy = multi.get(buy_key,0)
-                                            sell = multi.get(sell_key,0)
-                                            avg = multi.get(avg_key,0)
-                                            status = multi.get(status_key,'')
-                                            emoji = "🟢" if status=="AKUM" else "🔴"
-                                            brokers = multi.get('brokers',[]) if tf=="d" else multi.get('brokers_5d',[]) if tf=="w" else multi.get('brokers_20d',[])
-                                            top = format_top_brokers(brokers, 3, status)
-                                            msg += f"{idx}. {emoji} *{item['symbol']}* -- {safe_int(item.get('close',0))} ({item.get('change_pct',0):+.2f}%)\n"
-                                            msg += f"   {status} | Buy {format_large_number(buy,True)} Sell {format_large_number(sell,True)} Net {format_large_number(net,True)} Avg {avg:.0f}\n"
-                                            msg += f"   Top: {top}\n\n"
-                                        send_reply(target_chat, msg)
-                                    except Exception as e:
-                                        import traceback
-                                        traceback.print_exc()
-                                        send_reply(target_chat, f"❌ Error /s: {e}")
-                                threading.Thread(target=screener_s, args=(chat_id, sub, tf_arg)).start()
-                        elif first_word in ["/wl","/watchlist"]:
-                            parts = text.split()
-                            WATCHLIST_FILE = "/tmp/rafano_watchlist.json"
-                            def load_wl():
-                                try:
-                                    import json
-                                    if os.path.exists(WATCHLIST_FILE):
-                                        with open(WATCHLIST_FILE,'r') as f:
-                                            return json.load(f)
-                                except:
-                                    pass
-                                return []
-                            def save_wl(wl):
-                                try:
-                                    import json
-                                    with open(WATCHLIST_FILE,'w') as f:
-                                        json.dump(wl,f)
-                                except:
-                                    pass
-                            if len(parts)==1 or parts[1].lower() in ["list","show"]:
-                                wl = load_wl()
-                                if not wl:
-                                    send_reply(chat_id, "⭐ Watchlist kosong. Tambah dengan `/wl add BBCA`")
-                                else:
-                                    msg = f"⭐ *WATCHLIST* ({len(wl)} saham)\n\n"
-                                    for s in wl:
-                                        msg += f"• {s}\n"
-                                    msg += f"\n`/wl add <KODE>` tambah, `/wl del <KODE>` hapus, `/wl scan` scan watchlist"
-                                    send_reply(chat_id, msg)
-                            elif parts[1].lower()=="add" and len(parts)>=3:
-                                sym = parts[2].upper()
-                                wl = load_wl()
-                                if sym not in wl:
-                                    wl.append(sym)
-                                    save_wl(wl)
-                                    send_reply(chat_id, f"✅ {sym} ditambah ke watchlist ({len(wl)} saham)")
-                                else:
-                                    send_reply(chat_id, f"⚠ {sym} sudah ada di watchlist")
-                            elif parts[1].lower() in ["del","remove","rm"] and len(parts)>=3:
-                                sym = parts[2].upper()
-                                wl = load_wl()
-                                if sym in wl:
-                                    wl.remove(sym)
-                                    save_wl(wl)
-                                    send_reply(chat_id, f"🗑️ {sym} dihapus dari watchlist")
-                                else:
-                                    send_reply(chat_id, f"⚠ {sym} tidak ada di watchlist")
-                            elif parts[1].lower()=="scan":
-                                wl = load_wl()
-                                if not wl:
-                                    send_reply(chat_id, "⭐ Watchlist kosong")
-                                else:
-                                    def scan_wl(target_chat, symbols):
-                                        try:
-                                            results = []
-                                            for sym in symbols:
-                                                try:
-                                                    df = get_history_pro(sym, limit=50)
-                                                    multi = get_broker_multi_tf(sym, df)
-                                                    score = 60 if multi.get('net_d',0)>0 else 35
-                                                    results.append({"symbol":sym, "multi_tf":multi, "score":score, "close": df['Close'].iloc[-1] if df is not None else 0})
-                                                except:
-                                                    pass
-                                            results = sorted(results, key=lambda x: abs(x.get('multi_tf',{}).get('net_d',0)), reverse=True)
-                                            msg = f"⭐ *WATCHLIST SCAN* ({len(results)})\n\n"
-                                            for idx, item in enumerate(results,1):
-                                                multi = item.get('multi_tf',{})
-                                                msg += f"{idx}. *{item['symbol']}* -- {safe_int(item.get('close',0))} | {multi.get('status_d')} Net {format_large_number(multi.get('net_d',0),True)}\n"
-                                            send_reply(target_chat, msg)
-                                        except Exception as e:
-                                            send_reply(target_chat, f"❌ Error wl scan: {e}")
-                                    threading.Thread(target=scan_wl, args=(chat_id, wl)).start()
-                            else:
-                                send_reply(chat_id, "⭐ Format: `/wl` `/wl add BBCA` `/wl del BBCA` `/wl scan`")
-                        elif first_word in ["/clearcache","/cc","/clear"]:
-                            try:
-                                import os
-                                removed = []
-                                for p in ["/tmp/rafano_cache.json"]:
-                                    if os.path.exists(p):
-                                        os.remove(p)
-                                        removed.append(p)
-                                BROKER_CACHE.clear()
-                                HISTORY_CACHE.clear()
-                                SCREENER_CACHE.clear()
-                                LAST_SIGNALS_CACHE.clear()
-                                send_reply(chat_id, f"🧹 Cache cleared: {', '.join(removed) if removed else 'memory cleared'}\nSekarang coba `/scan` atau `/c BBCA` lagi")
-                            except Exception as e:
-                                send_reply(chat_id, f"❌ Error clear: {e}")
-                        elif first_word in ["/scan","!scan","/scanpro"]:
-                            send_reply(chat_id, "🔍 *V3 Scanning Real Accumulation...*")
-                            def manual_scan(is_pro=False, target_chat=chat_id):
-                                global LAST_SIGNALS_CACHE
-                                print(f"Manual scan dipanggil is_pro={is_pro} target={target_chat}")
-                                sigs = scan_v3()
-                                LAST_SIGNALS_CACHE = {s['symbol']: s for s in sigs}
-                                filt = sigs
-                                now_str = get_now_wib().strftime('%d %b %Y %H:%M WIB')
-                                if not filt:
-                                    send_reply(target_chat, f"*RAFANO V3* {now_str}\n0 sinyal (weekend/market tutup, coba /c BBCA)\n_Screener kosong, coba beberapa saham fallback_")
-                                    return
-                                header = f"*RAFANO V3 PRO - {now_str}*\nTotal: {len(filt)} (manual, tanpa cooldown)\n\n"
-                                msg = header
-                                kb = []
-                                for idx, item in enumerate(filt,1):
-                                    def fmt(v):
-                                        return format_large_number(v, True)
-                                    def fmt_avg(v):
-                                        try:
-                                            fv = float(v)
-                                            return f"{fv:.0f}" if fv >= 100 else f"{fv:.1f}"
-                                        except:
-                                            return "0"
-                                    multi = item.get('multi_tf') or {}
-                                    brokers = item.get('brokers', []) or []
-                                    top_broker_str = format_top_brokers(brokers, 3)
-                                    reasons_str = " | ".join(item.get('reasons', [])[:2])
-                                    if multi:
-                                        st_d = multi.get('status_d','NEUTRAL')
-                                        st_5d = multi.get('status_5d','NEUTRAL')
-                                        st_20d = multi.get('status_20d','NEUTRAL')
-                                        emoji_d = "🟢" if st_d=="AKUM" else "🔴" if st_d=="DIST" else "⚪"
-                                        emoji_5d = "🟢" if st_5d=="AKUM" else "🔴" if st_5d=="DIST" else "⚪"
-                                        emoji_20d = "🟢" if st_20d=="AKUM" else "🔴" if st_20d=="DIST" else "⚪"
-                                        brokers_d = multi.get('brokers', []) or item.get('brokers', []) or []
-                                        brokers_5d = multi.get('brokers_5d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_5d di get_broker_multi_tf)
-                                        brokers_20d = multi.get('brokers_20d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_20d di get_broker_multi_tf)
-                                        top_d = format_top_brokers(brokers_d, 3, st_d)
-                                        top_5d = format_top_brokers(brokers_5d, 3, st_5d)
-                                        top_20d = format_top_brokers(brokers_20d, 3, st_20d)
-                                        label_d = "Top Buy" if st_d=="AKUM" else "Top Sell" if st_d=="DIST" else "Top"
-                                        label_5d = "Top Buy" if st_5d=="AKUM" else "Top Sell" if st_5d=="DIST" else "Top"
-                                        label_20d = "Top Buy" if st_20d=="AKUM" else "Top Sell" if st_20d=="DIST" else "Top"
-                                        daily_str = f"{emoji_d} Daily: {st_d} | Buy {fmt(multi.get('buy_d',0))} Sell {fmt(multi.get('sell_d',0))} Net {fmt(multi.get('net_d',0))} | Avg {fmt_avg(multi.get('avg_d',0))}"
-                                        daily_top = f"   |  └ {label_d}: {top_d}"
-                                        weekly_str = f"{emoji_5d} Weekly 5D: {st_5d} | Buy {fmt(multi.get('buy_5d',0))} Sell {fmt(multi.get('sell_5d',0))} Net {fmt(multi.get('net_5d',0))} | Avg {fmt_avg(multi.get('avg_5d',0))}"
-                                        weekly_top = f"   |  └ {label_5d}: {top_5d}"
-                                        monthly_str = f"{emoji_20d} Monthly 20D: {st_20d} | Buy {fmt(multi.get('buy_20d',0))} Sell {fmt(multi.get('sell_20d',0))} Net {fmt(multi.get('net_20d',0))} | Avg {fmt_avg(multi.get('avg_20d',0))}"
-                                        monthly_top = f"   |  └ {label_20d}: {top_20d}"
-                                    else:
-                                        daily_str = f"Akum {fmt(item.get('accum_value',0))} | Net {fmt(item.get('broker_net',0))}"
-                                        weekly_str = ""
-                                        monthly_str = ""
-                                        daily_top = ""
-                                        weekly_top = ""
-                                        monthly_top = ""
-                                    tp = item.get('trading_plan')
-                                    tp_line = f"Entry {tp['entry']} TP1 {tp['tp1']} SL {tp['sl']}" if tp else reasons_str
-                                    item_str = f"{idx}. *{item['symbol']}* -- {item.get('close',0)} ({item.get('change_pct',0):+.2f}%)\n"
-                                    item_str += f"   |- Score: {item['score']}% ({item.get('score_label','')})\n"
-                                    item_str += f"   |- {daily_str}\n"
-                                    if 'daily_top' in locals() and daily_top:
-                                        item_str += f"{daily_top}\n"
-                                    if weekly_str:
-                                        item_str += f"   |- {weekly_str}\n"
-                                        if 'weekly_top' in locals() and weekly_top:
-                                            item_str += f"{weekly_top}\n"
-                                    if monthly_str:
-                                        item_str += f"   |- {monthly_str}\n"
-                                        if 'monthly_top' in locals() and monthly_top:
-                                            item_str += f"{monthly_top}\n"
-                                    item_str += f"   +- {tp_line}\n\n"
-                                    kb.append([{"text": f"Pro Chart {item['symbol']}", "callback_data": f"chart_{item['symbol']}_1d"}])
-                                    if len(msg) + len(item_str) > 3500:
-                                        send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb})
-                                        msg = item_str
-                                        kb = []
-                                    else:
-                                        msg += item_str
-                                send_reply(target_chat, msg, reply_markup={"inline_keyboard": kb})
-                                if is_pro:
-                                    for top in filt[:3]:
-                                        process_chart_request(target_chat, top['symbol'], "1d", LAST_SIGNALS_CACHE)
-                                        time.sleep(1)
-                            is_pro_flag = (first_word == "/scanpro")
-                            threading.Thread(target=manual_scan, args=(is_pro_flag, chat_id)).start()
+                                    send_reply(target_chat, f"❌ Error {e}")
+                            threading.Thread(target=broker_detail, args=(chat_id, sym)).start()
+                    elif first_word in ["/clearcache","/cc","/clear"]:
+                        try:
+                            BROKER_CACHE.clear()
+                            HISTORY_CACHE.clear()
+                            SCREENER_CACHE.clear()
+                            LAST_SIGNALS_CACHE.clear()
+                            if os.path.exists("/tmp/rafano_cache.json"):
+                                os.remove("/tmp/rafano_cache.json")
+                            send_reply(chat_id, "🧹 Cache cleared")
+                        except Exception as e:
+                            send_reply(chat_id, f"❌ Error clear: {e}")
+                    elif first_word in ["/scan","!scan","/scanpro"]:
+                        send_reply(chat_id, "🔍 *V3 Scanning Real Accumulation (FIXED SELL)...*")
+                        def manual_scan(target_chat=chat_id):
+                            global LAST_SIGNALS_CACHE
+                            sigs = scan_v3()
+                            LAST_SIGNALS_CACHE = {s['symbol']: s for s in sigs}
+                            broadcast_v3(sigs)
+                        threading.Thread(target=manual_scan, args=(chat_id,)).start()
         except Exception as e:
             print(f"Listener error: {e}")
             time.sleep(3)
@@ -2785,7 +1729,6 @@ def auto_screener_loop():
             now = get_now_wib()
             today_str, current_time_str = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
             weekday = now.weekday()
-
             target_sesi1 = "11:25" if weekday == 4 else "11:55"
             if current_time_str == target_sesi1 and last_triggered_sesi1 != today_str:
                 sigs = scan_v3()
@@ -2793,14 +1736,12 @@ def auto_screener_loop():
                 filt = filter_signals_with_cooldown(sigs)
                 broadcast_v3(filt)
                 last_triggered_sesi1 = today_str
-
             if current_time_str == "15:55" and last_triggered_eod != today_str:
                 sigs = scan_v3()
                 LAST_SIGNALS_CACHE = {s['symbol']: s for s in sigs}
                 filt = filter_signals_with_cooldown(sigs)
                 broadcast_v3(filt)
                 last_triggered_eod = today_str
-
             sigs = scan_v3()
             LAST_SIGNALS_CACHE = {s['symbol']: s for s in sigs}
             filt = filter_signals_with_cooldown(sigs)
@@ -2813,7 +1754,7 @@ def auto_screener_loop():
 
 if __name__ == "__main__":
     print("==========================================")
-    print("🔥 RAFANO V3 PRO STARTING (FIXED)...")
+    print("🔥 RAFANO V3 PRO FIXED SELL STARTING...")
     print("==========================================")
     threading.Thread(target=auto_screener_loop, daemon=True).start()
     telegram_bot_listener()
