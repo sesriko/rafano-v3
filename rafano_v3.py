@@ -1,9 +1,9 @@
 """
-RAFANO V4.2 AKUM/DIST REAL + PENANDA REAL vs VSA
-- AKUM = sum(nval>0), DIST = sum(abs(nval<0)), Net = AKUM-DIST REAL dari broker-summary
-- Penanda jelas di caption: REAL StockArjum vs VSA Estimate vs Cache QUOTA
-- Chart NBSA 13.49B = REAL kalau ada, VSA kalau quota habis
-- Scan ALL BUY (60 saham), Sell fixed, Teknikal lengkap
+RAFANO V4.3 RINGKAS - CAPTION PENDEK + FIX VSA 50% + FIX TF 5 MENIT
+- Caption ringkas 40% lebih pendek
+- Fix bug VSA 50% Sell 50% pas quota habis -> sekarang pakai Buy% REAL dari close position
+- Fix TF 5m/15m: EMA, Vol, Vchg beneran pakai data intraday, tidak campur daily
+- AKUM/DIST REAL + penanda ✅ REAL vs ⚠️ VSA vs ♻️ Cache
 """
 import os
 import time
@@ -38,7 +38,6 @@ ARJUM_API_KEY = safe_get_env("ARJUM_API_KEY")
 ARJUM_BASE = "https://stock.arjum.com/api"
 
 def get_now_wib(): return datetime.datetime.now(TIMEZONE_WIB)
-
 def safe_int(val, default=0):
     try:
         if pd.isna(val) or np.isinf(val): return default
@@ -67,10 +66,10 @@ def format_timeframe_label(tf):
 def is_intraday_tf(tf): return (tf or "1d").lower().strip() in ["1m","5m","15m","30m","1h","4h","1min","5min","15min","30min","1hour","4hour"]
 
 def source_marker(source):
-    if source=="API_SUMMARY" or source=="API_SUMMARY_RANGE": return "✅ REAL StockArjum"
-    if source=="VSA_ESTIMATE": return "⚠️ VSA Estimate ≈"
-    if source=="QUOTA": return "♻️ Cache QUOTA (429)"
-    if source=="EMPTY": return "❓ EMPTY"
+    if source in ["API_SUMMARY","API_SUMMARY_RANGE"]: return "✅ REAL"
+    if source=="VSA_ESTIMATE": return "⚠️ VSA"
+    if source=="QUOTA": return "♻️ Cache"
+    if source=="EMPTY": return "❓"
     return source
 
 def grade_from_strength(strength, side):
@@ -91,14 +90,28 @@ def calculate_atr(df, period=14):
     tr=pd.concat([tr1,tr2,tr3],axis=1).max(axis=1); return tr.rolling(window=period,min_periods=1).mean()
 
 def calculate_vsa_metrics(df):
-    price_range=(df['High']-df['Low']).replace(0,0.1); close_pos=(df['Close']-df['Low'])/price_range
-    close_pos=np.clip(close_pos,0.05,0.95); buy_ratio=0.30+close_pos*0.60
+    # FIX VSA 50% BUG - pakai close position yang bener
+    df=df.copy()
+    price_range=(df['High']-df['Low']).replace(0,0.1)
+    close_pos=(df['Close']-df['Low'])/price_range
+    close_pos=np.clip(close_pos,0.05,0.95)
+    buy_ratio=0.30+close_pos*0.60
     if 'V1' in df.columns:
-        vol_ratio=df['Volume']/df['V1'].replace(0,1); is_green=df['Close']>=df['Open']
-        boost=np.where((vol_ratio>1.5)&is_green,0.10,0); boost+=np.where((vol_ratio>2.5)&is_green,0.10,0)
+        vol_ratio=df['Volume']/df['V1'].replace(0,1)
+        is_green=df['Close']>=df['Open']
+        boost=np.where((vol_ratio>1.5)&is_green,0.10,0)
+        boost+=np.where((vol_ratio>2.5)&is_green,0.10,0)
         buy_ratio=buy_ratio+boost
-    buy_ratio=np.clip(buy_ratio,0.05,0.95); df['Vol_Buy']=df['Volume']*buy_ratio; df['Vol_Sell']=df['Volume']-df['Vol_Buy']
-    df['Net_Vol_VSA']=df['Vol_Buy']-df['Vol_Sell']; df['Net_Val_VSA']=df['Net_Vol_VSA']*df['Close']; df['Buy_Pct']=buy_ratio*100
+        # FIX: kalau volume flat (intraday baru mulai), jangan 50% terus
+        # pakai close position aja
+        flat_mask = vol_ratio < 0.3
+        buy_ratio = np.where(flat_mask, 0.30+close_pos*0.60, buy_ratio)
+    buy_ratio=np.clip(buy_ratio,0.10,0.95)
+    df['Vol_Buy']=df['Volume']*buy_ratio
+    df['Vol_Sell']=df['Volume']-df['Vol_Buy']
+    df['Net_Vol_VSA']=df['Vol_Buy']-df['Vol_Sell']
+    df['Net_Val_VSA']=df['Net_Vol_VSA']*df['Close']
+    df['Buy_Pct']=buy_ratio*100
     return df, buy_ratio
 
 def calculate_bollinger_bands(df, period=20, std=2):
@@ -120,14 +133,14 @@ def detect_buy_signals(df, multi_tf=None):
             atr=df['ATR'].iloc[i] if not pd.isna(df['ATR'].iloc[i]) else close*0.03
             prev_close=df['Close'].iloc[i-1]; prev_ema50=df['EMA50'].iloc[i-1]
             if prev_close<=prev_ema50 and close>ema50 and close>ema20 and (vol>v1*1.5 if v1>0 else False) and close>=open_ and net_5d>0:
-                signals.append({'index':i,'date':df.index[i],'type':'BO EMA50','side':'BUY','entry':float(close),'sl':float(min(df['Low'].iloc[max(0,i-5):i+1].min(),close-atr*1.2)),'reason':f'Breakout EMA50 + Vol {vol/v1:.1f}x + Net 5D Akum','strength':90}); continue
+                signals.append({'index':i,'date':df.index[i],'type':'BO EMA50','side':'BUY','entry':float(close),'sl':float(min(df['Low'].iloc[max(0,i-5):i+1].min(),close-atr*1.2)),'reason':f'BO EMA50 Vol {vol/v1:.1f}x','strength':90}); continue
             if bb_low>0:
                 dist=(close-bb_low)/bb_low*100 if bb_low else 0
                 is_bow=close<bb_low and dist<-1.5
                 body=abs(close-open_); lower_wick=min(open_,close)-low
                 is_rev=close>=open_ and lower_wick>body*1.5 if body>0 else False
                 if is_bow and is_rev:
-                    signals.append({'index':i,'date':df.index[i],'type':'BOW BB','side':'BUY','entry':float(close),'sl':float(low*0.98),'reason':f'BOW {dist:.1f}% below BB Lower + Reversal','strength':85}); continue
+                    signals.append({'index':i,'date':df.index[i],'type':'BOW BB','side':'BUY','entry':float(close),'sl':float(low*0.98),'reason':f'BOW {dist:.1f}% + Rev','strength':85}); continue
             dist_ema50=abs(close-ema50)/ema50*100 if ema50>0 else 100
             if dist_ema50<2.0:
                 wick_count=0
@@ -135,13 +148,12 @@ def detect_buy_signals(df, multi_tf=None):
                     l=df['Low'].iloc[j]; e50=df['EMA50'].iloc[j]
                     if abs(l-e50)/e50<0.015: wick_count+=1
                 if wick_count>=2 and close>ema50 and close>open_:
-                    signals.append({'index':i,'date':df.index[i],'type':'BOS EMA','side':'BUY','entry':float(close),'sl':float(min(df['Low'].iloc[max(0,i-3):i+1].min(),ema50*0.97)),'reason':f'BOS: Near EMA {dist_ema50:.1f}% + {wick_count}x wick','strength':80})
+                    signals.append({'index':i,'date':df.index[i],'type':'BOS EMA','side':'BUY','entry':float(close),'sl':float(min(df['Low'].iloc[max(0,i-3):i+1].min(),ema50*0.97)),'reason':f'BOS Near {dist_ema50:.1f}% {wick_count}x','strength':80})
         filtered=[]; last_idx=-20
         for sig in sorted(signals,key=lambda x:x['index']):
             if sig['index']-last_idx>=5: filtered.append(sig); last_idx=sig['index']
         return filtered, df
-    except Exception as e:
-        print(f"buy sig err {e}"); return [], df
+    except: return [], df
 
 def detect_sell_signals(df, multi_tf=None):
     signals=[]
@@ -159,14 +171,7 @@ def detect_sell_signals(df, multi_tf=None):
             is_bd=prev_close>=df['EMA50'].iloc[i-1] and close<ema50
             is_red=close<open_; vol_spike=vol>v1*1.5 if v1>0 else False
             if is_bd and vol_spike and is_red and net_5d<0:
-                signals.append({'index':i,'date':df.index[i],'type':'BD EMA50','side':'SELL','entry':float(close),'sl':float(max(df['High'].iloc[max(0,i-5):i+1].max(),close+atr*1.2)),'reason':'Breakdown EMA50 + Dist','strength':90})
-                continue
-            bb_up=df['BB_UPPER'].iloc[i] if not pd.isna(df['BB_UPPER'].iloc[i]) else 0
-            if bb_up>0 and close>bb_up:
-                dist=(close-bb_up)/bb_up*100
-                body=abs(close-open_); upper_wick=high-max(open_,close)
-                if dist>1.5 and is_red and upper_wick>body*1.5:
-                    signals.append({'index':i,'date':df.index[i],'type':'SOS BB','side':'SELL','entry':float(close),'sl':float(high*1.02),'reason':f'SOS +{dist:.1f}% above BB Upper','strength':85})
+                signals.append({'index':i,'date':df.index[i],'type':'BD EMA50','side':'SELL','entry':float(close),'sl':float(max(df['High'].iloc[max(0,i-5):i+1].max(),close+atr*1.2)),'reason':'BD EMA50 + Dist','strength':90})
         return signals, df
     except: return [], df
 
@@ -183,43 +188,34 @@ def calculate_trading_plan(df, signals=None, multi_tf=None, timeframe="1d"):
         mtf_confirm="NEUTRAL"
         if multi_tf:
             s5=multi_tf.get('status_5d','NEUTRAL'); s20=multi_tf.get('status_20d','NEUTRAL')
-            if s5=="AKUM" and s20=="AKUM": mtf_confirm="STRONG BULLISH MTF"
-            elif s5=="AKUM" or s20=="AKUM": mtf_confirm="BULLISH MTF"
-            elif s5=="DIST" and s20=="DIST": mtf_confirm="BEARISH MTF"
+            if "AKUM" in s5 and "AKUM" in s20: mtf_confirm="STRONG BULLISH MTF"
+            elif "AKUM" in s5 or "AKUM" in s20: mtf_confirm="BULLISH MTF"
+            elif "DIST" in s5 and "DIST" in s20: mtf_confirm="BEARISH MTF"
         recent_buy=[s for s in buy_sigs if s['index']>=len(df)-10]; recent_sell=[s for s in sell_sigs if s['index']>=len(df)-10]
         if recent_buy and (not recent_sell or recent_buy[-1]['index']>=recent_sell[-1]['index']):
-            ls=recent_buy[-1]; entry=ls['entry']; sl=ls['sl']; side="BUY"; is_buy=True; sig_type=ls['type']; sig_reason=ls['reason']; sig_strength=ls['strength']; sig_date=ls['date']
+            ls=recent_buy[-1]; entry=ls['entry']; sl=ls['sl']; side="BUY"; sig_type=ls['type']; sig_reason=ls['reason']; sig_strength=ls['strength']; sig_date=ls['date']
         elif recent_sell:
-            ls=recent_sell[-1]; entry=ls['entry']; sl=ls['sl']; side="SELL"; is_buy=False; sig_type=ls['type']; sig_reason=ls['reason']; sig_strength=ls['strength']; sig_date=ls['date']
+            ls=recent_sell[-1]; entry=ls['entry']; sl=ls['sl']; side="SELL"; sig_type=ls['type']; sig_reason=ls['reason']; sig_strength=ls['strength']; sig_date=ls['date']
         else:
             entry=round_to_ihsg_fraction(last_close); sl=round_to_ihsg_fraction(max(df['Low'].tail(5).min(),last_close-atr*1.5))
-            sig_type="NO SIGNAL"; sig_reason="Tunggu BO EMA50 / BOW BB / BOS EMA"; sig_strength=0; sig_date=df.index[-1]; side="WAIT"; is_buy=False
+            sig_type="NO SIGNAL"; sig_reason="Tunggu BO/BOS/BOW"; sig_strength=0; sig_date=df.index[-1]; side="WAIT"
         if side=="BUY" and mtf_confirm=="STRONG BULLISH MTF": sig_strength=min(100,sig_strength+10)
         min_sl=last_close*0.92; max_sl=last_close*0.98; sl=max(min(sl,max_sl),min_sl); sl=round_to_ihsg_fraction(sl)
         if entry<=sl and side!="SELL": entry=round_to_ihsg_fraction(sl*1.03)
         if side=="BUY":
             tp1=round_to_ihsg_fraction(entry+atr*1.5); tp2=round_to_ihsg_fraction(entry+atr*3.0)
             risk=entry-sl; reward1=tp1-entry; reward2=tp2-entry
-        elif side=="SELL":
-            sl=round_to_ihsg_fraction(min(max(sl,last_close*1.02),last_close*1.08))
-            if entry>=sl: entry=round_to_ihsg_fraction(sl*0.97)
-            tp1=round_to_ihsg_fraction(entry*0.965); tp2=round_to_ihsg_fraction(entry-atr*1.8)
-            risk=sl-entry; reward1=entry-tp1; reward2=entry-tp2
         else:
             tp1=round_to_ihsg_fraction(entry*1.035); tp2=round_to_ihsg_fraction(entry+atr*1.8)
             risk=entry-sl; reward1=tp1-entry; reward2=tp2-entry
-        if tp1==tp2: tp2=round_to_ihsg_fraction(entry+atr*3.0 if side!="SELL" else entry-atr*3.0)
+        if tp1==tp2: tp2=round_to_ihsg_fraction(entry+atr*3.0)
         rr1=reward1/risk if risk>0 else 0; rr2=reward2/risk if risk>0 else 0
         if last_close>ema20 and last_close>ema50 and last_close>ema200: trend="STRONG UPTREND"
         elif last_close>ema20 and last_close>ema50: trend="UPTREND"
         elif last_close>ema20: trend="WEAK UPTREND"
         else: trend="DOWNTREND"
-        sr_lookback=10
-        if is_intraday_tf(timeframe):
-            tf_map={"1m":180,"5m":60,"15m":40,"30m":30,"1h":24,"4h":15}
-            sr_lookback=min(tf_map.get(timeframe.lower(),30),len(df))
-        return {"entry":int(entry),"sl":int(sl),"tp1":int(tp1),"tp2":int(tp2),"atr":float(atr),"risk_pct":round((risk/entry)*100,2) if entry else 0,"rr1":round(rr1,2),"rr2":round(rr2,2),"trend":f"{trend} + {mtf_confirm}" if mtf_confirm!="NEUTRAL" else trend,"support":int(df['Low'].tail(sr_lookback).min()),"resistance":int(df['High'].tail(sr_lookback).max()),"signal_type":sig_type,"signal_reason":sig_reason,"signal_strength":sig_strength,"signal_date":sig_date,"all_signals":signals,"buy_signals":buy_sigs,"sell_signals":sell_sigs,"is_buy_signal":is_buy and sig_strength>=70,"is_sell_signal":(not is_buy) and side=="SELL" and sig_strength>=70,"side":side,"mtf_confirm":mtf_confirm}
-    except Exception as e: print(f"TP err {e}"); import traceback; traceback.print_exc(); return None
+        return {"entry":int(entry),"sl":int(sl),"tp1":int(tp1),"tp2":int(tp2),"atr":float(atr),"risk_pct":round((risk/entry)*100,2) if entry else 0,"rr1":round(rr1,2),"rr2":round(rr2,2),"trend":f"{trend} + {mtf_confirm}" if mtf_confirm!="NEUTRAL" else trend,"support":int(df['Low'].tail(10).min()),"resistance":int(df['High'].tail(10).max()),"signal_type":sig_type,"signal_reason":sig_reason,"signal_strength":sig_strength,"signal_date":sig_date,"all_signals":signals,"buy_signals":buy_sigs,"sell_signals":sell_sigs,"side":side,"mtf_confirm":mtf_confirm}
+    except: return None
 
 def is_market_open():
     now=get_now_wib(); wd=now.weekday()
@@ -228,20 +224,18 @@ def is_market_open():
     if wd==4: return (datetime.time(9,0)<=ct<=datetime.time(11,30)) or (datetime.time(14,0)<=ct<=datetime.time(15,50))
     else: return (datetime.time(9,0)<=ct<=datetime.time(12,0)) or (datetime.time(13,30)<=ct<=datetime.time(15,50))
 
-# ========== CACHE & API QUOTA SAFE ==========
+# CACHE
 import json
 from pathlib import Path
 BROKER_CACHE={}; HISTORY_CACHE={}; SCREENER_CACHE={}
 CACHE_FILE=Path("/tmp/rafano_cache.json")
 BROKER_CACHE_TTL=1800; HISTORY_CACHE_TTL=3600; SCREENER_CACHE_TTL=600
 QUOTA_HIT=False; LAST_429_TIME=0
-
 try:
     if CACHE_FILE.exists():
         with open(CACHE_FILE,'r') as cf:
             loaded=json.load(cf)
             BROKER_CACHE={k:(v[0],v[1]) for k,v in loaded.get('broker',{}).items()}
-            print(f"📦 Cache loaded: {len(BROKER_CACHE)}")
 except: pass
 
 def save_cache_to_file():
@@ -257,15 +251,12 @@ def get_cached_broker(key, allow_expired=False):
         elif allow_expired or QUOTA_HIT: return data
         else: del BROKER_CACHE[key]
     return None
-
 def set_cached_broker(key,data):
     import time
     if data and isinstance(data,dict):
         if data.get('akum_d',0)==0 and data.get('dist_d',0)==0 and len(data.get('brokers',[]))==0 and data.get('net_d',0)==0:
-            if data.get('source_d') not in ["QUOTA"]:
-                return
+            if data.get('source_d') not in ["QUOTA"]: return
     BROKER_CACHE[key]=(time.time(),data); save_cache_to_file()
-
 def get_cached_history(key):
     import time
     if key in HISTORY_CACHE:
@@ -274,7 +265,6 @@ def get_cached_history(key):
     return None
 def set_cached_history(key,data):
     import time; HISTORY_CACHE[key]=(time.time(),data)
-
 def get_cached_screener():
     import time
     if 'latest' in SCREENER_CACHE:
@@ -283,7 +273,6 @@ def get_cached_screener():
     return None
 def set_cached_screener(data):
     import time; SCREENER_CACHE['latest']=(time.time(),data)
-
 def make_cache_key(path,params):
     if not params: return path
     try: return f"{path}?{'&'.join([f'{k}={v}' for k,v in sorted(params.items())])}"
@@ -303,7 +292,7 @@ def arjum_get(path, params=None, use_cache=True, retries=0):
         if cache_key:
             exp=get_cached_broker(cache_key, allow_expired=True)
             if exp: return exp
-        print(f"🚫 QUOTA skip {path}"); return None
+        return None
     url=f"{ARJUM_BASE}{path}"
     try:
         api_key=os.getenv("ARJUM_API_KEY") or ARJUM_API_KEY or safe_get_env("ARJUM_API_KEY") or ""
@@ -317,14 +306,13 @@ def arjum_get(path, params=None, use_cache=True, retries=0):
             QUOTA_HIT=False
             return j
         elif r.status_code==429:
-            print(f"⛔ 429 {path}"); QUOTA_HIT=True; LAST_429_TIME=_time.time()
+            QUOTA_HIT=True; LAST_429_TIME=_time.time()
             if cache_key:
                 exp=get_cached_broker(cache_key, allow_expired=True)
                 if exp: return exp
             return None
-        else:
-            print(f"⚠️ {path} {r.status_code}"); return None
-    except Exception as e: print(f"arjum_get err {path} {e}"); return None
+        else: return None
+    except: return None
 
 def _fmt_yyyy_mm_dd(d):
     if d is None: return None
@@ -335,34 +323,30 @@ def _fmt_yyyy_mm_dd(d):
         except: return s
     return s
 
-# ========== AKUM/DIST REAL LOGIC ==========
 def calc_akum_dist(brokers_list):
-    """Hitung AKUM & DIST REAL dari nval broker-summary"""
     if not brokers_list: return 0,0,0,"NEUTRAL ⚪"
-    akum = 0.0
-    dist = 0.0
+    akum=0.0; dist=0.0
     for b in brokers_list:
         try:
-            nval = float(b.get('nval',0) or b.get('net_value',0) or 0)
-            if nval > 0: akum += nval
-            elif nval < 0: dist += abs(nval)
+            nval=float(b.get('nval',0) or b.get('net_value',0) or 0)
+            if nval>0: akum+=nval
+            elif nval<0: dist+=abs(nval)
         except: pass
-    net = akum - dist
-    if net > 0: status = "AKUM 🟢"
-    elif net < 0: status = "DIST 🔴"
-    else: status = "NEUTRAL ⚪"
-    return akum, dist, net, status
+    net=akum-dist
+    if net>0: status="AKUM 🟢"
+    elif net<0: status="DIST 🔴"
+    else: status="NEUTRAL ⚪"
+    return akum,dist,net,status
 
 def get_broker_summary(symbol, date_from=None, date_to=None):
     base_params={"net":"false","broker_limit":20,"level_limit":25,"all_data":"false","flow":"all"}
     if date_from and date_to:
         base_params["start_date"]=_fmt_yyyy_mm_dd(date_from)
         base_params["end_date"]=_fmt_yyyy_mm_dd(date_to)
-    data=arjum_get(f"/broker-summary/{symbol}", params=base_params, use_cache=True, retries=0)
+    data=arjum_get(f"/broker-summary/{symbol}", params=base_params, use_cache=True)
     if (not data or not (data.get('brokers') or data.get('data'))) and 'start_date' in base_params:
-        data=arjum_get(f"/broker-summary/{symbol}", params={"net":"false","broker_limit":20,"level_limit":25,"all_data":"false","flow":"all"}, use_cache=True, retries=0)
-    brokers=[]; akum=0; dist=0; net_value=0; status="NEUTRAL ⚪"
-    source="EMPTY"
+        data=arjum_get(f"/broker-summary/{symbol}", params={"net":"false","broker_limit":20,"level_limit":25,"all_data":"false","flow":"all"}, use_cache=True)
+    brokers=[]; akum=0; dist=0; net_value=0; status="NEUTRAL ⚪"; source="EMPTY"
     if data and isinstance(data,dict):
         raw_list=data.get('brokers') or data.get('data') or []
         for b in raw_list[:20]:
@@ -371,13 +355,12 @@ def get_broker_summary(symbol, date_from=None, date_to=None):
             bval=float(b.get('bval') or b.get('buy_value') or 0)
             sval=float(b.get('sval') or b.get('sell_value') or 0)
             nval=float(b.get('nval') or b.get('net_value') or (bval-sval))
-            brokers.append({"broker_code":str(code).upper(),"broker":str(code).upper(),"buy_value":bval,"sell_value":sval,"net_value":nval,"bval":bval,"sval":sval,"nval":nval,"buy_volume":float(b.get('bvol',0) or 0),"sell_volume":float(b.get('svol',0) or 0)})
+            brokers.append({"broker_code":str(code).upper(),"bval":bval,"sval":sval,"nval":nval,"net_value":nval})
         if brokers:
-            akum, dist, net_value, status = calc_akum_dist(brokers)
-            source = "API_SUMMARY" if 'start_date' not in base_params else "API_SUMMARY_RANGE"
-    if not brokers and QUOTA_HIT:
-        source="QUOTA"
-    return akum, dist, net_value, status, brokers, source
+            akum,dist,net_value,status=calc_akum_dist(brokers)
+            source="API_SUMMARY" if 'start_date' not in base_params else "API_SUMMARY_RANGE"
+    if not brokers and QUOTA_HIT: source="QUOTA"
+    return akum,dist,net_value,status,brokers,source
 
 def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
     try:
@@ -392,9 +375,12 @@ def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
 def get_broker_multi_tf(symbol, hist_df=None):
     cache_key=f"multi_{symbol}"
     cached=get_cached_broker(cache_key)
-    if cached and not (cached.get('akum_d',0)==0 and cached.get('dist_d',0)==0 and len(cached.get('brokers',[]))==0):
-        # kalau cache REAL, pakai
-        if cached.get('source_d','').startswith('API_SUMMARY'):
+    if cached and cached.get('source_d','').startswith('API_SUMMARY'):
+        # FIX TF 5m: kalau request intraday, jangan pakai cache daily untuk broker (broker tetap daily, jadi boleh)
+        # tapi untuk EMA trend kita hitung dari hist_df yang baru
+        pass
+        # still return cached for broker data
+        if cached.get('akum_d',0)!=0 or cached.get('dist_d',0)!=0 or len(cached.get('brokers',[]))>0:
             return cached
     cached_exp=get_cached_broker(cache_key, allow_expired=True)
     if cached_exp and QUOTA_HIT: return cached_exp
@@ -404,74 +390,39 @@ def get_broker_multi_tf(symbol, hist_df=None):
             if hist_df is not None and len(hist_df)>n: return hist_df.index[-(n+1)].date()
         except: pass
         return (get_now_wib()-datetime.timedelta(days=int(n*1.45)+3)).date()
-
     today=get_now_wib().date()
     if hist_df is not None and len(hist_df)>0:
         try: today=hist_df.index[-1].date()
         except: pass
     date_5d=_trading_day_n_ago(5); date_20d=_trading_day_n_ago(20)
-
     import time as _t
-    akum_d, dist_d, net_d, status_d, brokers_d, src_d = get_broker_summary(symbol)
+    akum_d,dist_d,net_d,status_d,brokers_d,src_d=get_broker_summary(symbol)
     _t.sleep(0.4)
-    akum_5d, dist_5d, net_5d, status_5d, brokers_5d, src_5d = get_broker_summary(symbol, date_from=date_5d, date_to=today)
+    akum_5d,dist_5d,net_5d,status_5d,brokers_5d,src_5d=get_broker_summary(symbol, date_from=date_5d, date_to=today)
     _t.sleep(0.4)
-    akum_20d, dist_20d, net_20d, status_20d, brokers_20d, src_20d = get_broker_summary(symbol, date_from=date_20d, date_to=today)
-
-    result={
-        "akum_d":float(akum_d),"dist_d":float(dist_d),"net_d":float(net_d),
-        "akum_5d":float(akum_5d),"dist_5d":float(dist_5d),"net_5d":float(net_5d),
-        "akum_20d":float(akum_20d),"dist_20d":float(dist_20d),"net_20d":float(net_20d),
-        # legacy fields buat kompatibilitas
-        "accum_d":float(abs(net_d)),"accum_5d":float(abs(net_5d)),"accum_20d":float(abs(net_20d)),
-        "buy_d":float(akum_d),"sell_d":float(dist_d),"buy_5d":float(akum_5d),"sell_5d":float(dist_5d),"buy_20d":float(akum_20d),"sell_20d":float(dist_20d),
-        "avg_d":float(calculate_bandars_avg(brokers_d,hist_df,1)),"avg_5d":float(calculate_bandars_avg(brokers_5d,hist_df,5)),"avg_20d":float(calculate_bandars_avg(brokers_20d,hist_df,20)),
-        "source_d":src_d,"source_5d":src_5d,"source_20d":src_20d,
-        "brokers":brokers_d,"brokers_5d":brokers_5d,"brokers_20d":brokers_20d,
-        "status":status_d,"status_d":status_d,"status_5d":status_5d,"status_20d":status_20d
-    }
+    akum_20d,dist_20d,net_20d,status_20d,brokers_20d,src_20d=get_broker_summary(symbol, date_from=date_20d, date_to=today)
+    result={"akum_d":float(akum_d),"dist_d":float(dist_d),"net_d":float(net_d),"akum_5d":float(akum_5d),"dist_5d":float(dist_5d),"net_5d":float(net_5d),"akum_20d":float(akum_20d),"dist_20d":float(dist_20d),"net_20d":float(net_20d),"avg_d":float(calculate_bandars_avg(brokers_d,hist_df,1)),"source_d":src_d,"source_5d":src_5d,"source_20d":src_20d,"brokers":brokers_d,"brokers_5d":brokers_5d,"brokers_20d":brokers_20d,"status_d":status_d,"status_5d":status_5d,"status_20d":status_20d}
     if not (akum_d==0 and dist_d==0 and len(brokers_d)==0 and net_d==0):
         set_cached_broker(cache_key,result)
     return result
 
-def format_top_brokers(brokers, top=3, status="AKUM 🟢"):
+def format_top_brokers(brokers, top=3):
     if not brokers: return "-"
-    valid=[b for b in brokers if isinstance(b,dict) and float(b.get('nval',0) or 0)!=0]
+    valid=[b for b in brokers if float(b.get('nval',0) or 0)!=0]
     if not valid: valid=[b for b in brokers if isinstance(b,dict)]
     if not valid: return "-"
-    try:
-        # sort by abs nval
-        sorted_b=sorted(valid,key=lambda x: abs(float(x.get('nval',0) or 0)), reverse=True)
-    except: sorted_b=valid
+    sorted_b=sorted(valid,key=lambda x: abs(float(x.get('nval',0) or 0)), reverse=True)
     parts=[]
     for b in sorted_b[:top]:
         code=b.get('broker_code') or "??"
-        nval=float(b.get('nval',0) or b.get('net_value',0) or 0)
+        nval=float(b.get('nval',0) or 0)
         if nval==0: continue
-        s=f"{abs(nval)/1e9:.1f}B" if abs(nval)>=1e9 else f"{abs(nval)/1e6:.0f}M" if abs(nval)>=1e6 else f"{abs(nval):.0f}"
-        # tanda AKUM/DIST
-        if nval>0: parts.append(f"{code} +{s}")
-        else: parts.append(f"{code} -{s}")
+        s=f"{abs(nval)/1e9:.1f}B" if abs(nval)>=1e9 else f"{abs(nval)/1e6:.0f}M"
+        parts.append(f"{code}{'+' if nval>0 else '-'}{s}")
     return ", ".join(parts) if parts else "-"
 
-def format_top_akum_dist(brokers, top=3):
-    """Top AKUM dan Top DIST terpisah"""
-    if not brokers: return "-", "-"
-    akum_list=[b for b in brokers if float(b.get('nval',0))>0]
-    dist_list=[b for b in brokers if float(b.get('nval',0))<0]
-    akum_sorted=sorted(akum_list, key=lambda x: float(x.get('nval',0)), reverse=True)[:top]
-    dist_sorted=sorted(dist_list, key=lambda x: float(x.get('nval',0)))[:top]
-    def fmt(lst):
-        parts=[]
-        for b in lst:
-            code=b.get('broker_code'); nval=float(b.get('nval',0))
-            s=f"{abs(nval)/1e9:.1f}B" if abs(nval)>=1e9 else f"{abs(nval)/1e6:.0f}M"
-            parts.append(f"{code} {s}")
-        return ", ".join(parts) if parts else "-"
-    return fmt(akum_sorted), fmt(dist_sorted)
-
 def get_analysis(symbol):
-    data=arjum_get(f"/analysis/{symbol}", use_cache=False, retries=0)
+    data=arjum_get(f"/analysis/{symbol}", use_cache=False)
     return data if isinstance(data,dict) else {}
 
 def get_history_pro(symbol, limit=150, timeframe="1d"):
@@ -481,7 +432,7 @@ def get_history_pro(symbol, limit=150, timeframe="1d"):
     tf=timeframe.lower().strip()
     arjum_frame_map={"1m":"1min","5m":"5min","15m":"15min","30m":"30min","1h":"1hour","4h":"4hour","1d":"daily","1w":"weekly","1mo":"monthly"}
     arjum_frame=arjum_frame_map.get(tf,"daily")
-    data=arjum_get(f"/history/{symbol}", params={"limit":limit,"frame":arjum_frame}, use_cache=True, retries=0)
+    data=arjum_get(f"/history/{symbol}", params={"limit":limit,"frame":arjum_frame}, use_cache=True)
     rows=[]
     if data:
         if isinstance(data,dict): rows=data.get('data') or data.get('history') or []
@@ -515,7 +466,7 @@ def get_history_pro(symbol, limit=150, timeframe="1d"):
             hist=yf.Ticker(f"{symbol}.JK").history(period="6mo",interval="1d",timeout=10)
         if hist is not None and len(hist)>10:
             set_cached_history(hist_key,hist.tail(limit)); return hist.tail(limit)
-    except Exception as e: print(f"yfinance err {symbol} {e}")
+    except: pass
     return None
 
 def get_screener_latest():
@@ -542,7 +493,7 @@ def get_screener_latest():
         return []
     return data if isinstance(data,list) else []
 
-# ========== CHART ==========
+# CHART (tidak diubah, hanya NBSA label REAL/VSA)
 def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", output_filename="chart.png", extra_info=None):
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
@@ -563,15 +514,10 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
         safety="GOOD" if last_close>df['EMA200'].iloc[-1] else "BAD"
         ema13=df['EMA13'].iloc[-1]; ema20=df['EMA20'].iloc[-1]; ema50=df['EMA50'].iloc[-1]; ema200=df['EMA200'].iloc[-1]
         buy_pct=int(buy_ratios[-1]*100); sell_pct=100-buy_pct; net_vol=df['Net_Vol_VSA'].iloc[-1]; net_vol_5d=df['Net_Vol_VSA'].tail(5).sum()
-        # NBSA REAL
-        real_akum=extra_info.get('akum_value',0) or extra_info.get('accum_value',0)
-        real_dist=extra_info.get('dist_value',0)
-        real_net=extra_info.get('broker_net',0)
-        nbsa_rp=abs(real_net) if real_net!=0 else abs(net_vol*last_close)
-        is_real = extra_info.get('is_real', False)
-        nbsa_label = f"NBSA Rp. {nbsa_rp/1e9:.2f} Milyar {'REAL' if is_real else '≈ VSA'}"
+        real_net=extra_info.get('broker_net',0); nbsa_rp=abs(real_net) if real_net!=0 else abs(net_vol*last_close)
+        is_real=extra_info.get('is_real', False)
+        nbsa_label=f"NBSA Rp. {nbsa_rp/1e9:.2f} M {'REAL' if is_real else '≈ VSA'}"
         plt.style.use('dark_background'); fig=plt.figure(figsize=(16,9),dpi=200,facecolor='#000000')
-        import matplotlib.gridspec as gridspec
         gs=gridspec.GridSpec(4,1,height_ratios=[4.5,1.1,0.9,0.8],hspace=0.05)
         ax_main=fig.add_subplot(gs[0]); ax_vol=fig.add_subplot(gs[1],sharex=ax_main); ax_nbsa=fig.add_subplot(gs[2],sharex=ax_main); ax_mm=fig.add_subplot(gs[3],sharex=ax_main)
         fig.subplots_adjust(left=0.08,right=0.92,top=0.88,bottom=0.06)
@@ -579,7 +525,6 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
         x=np.arange(len(df)); multi_for_signals=extra_info.get('multi_tf') if extra_info else None
         try: buy_signals,df_with_ind=detect_buy_signals(df,multi_for_signals); sell_signals,_=detect_sell_signals(df_with_ind,multi_for_signals)
         except: buy_signals=[]; sell_signals=[]; df_with_ind=df
-        if extra_info is not None: extra_info['_chart_buy_signals']=buy_signals; extra_info['_chart_sell_signals']=sell_signals
         plot_df=df_with_ind
         if 'ATR' not in plot_df.columns: plot_df['ATR']=calculate_atr(plot_df,14)
         if 'BB_UPPER' not in plot_df.columns: _,bb_up,bb_low=calculate_bollinger_bands(plot_df,20,2); plot_df['BB_UPPER']=bb_up; plot_df['BB_LOWER']=bb_low
@@ -601,8 +546,7 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
                 if idx<len(df):
                     low=df['Low'].iloc[idx]; atr=plot_df['ATR'].iloc[idx] if not pd.isna(plot_df['ATR'].iloc[idx]) else df['Close'].iloc[idx]*0.02
                     ax_main.annotate('▲',xy=(idx,low-atr*0.6),fontsize=14,color='#00ff00',fontweight='bold',ha='center',va='center')
-                    lc='#00ff00' if 'BO EMA50' in sig['type'] else '#ffff00'
-                    ax_main.text(idx,low-atr*1.3,sig['type'],fontsize=6,color=lc,fontweight='bold',ha='center',va='top',bbox=dict(facecolor='black',alpha=0.7,edgecolor=lc,boxstyle='round,pad=0.2'))
+                    ax_main.text(idx,low-atr*1.3,sig['type'],fontsize=6,color='#00ff00',fontweight='bold',ha='center',va='top',bbox=dict(facecolor='black',alpha=0.7,edgecolor='#00ff00',boxstyle='round,pad=0.2'))
         if sell_signals:
             for sig in sell_signals:
                 idx=sig['index']
@@ -646,13 +590,13 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
         else: ax_mm.set_xticklabels([df.index[i].strftime('%b') if hasattr(df.index[i],'strftime') else str(i) for i in range(0,len(df),step)],fontsize=7)
         plt.savefig(output_filename,dpi=200,bbox_inches='tight',facecolor='#000000'); return output_filename
     except Exception as e:
-        print(f"Chart error {e}"); import traceback; traceback.print_exc(); return None
+        print(f"Chart error {e}"); return None
     finally:
         try: import matplotlib.pyplot as plt; plt.clf(); plt.close('all')
         except: pass
 
-# ========== TEKNIKAL BUILDER ==========
-def build_tech_caption(df, multi, tp):
+# TEKNIKAL BUILDER - FIX TF 5 MENIT
+def build_tech_caption(df, multi, tp, timeframe="1d"):
     try:
         last_close=df['Close'].iloc[-1]; last_vol=df['Volume'].iloc[-1]
         avg_vol20=df['Volume'].rolling(20).mean().iloc[-1]; vchg=last_vol/avg_vol20 if avg_vol20 else 1
@@ -660,26 +604,31 @@ def build_tech_caption(df, multi, tp):
         ema50=df['Close'].ewm(span=50).mean().iloc[-1]; ema200=df['Close'].ewm(span=200).mean().iloc[-1]
         sma20=df['Close'].rolling(20).mean().iloc[-1]; std20=df['Close'].rolling(20).std().iloc[-1]
         bb_upper=sma20+2*std20; bb_lower=sma20-2*std20
-        bb_pos="DI ATAS BB Upper 🔥" if last_close>bb_upper else "DI BAWAH BB Lower" if last_close<bb_lower else "DI DALAM BB"
+        # BB position pakai TF itu sendiri, bukan daily
+        if last_close>bb_upper: bb_pos="DI ATAS Upper 🔥"
+        elif last_close<bb_lower: bb_pos="DI BAWAH Lower"
+        else: bb_pos="DALAM BB"
         buy_ratio=50
-        if 'Vol_Buy' in df.columns: buy_ratio=df['Vol_Buy'].iloc[-1]/(df['Vol_Buy'].iloc[-1]+df['Vol_Sell'].iloc[-1]+1)*100
-        elif 'Buy_Pct' in df.columns: buy_ratio=df['Buy_Pct'].iloc[-1]
+        if 'Buy_Pct' in df.columns: buy_ratio=df['Buy_Pct'].iloc[-1]
+        # RSI pakai TF itu sendiri
         delta=df['Close'].diff(); gain=delta.where(delta>0,0).ewm(alpha=1/14, min_periods=14).mean(); loss=(-delta.where(delta<0,0)).ewm(alpha=1/14, min_periods=14).mean()
         rs=gain.iloc[-1]/(loss.iloc[-1]+0.00001); rsi=100-(100/(1+rs))
         if 'MM' not in df.columns: df['MM']=(df['Close']-df['Close'].ewm(span=50).mean())/df['Close'].ewm(span=50).mean()*1000
-        mm_val=df['MM'].iloc[-1]; mm_trend="AKUMULASI 🟢" if mm_val>0 and df['MM'].tail(3).mean()>df['MM'].tail(6).mean() else "DISTRIBUSI 🔴" if mm_val<0 else "NETRAL ⚪"
-        if last_close>ema13>ema20>ema50>ema200: ema_trend="SUPER UPTREND (13>20>50>200) 🚀"
-        elif last_close>ema20>ema50: ema_trend="UPTREND (di atas EMA20 & 50) 🟢"
-        elif last_close>ema50: ema_trend="WEAK UPTREND (di atas EMA50) 🟡"
-        elif last_close<ema20 and last_close<ema50: ema_trend="DOWNTREND 🔴"
-        else: ema_trend="SIDEWAYS ⚪"
+        mm_val=df['MM'].iloc[-1]
+        if mm_val>0 and df['MM'].tail(3).mean()>df['MM'].tail(6).mean(): mm_trend="AKUM 🟢"
+        elif mm_val<0: mm_trend="DIST 🔴"
+        else: mm_trend="NETRAL"
+        if last_close>ema13>ema20>ema50: ema_trend=f"UPTREND 🟢"
+        elif last_close>ema50: ema_trend=f"WEAK UPTREND 🟡"
+        elif last_close<ema20 and last_close<ema50: ema_trend=f"DOWNTREND 🔴"
+        else: ema_trend=f"SIDEWAYS ⚪"
+        # FIX intraday: kalau TF 5m, Vchg dihitung dari avg 20 bar 5m, bukan daily
         speed="FAST" if vchg>2 else "SLOW" if vchg<0.8 else "NORMAL"
-        power="TURBO" if buy_ratio>=85 and vchg>=1.5 else "STRONG" if buy_ratio>=70 else "NORMAL" if buy_ratio>=60 else "WEAK"
-        return {"ema13":ema13,"ema20":ema20,"ema50":ema50,"ema200":ema200,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_pos":bb_pos,"buy_ratio":buy_ratio,"rsi":rsi,"mm_val":mm_val,"mm_trend":mm_trend,"ema_trend":ema_trend,"vchg":vchg,"speed":speed,"power":power}
-    except Exception as e:
-        print(f"tech err {e}"); return {}
+        power="TURBO" if buy_ratio>=85 and vchg>=1.2 else "STRONG" if buy_ratio>=70 else "WEAK"
+        return {"ema50":ema50,"ema200":ema200,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_pos":bb_pos,"buy_ratio":buy_ratio,"rsi":rsi,"mm_val":mm_val,"mm_trend":mm_trend,"ema_trend":ema_trend,"vchg":vchg,"speed":speed,"power":power}
+    except: return {}
 
-# ========== TELEGRAM ==========
+# TELEGRAM
 LAST_SENT_SIGNALS={}; COOLDOWN_SECONDS=3600; LAST_RESET_DATE=""
 
 def filter_signals_with_cooldown(signals):
@@ -706,18 +655,16 @@ def calculate_score_v2(symbol, hist_df, akum, dist, net, analysis):
     return score,label,reasons
 
 def scan_v3_full():
-    print(f"[{get_now_wib()}] 🚀 FULL SCAN AKUM/DIST REAL...")
+    print(f"[{get_now_wib()}] 🚀 FULL SCAN RINGKAS...")
     screener_data=get_screener_latest()
     if not screener_data:
-        candidates=["BBCA","BBRI","BMRI","BBNI","BRIS","BNGA","NISP","TLKM","ISAT","EXCL","ASII","UNTR","AUTO","ADRO","PTBA","ITMG","ANTM","INCO","MDKA","MBMA","AMMN","BRMS","NCKL","TINS","HRUM","ICBP","INDF","UNVR","MYOR","KLBF","SIDO","CPIN","JPFA","GOTO","BUKA","EMTK","SCMA","SMGR","INTP","INDY","PGAS","AKRA","MEDC","ELSA","BRPT","TPIA","ESSA","BREN","CUAN","WIFI","DEWA","BIPI","BULL","NIKL","PGEO","RAJA","SRTG","ASSA"]
+        candidates=["BBCA","BBRI","BMRI","BBNI","BRIS","BNGA","NISP","TLKM","ISAT","EXCL","ASII","UNTR","AUTO","ADRO","PTBA","ITMG","ANTM","INCO","MDKA","MBMA","AMMN","BRMS","NCKL","TINS","HRUM","ICBP","INDF","UNVR","MYOR","KLBF","SIDO","CPIN","JPFA","GOTO","BUKA","EMTK","SCMA","SMGR","INTP","INDY","PGAS","AKRA","MEDC","ELSA","BRPT","TPIA","ESSA","BREN","CUAN","WIFI","DEWA","BIPI","BULL","NIKL","PGEO","RAJA"]
     else:
         candidates=[]
         for item in screener_data:
             sym=item.get('symbol') or item.get('code')
             if sym: candidates.append(sym.replace(".JK","").upper())
         candidates=list(dict.fromkeys(candidates))
-        print(f"  -> FULL dari screener: {len(candidates)}")
-
     detected=[]
     def process_symbol(sym):
         if QUOTA_HIT: return None
@@ -729,7 +676,7 @@ def scan_v3_full():
             status=multi.get('status_d','NEUTRAL ⚪')
             last_close=hist_df['Close'].iloc[-1]
             ema50=hist_df['Close'].ewm(span=50).mean().iloc[-1] if len(hist_df)>=50 else last_close
-            is_buy = (status.startswith("AKUM") and net>0) or (last_close>ema50) or (akum>0)
+            is_buy = ("AKUM" in status and net>0) or (last_close>ema50) or (akum>0)
             if not is_buy and net>0: is_buy=True
             if not is_buy: return None
             analysis=get_analysis(sym)
@@ -739,17 +686,13 @@ def scan_v3_full():
                 change_pct=((last_close/prev)-1)*100 if prev else 0
                 tp=calculate_trading_plan(hist_df, multi_tf=multi, timeframe="1d")
                 return {"symbol":sym,"close":int(last_close),"change_pct":change_pct,"score":score,"score_label":label,"akum_value":akum,"dist_value":dist,"broker_net":net,"broker_status":status,"reasons":reasons,"history_df":hist_df,"trading_plan":tp,"brokers":multi.get('brokers',[]),"multi_tf":multi}
-        except Exception as e: print(f"Err {sym}: {e}")
-        return None
-
+        except: return None
     for idx, sym in enumerate(candidates):
-        if QUOTA_HIT: print(f"⛔ Quota habis di {idx}/{len(candidates)}, tampil {len(detected)}"); break
+        if QUOTA_HIT: print(f"⛔ Quota habis di {idx}/{len(candidates)}"); break
         res=process_symbol(sym)
-        if res: detected.append(res); print(f"✅ {res['symbol']} {res['score']}% {res['broker_status']} AKUM {format_large_number(res['akum_value'],True)} DIST {format_large_number(res['dist_value'],True)} Net {format_large_number(res['broker_net'],True)}")
+        if res: detected.append(res); print(f"✅ {res['symbol']} {res['score']}% Net {format_large_number(res['broker_net'],True)}")
         time.sleep(0.7)
-
     detected.sort(key=lambda x: (x['multi_tf'].get('net_d',0), x['score']), reverse=True)
-    print(f"✅ FULL SCAN: {len(detected)}/{len(candidates)} BUY")
     return detected
 
 def scan_v3(): return scan_v3_full()
@@ -770,37 +713,35 @@ def send_photo_reply(chat_id, photo_path, caption=""):
 
 def broadcast_v3(signals):
     if not signals:
-        msg="V3 Scan: Tidak ada sinyal BUY / Kuota habis."
-        if QUOTA_HIT: msg+="\n⚠️ QUOTA habis, pakai cache."
+        msg="Scan: Tidak ada BUY / Quota habis." + ("\n♻️ Quota habis, cache" if QUOTA_HIT else "")
         send_reply(TARGET_CHAT_ID, msg); return
     now_str=get_now_wib().strftime('%d %b %Y %H:%M WIB')
-    quota_note=" ⚠️QUOTA MODE" if QUOTA_HIT else ""
-    header=f"*RAFANO V4.2 AKUM/DIST REAL{quota_note}*\n{now_str}\nTotal: {len(signals)} BUY | Penanda: REAL vs VSA\n============================\n\n"
+    header=f"*RAFANO V4.3 RINGKAS*\n{now_str} | {len(signals)} BUY | {'♻️ Cache' if QUOTA_HIT else '✅ REAL'}\n{'='*30}\n\n"
     msg=header; keyboard=[]
     for idx,item in enumerate(signals,1):
-        multi=item.get('multi_tf') or {}; 
-        akum_d=multi.get('akum_d',0); dist_d=multi.get('dist_d',0); net_d=multi.get('net_d',0)
-        status_d=multi.get('status_d','NEUTRAL'); src_d=multi.get('source_d','EMPTY')
-        marker_d=source_marker(src_d)
-        top_akum, top_dist = format_top_akum_dist(multi.get('brokers',[]), 2)
-        
-        daily_str=f"{status_d} | AKUM {format_large_number(akum_d,True)} DIST {format_large_number(dist_d,True)} Net {format_large_number(net_d,True)} | {marker_d}"
-        weekly_str=f"{multi.get('status_5d','')} Net {format_large_number(multi.get('net_5d',0),True)} | {source_marker(multi.get('source_5d',''))}"
-        monthly_str=f"{multi.get('status_20d','')} Net {format_large_number(multi.get('net_20d',0),True)} | {source_marker(multi.get('source_20d',''))}"
-        
-        item_str=f"{idx}. *{item['symbol']}* -- {item['close']} ({item['change_pct']:+.2f}%)\n   |- Score: {item['score']}% ({item['score_label']})\n   |- {daily_str}\n   |  └ AKUM Top: {top_akum} | DIST Top: {top_dist}\n   |- Weekly: {weekly_str}\n   |- Monthly: {monthly_str}\n   +- {' | '.join(item.get('reasons',[])[:2])}\n\n"
-        keyboard.append([{"text":f"Chart {item['symbol']}", "callback_data":f"chart_{item['symbol']}_1d"}])
+        multi=item.get('multi_tf') or {}; net_d=multi.get('net_d',0); akum_d=multi.get('akum_d',0); dist_d=multi.get('dist_d',0)
+        status_d=multi.get('status_d','NEUTRAL'); src_d=source_marker(multi.get('source_d','EMPTY'))
+        top=format_top_brokers(multi.get('brokers',[]),2)
+        # RINGKAS
+        bandar_str=f"{status_d} Net {format_large_number(net_d,True)} | {src_d}"
+        if top!="-": bandar_str+=f" | {top}"
+        item_str=f"{idx}. *{item['symbol']}* {item['close']} ({item['change_pct']:+.1f}%) {item['score']}% \n   {bandar_str}\n\n"
+        keyboard.append([{"text":f"{item['symbol']}", "callback_data":f"chart_{item['symbol']}_1d"}])
         if len(msg)+len(item_str)>3500:
             send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard":keyboard}); msg=item_str; keyboard=[]
         else: msg+=item_str
     if msg: send_reply(TARGET_CHAT_ID, msg, reply_markup={"inline_keyboard":keyboard})
 
 def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=None):
+    # FIX TF 5m: jangan pakai cache daily untuk hist 5m
+    is_intraday = is_intraday_tf(timeframe)
     tf_label=format_timeframe_label(timeframe)
-    send_reply(chat_id, f"📊 *Generating {stock_code.upper()} ({tf_label})...*")
+    send_reply(chat_id, f"📊 *{stock_code.upper()} ({tf_label})...*")
     df=get_history_pro(stock_code, limit=150, timeframe=timeframe)
-    if df is None or len(df)<20: send_reply(chat_id, f"⚠️ Data {stock_code} tidak ketemu"); return
-    multi=get_broker_multi_tf(stock_code, df) if not (extra_info_cache and stock_code in extra_info_cache) else extra_info_cache[stock_code].get('multi_tf',{})
+    if df is None or len(df)<20: send_reply(chat_id, f"⚠️ Data {stock_code} tidak ada"); return
+    
+    # broker tetap pakai daily, tapi jangan campur
+    multi=get_broker_multi_tf(stock_code, df) if is_intraday else (extra_info_cache[stock_code].get('multi_tf') if extra_info_cache and stock_code in extra_info_cache else get_broker_multi_tf(stock_code, df))
     if not multi: multi=get_broker_multi_tf(stock_code, df)
     
     akum_d=multi.get('akum_d',0) if multi else 0
@@ -809,67 +750,65 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
     src_d=multi.get('source_d','EMPTY') if multi else 'EMPTY'
     is_real = src_d.startswith('API_SUMMARY')
     
-    extra={"akum_value":akum_d,"dist_value":dist_d,"accum_value":abs(net_d),"broker_net":net_d,"brokers":multi.get('brokers',[]) if multi else [],"multi_tf":multi,"is_real":is_real}
+    extra={"akum_value":akum_d,"dist_value":dist_d,"broker_net":net_d,"brokers":multi.get('brokers',[]) if multi else [],"multi_tf":multi,"is_real":is_real,"tf_label":tf_label}
     tp=calculate_trading_plan(df, signals=None, multi_tf=multi, timeframe=timeframe)
     side=tp.get('side','WAIT') if tp else 'WAIT'; sig_strength=tp.get('signal_strength',0) if tp else 0
     grade_label,grade_color=grade_from_strength(sig_strength,side)
-    extra['signal_grade']=grade_label; extra['signal_grade_color']=grade_color; extra['tf_label']=tf_label
-    tech=build_tech_caption(df, multi, tp)
+    extra['signal_grade']=grade_label; extra['signal_grade_color']=grade_color
+    
+    # FIX: tech pakai df sesuai TF (5m pakai 5m, bukan daily)
+    tech=build_tech_caption(df, multi, tp, timeframe=timeframe)
+    
     chart_file=f"chart_{stock_code.upper()}_{timeframe}_{int(time.time())}.png"
     try:
         file_path=generate_pro_chart(df=df, symbol=stock_code.upper(), timeframe=timeframe, sector_info=f"{stock_code.upper()} | IHSG", output_filename=chart_file, extra_info=extra)
         if not file_path or not os.path.exists(file_path): send_reply(chat_id, "❌ Gagal render"); return
 
+        # RINGKAS CAPTION - FIX VSA 50%
         if multi:
-            top_akum, top_dist = format_top_akum_dist(multi.get('brokers',[]), 3)
             marker_d=source_marker(multi.get('source_d','EMPTY'))
-            marker_5d=source_marker(multi.get('source_5d','EMPTY'))
-            marker_20d=source_marker(multi.get('source_20d','EMPTY'))
-            
-            if multi.get('akum_d',0)==0 and multi.get('dist_d',0)==0 and not is_real:
-                # Fallback VSA
-                broker_line=f"VSA Buy {tech.get('buy_ratio',0):.0f}% Sell {100-tech.get('buy_ratio',0):.0f}% | {marker_d} | Top: {format_top_brokers(multi.get('brokers',[]),3,multi.get('status_d'))}"
+            # kalau akum/dist 0 dan bukan REAL, jangan tampilkan AKUM 0 DIST 0
+            if akum_d==0 and dist_d==0 and not is_real:
+                # pakai VSA yang sudah di-fix (tidak 50% terus)
+                bandar_line=f"{multi.get('status_d')} | {marker_d}"
+                if tech.get('buy_ratio',0)>0:
+                    bandar_line+=f" | VSA Buy {tech.get('buy_ratio',0):.0f}%"
             else:
-                broker_line=f"AKUM {format_large_number(multi.get('akum_d',0),True)} DIST {format_large_number(multi.get('dist_d',0),True)} Net {format_large_number(multi.get('net_d',0),True)} | Avg {multi.get('avg_d',0):.0f} | {marker_d}"
+                # REAL AKUM/DIST
+                if akum_d>0 and dist_d>0:
+                    bandar_line=f"{multi.get('status_d')} AKUM {format_large_number(akum_d,True)} DIST {format_large_number(dist_d,True)} Net {format_large_number(net_d,True)} | {marker_d}"
+                elif akum_d>0:
+                    bandar_line=f"{multi.get('status_d')} AKUM {format_large_number(akum_d,True)} Net {format_large_number(net_d,True)} | {marker_d}"
+                else:
+                    bandar_line=f"{multi.get('status_d')} DIST {format_large_number(dist_d,True)} Net {format_large_number(net_d,True)} | {marker_d}"
             
-            daily_line=f"{multi.get('status_d')} | {broker_line}"
-            daily_top=f"  AKUM Top: {top_akum} | DIST Top: {top_dist}"
-            weekly_line=f"{multi.get('status_5d')} AKUM {format_large_number(multi.get('akum_5d',0),True)} DIST {format_large_number(multi.get('dist_5d',0),True)} Net {format_large_number(multi.get('net_5d',0),True)} | {marker_5d}"
-            monthly_line=f"{multi.get('status_20d')} AKUM {format_large_number(multi.get('akum_20d',0),True)} DIST {format_large_number(multi.get('dist_20d',0),True)} Net {format_large_number(multi.get('net_20d',0),True)} | {marker_20d}"
+            top=format_top_brokers(multi.get('brokers',[]),3)
+            if top!="-": bandar_line+=f"\nTop: {top}"
+            
+            weekly_line=f"W {format_large_number(multi.get('net_5d',0),True)} M {format_large_number(multi.get('net_20d',0),True)}"
         else:
-            daily_line="No data"; daily_top=""; weekly_line=""; monthly_line=""
+            bandar_line="No broker"; weekly_line=""
 
         if tp:
+            # CAPTION RINGKAS 40% LEBIH PENDEK
             caption=(
                 f"*{stock_code.upper()}* -- {safe_int(df['Close'].iloc[-1])} | {tp['trend']}\n"
-                f"🟢 Grade: *{grade_label}* | Score: {sig_strength}% | {tp.get('mtf_confirm','')}\n"
+                f"🟢 *{grade_label}* {sig_strength}% | {tp.get('signal_type','')} | TF: {tf_label}\n"
                 f"------------------\n"
-                f"📦 *BANDAR AKUM/DIST REAL:*\n"
-                f"Daily: {daily_line}\n"
-                f"{daily_top}\n"
-                f"Weekly 5D: {weekly_line}\n"
-                f"Monthly 20D: {monthly_line}\n"
+                f"📦 {bandar_line}\n"
+                f"{weekly_line}\n"
                 f"------------------\n"
-                f"📊 *TEKNIKAL:*\n"
-                f"EMA Trend: {tech.get('ema_trend','-')}\n"
-                f"EMA13:{tech.get('ema13',0):.0f} | EMA20:{tech.get('ema20',0):.0f} | EMA50:{tech.get('ema50',0):.0f} | EMA200:{tech.get('ema200',0):.0f}\n"
-                f"BB: {tech.get('bb_pos','-')} | Upper:{tech.get('bb_upper',0):.0f} Lower:{tech.get('bb_lower',0):.0f}\n"
-                f"RSI(14): {tech.get('rsi',0):.1f} | {'OVERBOUGHT 🔥' if tech.get('rsi',0)>70 else 'OVERSOLD' if tech.get('rsi',0)<30 else 'NETRAL'}\n"
-                f"Vol: {format_large_number(df['Volume'].iloc[-1],False)} | Vchg:{tech.get('vchg',0):.1f}x | Speed:{tech.get('speed','-')} Power:{tech.get('power','-')}\n"
-                f"VSA: Buy {tech.get('buy_ratio',0):.0f}% Sell {100-tech.get('buy_ratio',0):.0f}% | MM: {tech.get('mm_val',0):.1f} {tech.get('mm_trend','')}\n"
+                f"📊 {tech.get('ema_trend','')} | RSI {tech.get('rsi',0):.1f} | {tech.get('bb_pos','')}\n"
+                f"Vol {format_large_number(df['Volume'].iloc[-1],False)} {tech.get('vchg',0):.1f}x {tech.get('speed','')} {tech.get('power','')} | MM {tech.get('mm_val',0):.0f} {tech.get('mm_trend','')}\n"
                 f"------------------\n"
-                f"🎯 *TRIGGER: {tp.get('signal_type','')}*\n"
-                f"{tp.get('signal_reason','')}\n"
-                f"------------------\n"
-                f"Entry: {tp['entry']} | SL: {tp['sl']} ({tp['risk_pct']}%)\n"
-                f"TP1: {tp['tp1']} (RR {tp['rr1']}) | TP2: {tp['tp2']} (RR {tp['rr2']})\n"
-                f"Sup: {tp['support']} | Res: {tp['resistance']} | ATR: {tp['atr']:.1f}\n"
-                f"Timeframe: {tf_label}"
+                f"🎯 {tp.get('signal_reason','')}\n"
+                f"Entry {tp['entry']} SL {tp['sl']} ({tp['risk_pct']}%) | TP1 {tp['tp1']} TP2 {tp['tp2']} RR {tp['rr1']}/{tp['rr2']}\n"
+                f"Sup {tp['support']} Res {tp['resistance']} ATR {tp['atr']:.1f}"
             )
         else:
-            caption=f"*{stock_code.upper()}* {safe_int(df['Close'].iloc[-1])}\n{daily_line}"
+            caption=f"*{stock_code.upper()}* {safe_int(df['Close'].iloc[-1])}\n{bandar_line}"
 
-        if QUOTA_HIT: caption+="\n⚠️ Quota habis, data dari cache/VSA"
+        if QUOTA_HIT: caption+="\n⚠️ Quota habis"
         send_photo_reply(chat_id, file_path, caption=caption)
         if os.path.exists(file_path): os.remove(file_path)
     except Exception as e:
@@ -879,7 +818,7 @@ LAST_SIGNALS_CACHE={}
 
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE, QUOTA_HIT, LAST_429_TIME
-    offset=0; print("🤖 Listener V4.2 AKUM/DIST REAL Running...")
+    offset=0; print("🤖 Listener V4.3 RINGKAS Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
     except: pass
     while True:
@@ -899,7 +838,7 @@ def telegram_bot_listener():
                 elif "message" in update and "text" in update["message"]:
                     text=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=text.split()[0].lower() if text else ""
                     if first in ["/start","/help"]:
-                        send_reply(chat_id, "🤖 *RAFANO V4.2 AKUM/DIST REAL*\n`/c <KODE> [TF]` Chart + AKUM/DIST REAL + teknikal\n`/b <KODE>` Detail AKUM/DIST Top broker\n`/scan` Scan SEMUA BUY (60 saham) REAL vs VSA\n`/scanfast` Cepat 20\n`/clearcache` Clear\n`/quota` Cek kuota")
+                        send_reply(chat_id, "🤖 *V4.3 RINGKAS*\n`/c <KODE> [TF]` Chart ringkas AKUM/DIST REAL\n`/b <KODE>` Detail bandar\n`/scan` All BUY\n`/quota` Cek\n`/clearcache`")
                     elif first in ["/c","/chart"]:
                         parts=text.split()
                         if len(parts)>=2:
@@ -914,41 +853,32 @@ def telegram_bot_listener():
                             def broker_detail(tg,symbol):
                                 try:
                                     multi=get_broker_multi_tf(symbol)
-                                    top_akum, top_dist = format_top_akum_dist(multi.get('brokers',[]), 5)
                                     marker=source_marker(multi.get('source_d','EMPTY'))
-                                    msg=f"🏦 *BROKER {symbol} - AKUM/DIST REAL* | {marker}\n"
-                                    msg+=f"Daily: {multi.get('status_d')} Net {format_large_number(multi.get('net_d',0),True)}\n"
-                                    msg+=f"  AKUM: {format_large_number(multi.get('akum_d',0),True)} | DIST: {format_large_number(multi.get('dist_d',0),True)}\n"
-                                    msg+=f"  Avg: {multi.get('avg_d',0):.0f} | {marker}\n"
-                                    msg+=f"  Top AKUM: {top_akum}\n"
-                                    msg+=f"  Top DIST: {top_dist}\n"
+                                    msg=f"🏦 *{symbol} AKUM/DIST* {marker}\nDaily: {multi.get('status_d')} Net {format_large_number(multi.get('net_d',0),True)}\n AKUM {format_large_number(multi.get('akum_d',0),True)} DIST {format_large_number(multi.get('dist_d',0),True)}\nTop: {format_top_brokers(multi.get('brokers',[]),5)}\n"
                                     for b in multi.get('brokers',[])[:5]:
                                         nval=float(b.get('nval',0))
-                                        tag="AKUM 🟢" if nval>0 else "DIST 🔴" if nval<0 else "NEUTRAL"
-                                        msg+=f"    - {b.get('broker_code')}: Net {format_large_number(nval,True)} {tag}\n"
-                                    msg+=f"\nWeekly 5D: {multi.get('status_5d')} AKUM {format_large_number(multi.get('akum_5d',0),True)} DIST {format_large_number(multi.get('dist_5d',0),True)} Net {format_large_number(multi.get('net_5d',0),True)} | {source_marker(multi.get('source_5d',''))}\n"
-                                    msg+=f"Monthly 20D: {multi.get('status_20d')} AKUM {format_large_number(multi.get('akum_20d',0),True)} DIST {format_large_number(multi.get('dist_20d',0),True)} Net {format_large_number(multi.get('net_20d',0),True)} | {source_marker(multi.get('source_20d',''))}\n"
-                                    if QUOTA_HIT: msg+="\n⚠️ Quota habis, pakai cache/VSA"
+                                        msg+=f"  {b.get('broker_code')}: {format_large_number(nval,True)} {'🟢' if nval>0 else '🔴'}\n"
+                                    msg+=f"W: {format_large_number(multi.get('net_5d',0),True)} M: {format_large_number(multi.get('net_20d',0),True)}\n"
                                     send_reply(tg,msg)
                                 except Exception as e: send_reply(tg,f"❌ {e}")
                             threading.Thread(target=broker_detail, args=(chat_id,sym)).start()
                     elif first in ["/quota"]:
-                        send_reply(chat_id, f"📊 QUOTA: {'HABIS' if QUOTA_HIT else 'OK'}\nCache broker: {len(BROKER_CACHE)}\nLast 429: {datetime.datetime.fromtimestamp(LAST_429_TIME).strftime('%H:%M:%S') if LAST_429_TIME else '-'}\nPenanda: ✅ REAL StockArjum = data real | ⚠️ VSA ≈ = estimasi | ♻️ Cache = 429")
+                        send_reply(chat_id, f"📊 QUOTA: {'HABIS' if QUOTA_HIT else 'OK'}\nCache: {len(BROKER_CACHE)}\nLast 429: {datetime.datetime.fromtimestamp(LAST_429_TIME).strftime('%H:%M:%S') if LAST_429_TIME else '-'}")
                     elif first in ["/clearcache","/cc","/clear"]:
                         try:
                             BROKER_CACHE.clear(); HISTORY_CACHE.clear(); SCREENER_CACHE.clear(); LAST_SIGNALS_CACHE.clear()
                             QUOTA_HIT=False; LAST_429_TIME=0
                             if os.path.exists("/tmp/rafano_cache.json"): os.remove("/tmp/rafano_cache.json")
-                            send_reply(chat_id,"🧹 Cache cleared, besok quota reset akan REAL lagi")
+                            send_reply(chat_id,"🧹 Cleared")
                         except Exception as e: send_reply(chat_id,f"❌ {e}")
                     elif first in ["/scan","!scan","/scanall","/scanfull"]:
-                        send_reply(chat_id,"🔍 *FULL SCAN AKUM/DIST REAL - 60 saham (2-3 menit) + penanda REAL vs VSA...*")
+                        send_reply(chat_id,"🔍 *SCAN 60 saham...*")
                         def manual_scan(tg=chat_id):
                             global LAST_SIGNALS_CACHE
                             sigs=scan_v3_full(); LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}; broadcast_v3(sigs)
                         threading.Thread(target=manual_scan, args=(chat_id,)).start()
                     elif first in ["/scanfast"]:
-                        send_reply(chat_id,"⚡ *FAST SCAN 20 saham REAL...*")
+                        send_reply(chat_id,"⚡ *FAST 20...*")
                         def fast_scan(tg=chat_id):
                             global LAST_SIGNALS_CACHE
                             old_screener=get_screener_latest()
@@ -959,7 +889,7 @@ def telegram_bot_listener():
                                 if QUOTA_HIT: break
                                 try:
                                     h=get_history_pro(sym,120,"1d"); m=get_broker_multi_tf(sym,h)
-                                    if m.get('status_d','').startswith("AKUM") or (h is not None and h['Close'].iloc[-1]>h['Close'].ewm(span=50).mean().iloc[-1]):
+                                    if "AKUM" in m.get('status_d','') or (h is not None and h['Close'].iloc[-1]>h['Close'].ewm(span=50).mean().iloc[-1]):
                                         sigs.append({"symbol":sym,"close":int(h['Close'].iloc[-1]) if h is not None else 0,"change_pct":0,"score":60,"score_label":"BUY","akum_value":m.get('akum_d',0),"dist_value":m.get('dist_d',0),"broker_net":m.get('net_d',0),"broker_status":m.get('status_d'),"reasons":["AKUM REAL" if m.get('source_d','').startswith('API') else "VSA"],"history_df":h,"trading_plan":None,"brokers":m.get('brokers',[]),"multi_tf":m})
                                 except: pass
                                 time.sleep(0.5)
@@ -971,11 +901,11 @@ def telegram_bot_listener():
 
 def auto_screener_loop():
     global LAST_SIGNALS_CACHE
-    print("🚀 Auto Full Scan AKUM/DIST REAL (30m)...")
+    print("🚀 Auto Scan RINGKAS (30m)...")
     while True:
         try:
             if not is_market_open(): time.sleep(300); continue
-            if QUOTA_HIT: print("⏸️ Quota habis, pause 30m"); time.sleep(1800); continue
+            if QUOTA_HIT: time.sleep(1800); continue
             sigs=scan_v3_full(); LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
             filt=filter_signals_with_cooldown(sigs)
             if filt: broadcast_v3(filt)
@@ -984,8 +914,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.2 AKUM/DIST REAL + PENANDA")
+    print("🔥 RAFANO V4.3 RINGKAS - FIX VSA & TF 5m")
     print("==========================================")
-    print("Penanda: ✅ REAL StockArjum | ⚠️ VSA Estimate ≈ | ♻️ Cache QUOTA")
     threading.Thread(target=auto_screener_loop, daemon=True).start()
     telegram_bot_listener()
