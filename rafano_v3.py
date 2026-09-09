@@ -345,9 +345,9 @@ def get_broker_multi_tf(sym,hist_df=None):
     import time as _t
     ad,dd,nd,sd,bd,sr=get_broker_summary(sym)
     _t.sleep(0.4)
-    a5,d5,n5,s5,b5,sr5=get_broker_summary(sym,date_from=d5,date_to=today)
+    a5,d5,n5,s5,b5,sr5=get_broker_summary(sym,df_from=d5,df_to=today)
     _t.sleep(0.4)
-    a20,d20,n20,s20,b20,sr20=get_broker_summary(sym,date_from=d20,date_to=today)
+    a20,d20,n20,s20,b20,sr20=get_broker_summary(sym,df_from=d20,df_to=today)
     res={"akum_d":float(ad),"dist_d":float(dd),"net_d":float(nd),"akum_5d":float(a5),"dist_5d":float(d5),"net_5d":float(n5),"akum_20d":float(a20),"dist_20d":float(d20),"net_20d":float(n20),"avg_d":float(calculate_bandars_avg(bd,hist_df,1)),"source_d":sr,"source_5d":sr5,"source_20d":sr20,"brokers":bd,"brokers_5d":b5,"brokers_20d":b20,"status_d":sd,"status_5d":s5,"status_20d":s20}
     if not (ad==0 and dd==0 and len(bd)==0 and nd==0):
         set_cached_broker(ck,res)
@@ -700,6 +700,7 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False):
             print(f"vol {sym} err {e}")
             return None
     
+    print(f"📋 Scan {len(candidates)} saham: {candidates[:10]} ...")
     for sym in candidates:
         r=process_vol(sym)
         if r:
@@ -890,7 +891,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.3.4 VOL SPIKE + AKUM REAL Running...")
+    offset=0; print("🤖 V4.3.7 FULL UNIVERSE VOL SPIKE Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1017,7 +1018,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.3.6 VOL AKUM LOOSE + VSA")
+    print("🔥 RAFANO V4.3.7 FULL 150 SAHAM + VOL AKUM")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
