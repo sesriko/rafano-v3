@@ -878,7 +878,7 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
 LAST_SIGNALS_CACHE={}
 
 def telegram_bot_listener():
-    global LAST_SIGNALS_CACHE
+    global LAST_SIGNALS_CACHE, QUOTA_HIT, LAST_429_TIME
     offset=0; print("🤖 Listener V4.2 AKUM/DIST REAL Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=10)
     except: pass
@@ -937,7 +937,7 @@ def telegram_bot_listener():
                     elif first in ["/clearcache","/cc","/clear"]:
                         try:
                             BROKER_CACHE.clear(); HISTORY_CACHE.clear(); SCREENER_CACHE.clear(); LAST_SIGNALS_CACHE.clear()
-                            global QUOTA_HIT; QUOTA_HIT=False
+                            QUOTA_HIT=False; LAST_429_TIME=0
                             if os.path.exists("/tmp/rafano_cache.json"): os.remove("/tmp/rafano_cache.json")
                             send_reply(chat_id,"🧹 Cache cleared, besok quota reset akan REAL lagi")
                         except Exception as e: send_reply(chat_id,f"❌ {e}")
