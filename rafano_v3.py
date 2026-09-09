@@ -797,11 +797,13 @@ def send_reply(cid,txt,rm=None):
     if rm: pl["reply_markup"]=rm
     try: requests.post(url,json=pl,timeout=15)
     except: pass
-def send_photo_reply(cid,pp,cap=""):
+def send_photo_reply(cid,pp,cap="", caption=None):
+    # support both cap and caption kwarg
+    final_cap = caption if caption is not None else cap
     url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
         with open(pp,'rb') as ph:
-            requests.post(url,data={'chat_id':cid,'caption':cap,'parse_mode':'Markdown'},files={'photo':ph},timeout=30)
+            requests.post(url,data={'chat_id':cid,'caption':final_cap,'parse_mode':'Markdown'},files={'photo':ph},timeout=30)
     except Exception as e: print(f"Photo err {e}")
 
 def broadcast_v3(signals):
@@ -893,7 +895,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
             caption=f"*{code.upper()}* {safe_int(df['Close'].iloc[-1])}\n{bl}"
         
         if QUOTA_HIT: caption+="\n⚠️ Quota habis - VSA mode"
-        send_photo_reply(cid,fp,caption=caption)
+        send_photo_reply(cid,fp,cap=caption)
         if os.path.exists(fp): os.remove(fp)
     except Exception as e:
         import traceback; traceback.print_exc(); send_reply(cid,f"❌ {e}")
