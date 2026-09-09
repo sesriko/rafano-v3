@@ -851,17 +851,28 @@ def get_broker_accumulation(symbol, top=3, days=None):
                 if not is_timeline_format:
                     accum_total += abs(float(nval))
 
-        if not raw_brokers and top_sellers:
+        # FIX: dulu blok ini hanya jalan kalau raw_brokers masih kosong (top_buyers gagal),
+        # akibatnya sisi jual/distribusi TIDAK PERNAH ikut terhitung selama top_buyers ada isi.
+        # Sekarang top_sellers SELALU digabung supaya distribusi ikut terhitung.
+        if top_sellers:
+            existing_codes = {b.get('broker_code') for b in raw_brokers}
             for b in top_sellers[:20]:
                 if not isinstance(b, dict):
                     continue
-                code = b.get('broker_code') or '??'
-                nval = b.get('nval') or b.get('net_val') or 0
-                bval = b.get('bval') or 0
-                sval = b.get('sval') or abs(float(nval)) if float(nval or 0)<0 else 0
+                code = str(b.get('broker_code') or '??').upper()
+                nval = b.get('nval') or b.get('net_val') or b.get('net_value') or 0
+                bval = b.get('bval') or b.get('buy_value') or (float(nval) if float(nval or 0)>0 else 0)
+                sval = b.get('sval') or b.get('sell_value') or (abs(float(nval)) if float(nval or 0)<0 else 0)
+                if code in existing_codes:
+                    # broker ini sudah ada dari top_buyers (mis. tercatat net beli di satu sisi) - gabungkan sisi jualnya
+                    for eb in raw_brokers:
+                        if eb.get('broker_code') == code:
+                            eb['sell_value'] = float(eb.get('sell_value', 0) or 0) + float(sval)
+                            break
+                    continue
                 raw_brokers.append({
-                    "broker_code": str(code).upper(),
-                    "broker": str(code).upper(),
+                    "broker_code": code,
+                    "broker": code,
                     "buy_value": float(bval),
                     "sell_value": float(sval),
                     "buy_volume": 0,
@@ -910,7 +921,29 @@ def get_broker_accumulation(symbol, top=3, days=None):
     return 0.0, []
 
 
-def get_broker_summary(symbol):
+def get_broker_summary(symbol, date_from=None, date_to=None):
+    """
+    date_from/date_to: object date/datetime atau string. Kalau diisi, broker-summary
+    diambil untuk RENTANG TANGGAL tsb (persis seperti fitur "Dari...Sampai" di web
+    Arjum) - ini yang dipakai untuk breakdown Weekly/Monthly yang REAL, bukan snapshot
+    1 hari yang di-estimasi.
+    """
+    date_params = {}
+    if date_from is not None and date_to is not None:
+        def _fmt(d):
+            if hasattr(d, 'strftime'):
+                return d.strftime('%d/%m/%Y')
+            return str(d)
+        df_str, dt_str = _fmt(date_from), _fmt(date_to)
+        # Nama parameter API tidak diketahui pasti - kirim beberapa kemungkinan sekaligus,
+        # parameter yang tidak dikenali server biasanya diabaikan sehingga aman dikirim semua.
+        date_params = {
+            "from": df_str, "to": dt_str,
+            "date_from": df_str, "date_to": dt_str,
+            "start_date": df_str, "end_date": dt_str,
+            "dari": df_str, "sampai": dt_str,
+        }
+
     data = None
     used_params = None
     for p in [
@@ -920,6 +953,7 @@ def get_broker_summary(symbol):
         {"flow": "all"},
         {}
     ]:
+        p = {**p, **date_params}
         d = arjum_get(f"/broker-summary/{symbol}", params=p, use_cache=False)
         if d and isinstance(d, dict):
             test_list = d.get('brokers') or d.get('data') or []
@@ -1012,7 +1046,9 @@ def get_broker_summary(symbol):
                 net_value = buy_sum - sell_sum
                 if net_value==0 and buy_sum>0:
                     net_value = buy_sum * 0.8
-    if (net_value == 0 or not brokers):
+    if (net_value == 0 or not brokers) and not date_params:
+        # Fallback ke broker-accumulation HANYA untuk snapshot hari ini (tanpa date range),
+        # karena endpoint accumulation tidak reliable untuk rentang tanggal custom.
         try:
             acc_val, acc_brokers = get_broker_accumulation(symbol, top=5)
             if acc_val and acc_val != 0:
@@ -1070,11 +1106,13 @@ def calculate_bandars_avg(brokers, hist_df=None, period_days=None):
 
 def get_broker_multi_tf(symbol, hist_df=None):
     """
-    FIXED: Daily, Weekly(5D), Monthly(20D) sekarang REAL - masing2 diambil langsung
-    dari API broker-accumulation dengan parameter days berbeda (1/5/20), BUKAN
-    estimasi kali faktor tetap (1.8x/4.5x) seperti versi sebelumnya.
-    Status AKUM/DIST dihitung dari SEMUA broker yang dikembalikan API (bukan cuma top-3),
-    supaya distribusi ikut terhitung dengan benar, bukan cuma akumulasi.
+    FIXED v2: Daily, Weekly(5D), Monthly(20D) sekarang diambil dari broker-summary
+    dengan RENTANG TANGGAL eksplisit (persis seperti fitur "Dari...Sampai" di web
+    Arjum / Stockbit) - ini sumber data paling akurat untuk breakdown per-broker
+    per periode. broker-accumulation(days=X) dipakai sebagai fallback kedua, dan
+    VSA harga sebagai fallback terakhir kalau API benar2 tidak mengembalikan apa-apa.
+    Status AKUM/DIST dihitung dari SEMUA broker (bukan cuma top-3), supaya distribusi
+    ikut terhitung dengan benar.
     """
     cache_key = f"multi_{symbol}"
     cached = get_cached_broker(cache_key)
@@ -1088,13 +1126,46 @@ def get_broker_multi_tf(symbol, hist_df=None):
         except:
             return cached
 
+    def _trading_day_n_ago(n):
+        """Tanggal N hari BURSA (bukan kalender) ke belakang, dihitung dari hist_df kalau ada."""
+        try:
+            if hist_df is not None and len(hist_df) > n:
+                idx = hist_df.index[-(n+1)]
+                return idx.date() if hasattr(idx, 'date') else idx
+        except:
+            pass
+        # fallback kasar: kalender mundur ~1.45x (perkiraan proporsi hari bursa vs kalender)
+        return (get_now_wib() - datetime.timedelta(days=int(n*1.45)+1)).date()
+
+    today = get_now_wib().date()
+    if hist_df is not None and len(hist_df) > 0:
+        try:
+            last_idx = hist_df.index[-1]
+            today = last_idx.date() if hasattr(last_idx, 'date') else today
+        except:
+            pass
+    date_from_5d = _trading_day_n_ago(5)
+    date_from_20d = _trading_day_n_ago(20)
+
     # Snapshot hari berjalan (dari broker-summary, lebih presisi utk hari ini)
     net_d_summary, status_d_summary, brokers_net_d = get_broker_summary(symbol)
 
-    # REAL DATA: 3 panggilan terpisah dengan days berbeda -> BUKAN estimasi
+    # SUMBER UTAMA (real, ada date range): broker-summary dengan Dari/Sampai
+    net_5d_sum, status_5d_sum, brokers_5d_sum = get_broker_summary(symbol, date_from=date_from_5d, date_to=today)
+    net_20d_sum, status_20d_sum, brokers_20d_sum = get_broker_summary(symbol, date_from=date_from_20d, date_to=today)
+
+    # Fallback sekunder: broker-accumulation dengan parameter days
     accum_d, brokers_d = get_broker_accumulation(symbol, top=20, days=1)
-    accum_5d, brokers_5d = get_broker_accumulation(symbol, top=20, days=5)
-    accum_20d, brokers_20d = get_broker_accumulation(symbol, top=20, days=20)
+    accum_5d, brokers_5d_acc = get_broker_accumulation(symbol, top=20, days=5)
+    accum_20d, brokers_20d_acc = get_broker_accumulation(symbol, top=20, days=20)
+
+    # Prioritaskan hasil broker-summary date-range; kalau kosong, pakai hasil accumulation
+    brokers_5d = brokers_5d_sum if brokers_5d_sum else brokers_5d_acc
+    brokers_20d = brokers_20d_sum if brokers_20d_sum else brokers_20d_acc
+    if not accum_5d and net_5d_sum:
+        accum_5d = abs(net_5d_sum)
+    if not accum_20d and net_20d_sum:
+        accum_20d = abs(net_20d_sum)
 
     def calc_buy_sell_status(brokers_list):
         """Hitung dari SELURUH broker (bukan cuma top-3) supaya distribusi ikut kehitung."""
@@ -1120,10 +1191,39 @@ def get_broker_multi_tf(symbol, hist_df=None):
         status_d = "AKUM" if net_d > 0 else "DIST" if net_d < 0 else status_d
 
     buy_5d, sell_5d, net_5d, status_5d = calc_buy_sell_status(brokers_5d)
+    if net_5d_sum != 0:
+        net_5d = net_5d_sum
+        status_5d = "AKUM" if net_5d > 0 else "DIST" if net_5d < 0 else status_5d
     buy_20d, sell_20d, net_20d, status_20d = calc_buy_sell_status(brokers_20d)
+    if net_20d_sum != 0:
+        net_20d = net_20d_sum
+        status_20d = "AKUM" if net_20d > 0 else "DIST" if net_20d < 0 else status_20d
 
-    # Fallback ke VSA harga HANYA kalau API broker benar2 kosong (bukan estimasi kali faktor)
-    if not brokers_5d and hist_df is not None and len(hist_df) >= 5:
+    def _broker_signature(brokers_list):
+        """Tanda tangan ringkas dari daftar broker (code+buy+sell dibulatkan) untuk deteksi duplikasi."""
+        if not brokers_list:
+            return None
+        try:
+            return tuple(sorted(
+                (b.get('broker_code'), round(float(b.get('buy_value',0) or 0)), round(float(b.get('sell_value',0) or 0)))
+                for b in brokers_list
+            ))
+        except:
+            return None
+
+    sig_d = _broker_signature(brokers_d)
+    sig_5d = _broker_signature(brokers_5d)
+    sig_20d = _broker_signature(brokers_20d)
+
+    # FIX: untuk saham dengan histori broker terbatas di API, breakdown per-broker days=5/20
+    # kadang persis sama dengan days=1 (API tidak benar2 punya cukup histori untuk dibedakan).
+    # Kalau ketahuan identik, JANGAN tampilkan seolah itu breakdown segar - pakai VSA harga
+    # sebagai sumber Net/Status yang genuinely berbeda per periode, dan kosongkan daftar
+    # broker breakdown-nya (biar tampil "-" alih-alih duplikat yang menyesatkan).
+    dup_5d = (sig_5d is not None and sig_5d == sig_d)
+    dup_20d = (sig_20d is not None and sig_20d == sig_d)
+
+    if (not brokers_5d or dup_5d) and hist_df is not None and len(hist_df) >= 5:
         try:
             if 'Net_Val_VSA' not in hist_df.columns:
                 hist_df, _ = calculate_vsa_metrics(hist_df)
@@ -1132,9 +1232,11 @@ def get_broker_multi_tf(symbol, hist_df=None):
             status_5d = "AKUM" if vsa_5d > 0 else "DIST" if vsa_5d < 0 else "NEUTRAL"
             buy_5d = vsa_5d if vsa_5d > 0 else 0
             sell_5d = abs(vsa_5d) if vsa_5d < 0 else 0
+            if dup_5d:
+                brokers_5d = []  # breakdown broker per-periode tidak tersedia utk saham ini
         except:
             pass
-    if not brokers_20d and hist_df is not None and len(hist_df) >= 20:
+    if (not brokers_20d or dup_20d) and hist_df is not None and len(hist_df) >= 20:
         try:
             if 'Net_Val_VSA' not in hist_df.columns:
                 hist_df, _ = calculate_vsa_metrics(hist_df)
@@ -1143,6 +1245,8 @@ def get_broker_multi_tf(symbol, hist_df=None):
             status_20d = "AKUM" if vsa_20d > 0 else "DIST" if vsa_20d < 0 else "NEUTRAL"
             buy_20d = vsa_20d if vsa_20d > 0 else 0
             sell_20d = abs(vsa_20d) if vsa_20d < 0 else 0
+            if dup_20d:
+                brokers_20d = []
         except:
             pass
 
@@ -1169,8 +1273,10 @@ def get_broker_multi_tf(symbol, hist_df=None):
         "avg_5d": float(avg_5d),
         "avg_20d": float(avg_20d),
         "brokers": brokers_combined,
-        "brokers_5d": brokers_5d if brokers_5d else brokers_combined,
-        "brokers_20d": brokers_20d if brokers_20d else brokers_combined,
+        # NOTE: brokers_5d/20d sengaja dibiarkan kosong (bukan di-fallback ke brokers_combined)
+        # kalau breakdown per-periode terdeteksi duplikat dari Daily - lihat dup_5d/dup_20d di atas.
+        "brokers_5d": brokers_5d,
+        "brokers_20d": brokers_20d,
         "status": status_d,
         "status_d": status_d,
         "status_5d": status_5d,
@@ -1541,7 +1647,9 @@ def generate_pro_chart(df, symbol="BBCA", timeframe="1d", sector_info="IHSG", ou
             ax_main.plot([box_left, box_left], [y_low, y_high], color='white', linestyle='--', linewidth=0.6, alpha=0.6)
             ax_main.plot([box_right, box_right], [y_low, y_high], color='white', linestyle='--', linewidth=0.6, alpha=0.6)
 
-        ax_main.set_xlim(-1, len(df))
+        # FIX: beri ruang kosong di kanan supaya candle terakhir tidak mepet ke axis
+        right_pad = max(3, int(len(df) * 0.04))
+        ax_main.set_xlim(-1, len(df) - 1 + right_pad)
         ax_main.set_ylim(df['Low'].min()*0.95, df['High'].max()*1.08)
 
         left_text = (
@@ -1840,8 +1948,8 @@ def broadcast_v3(signals):
             emoji_5d = "🟢" if st_5d=="AKUM" else "🔴" if st_5d=="DIST" else "⚪"
             emoji_20d = "🟢" if st_20d=="AKUM" else "🔴" if st_20d=="DIST" else "⚪"
             brokers_d = multi.get('brokers', []) or item.get('brokers', []) or []
-            brokers_5d = multi.get('brokers_5d', []) or brokers_d
-            brokers_20d = multi.get('brokers_20d', []) or brokers_d
+            brokers_5d = multi.get('brokers_5d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_5d di get_broker_multi_tf)
+            brokers_20d = multi.get('brokers_20d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_20d di get_broker_multi_tf)
             top_d = format_top_brokers(brokers_d, 3, st_d)
             top_5d = format_top_brokers(brokers_5d, 3, st_5d)
             top_20d = format_top_brokers(brokers_20d, 3, st_20d)
@@ -1936,8 +2044,8 @@ def process_chart_request(chat_id, stock_code, timeframe="1d", extra_info_cache=
 
     if multi:
         brokers_d = multi.get('brokers', []) or brokers_cached
-        brokers_5d = multi.get('brokers_5d', []) or brokers_d
-        brokers_20d = multi.get('brokers_20d', []) or brokers_d
+        brokers_5d = multi.get('brokers_5d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_5d di get_broker_multi_tf)
+        brokers_20d = multi.get('brokers_20d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_20d di get_broker_multi_tf)
         st_d_tmp = multi.get('status_d','AKUM')
         st_5d_tmp = multi.get('status_5d','AKUM')
         st_20d_tmp = multi.get('status_20d','AKUM')
@@ -2576,8 +2684,8 @@ def telegram_bot_listener():
                                         emoji_5d = "🟢" if st_5d=="AKUM" else "🔴" if st_5d=="DIST" else "⚪"
                                         emoji_20d = "🟢" if st_20d=="AKUM" else "🔴" if st_20d=="DIST" else "⚪"
                                         brokers_d = multi.get('brokers', []) or item.get('brokers', []) or []
-                                        brokers_5d = multi.get('brokers_5d', []) or brokers_d
-                                        brokers_20d = multi.get('brokers_20d', []) or brokers_d
+                                        brokers_5d = multi.get('brokers_5d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_5d di get_broker_multi_tf)
+                                        brokers_20d = multi.get('brokers_20d', [])  # FIX: jangan fallback ke brokers_d (lihat dup_20d di get_broker_multi_tf)
                                         top_d = format_top_brokers(brokers_d, 3, st_d)
                                         top_5d = format_top_brokers(brokers_5d, 3, st_5d)
                                         top_20d = format_top_brokers(brokers_20d, 3, st_20d)
