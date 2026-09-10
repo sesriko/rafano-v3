@@ -912,75 +912,89 @@ def scan_v3_full(force_today=False, limit_candidates=60):
     
     det=[]
     def proc(sym):
-        # Kalau quota habis, pakai cache kalau ada, kalau tidak ada cache pakai VSA murni biar tetap ada BUY
-        if QUOTA_HIT:
-            ck = get_cached_broker(f"multi_{sym}", allow_expired=True)
-            hd = get_history_pro(sym,limit=120,timeframe="1d")
-            if hd is None or len(hd)<20:
-                return None
-            lc=hd['Close'].iloc[-1]
-            if ck:
-                multi = ck
-                akum=multi.get('akum_d',0); dist=multi.get('dist_d',0); net=multi.get('net_d',0); st=multi.get('status_d','NEUTRAL ⚪')
-                is_buy=("AKUM" in st and net>0) or (akum>0) or (net>0)
-                if not is_buy:
-                    try:
-                        e50=hd['Close'].ewm(span=50).mean().iloc[-1]
-                        if lc>e50:
-                            is_buy=True
-                    except:
-                        pass
-                if not is_buy:
-                    return None
-                an=get_analysis(sym)
-                sc,lab,rs=calculate_score_v2(sym,hd,akum,dist,net,an)
-                if sc>=35:
-                    prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc; chg=(lc/prev-1)*100 if prev else 0
-                    tp=calculate_trading_plan(hd,multi_tf=multi,timeframe="1d")
-                    return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":akum,"dist_value":dist,"broker_net":net,"broker_status":st,"reasons":rs,"history_df":hd,"trading_plan":tp,"brokers":multi.get('brokers',[]),"multi_tf":multi}
-                return None
-            else:
-                # TIDAK ADA CACHE + QUOTA HABIS -> VSA MURNI FALLBACK (biar tetap ada BUY)
-                try:
-                    e20=hd['Close'].ewm(span=20).mean().iloc[-1]
-                    e50=hd['Close'].ewm(span=50).mean().iloc[-1]
-                    vol_avg=hd['Volume'].tail(20).mean()
-                    last_vol=hd['Volume'].iloc[-1]
-                    # Syarat VSA BUY murni: close > EMA20 > EMA50 + volume di atas rata + naik >1%
-                    prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc
-                    chg=(lc/prev-1)*100 if prev else 0
-                    if lc>e20 and lc>e50 and last_vol>vol_avg*0.8 and chg>-2:
-                        an=get_analysis(sym)
-                        # buat multi dummy VSA
-                        dummy_multi={"akum_d":last_vol*lc*0.6,"dist_d":last_vol*lc*0.4,"net_d":last_vol*lc*0.2,"status_d":"AKUM 🟢 (VSA QUOTA)","source_d":"VSA_ESTIMATE","brokers":[],"avg_d":lc}
-                        sc,lab,rs=calculate_score_v2(sym,hd,dummy_multi["akum_d"],dummy_multi["dist_d"],dummy_multi["net_d"],an)
-                        if sc>=35:
-                            tp=calculate_trading_plan(hd,multi_tf=dummy_multi,timeframe="1d")
-                            return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":dummy_multi["akum_d"],"dist_value":dummy_multi["dist_d"],"broker_net":dummy_multi["net_d"],"broker_status":dummy_multi["status_d"],"reasons":rs+["VSA QUOTA FALLBACK"],"history_df":hd,"trading_plan":tp,"brokers":[],"multi_tf":dummy_multi}
-                except Exception as e:
-                    pass
-                return None
+        # QUOTA HABIS pun tetap scan pakai sinyal chart TF 1D (BO EMA50, BOS EMA, BOW BB)
         try:
             hd=get_history_pro(sym,limit=120,timeframe="1d")
-            if hd is None or len(hd)<20: return None
-            multi=get_broker_multi_tf(sym,hd)
-            akum=multi.get('akum_d',0); dist=multi.get('dist_d',0); net=multi.get('net_d',0); st=multi.get('status_d','NEUTRAL ⚪')
-            lc=hd['Close'].iloc[-1]; e50=hd['Close'].ewm(span=50).mean().iloc[-1] if len(hd)>=50 else lc
-            is_buy=("AKUM" in st and net>0) or (lc>e50) or (akum>0) or (net>0)
-            if not is_buy and lc>e50: is_buy=True
-            if not is_buy: return None
+            if hd is None or len(hd)<30:
+                return None
+            
+            lc=hd['Close'].iloc[-1]
+            # ===== DETEKSI SINYAL CHART 1D - SELALU JALAN =====
+            try:
+                buy_sigs, hd_ind = detect_buy_signals(hd, None)
+                has_chart_signal = len(buy_sigs) > 0
+                chart_type = buy_sigs[0].get('type','') if has_chart_signal else ''
+            except:
+                buy_sigs=[]; has_chart_signal=False; chart_type=''; hd_ind=hd
+            
+            # broker info opsional
+            multi=None; akum=0; dist=0; net=0; status="NEUTRAL ⚪ (VSA)"; src_mark="VSA_ESTIMATE"
+            try:
+                if not QUOTA_HIT:
+                    multi=get_broker_multi_tf(sym, hd)
+                    if multi:
+                        akum=multi.get('akum_d',0); dist=multi.get('dist_d',0); net=multi.get('net_d',0)
+                        status=multi.get('status_d','NEUTRAL ⚪'); src_mark=multi.get('source_d','VSA_ESTIMATE')
+                else:
+                    ck=get_cached_broker(f"multi_{sym}", allow_expired=True)
+                    if ck:
+                        multi=ck; akum=multi.get('akum_d',0); dist=multi.get('dist_d',0); net=multi.get('net_d',0)
+                        status=multi.get('status_d','NEUTRAL ⚪ (CACHE)'); src_mark=multi.get('source_d','QUOTA')
+            except:
+                pass
+            
+            # LOGIC BUY CHART 1D
+            ema20=hd['Close'].ewm(span=20).mean().iloc[-1]
+            ema50=hd['Close'].ewm(span=50).mean().iloc[-1]
+            ema200=hd['Close'].ewm(span=200).mean().iloc[-1]
+            df_v,_=calculate_vsa_metrics(hd.copy())
+            buy_pct=df_v['Buy_Pct'].iloc[-1] if 'Buy_Pct' in df_v.columns else 50
+            
+            is_buy_chart=False
+            if has_chart_signal:
+                is_buy_chart=True
+            elif lc>ema20 and lc>ema50 and buy_pct>=55:
+                is_buy_chart=True
+            elif lc>ema200 and lc>ema50 and buy_pct>=60:
+                is_buy_chart=True
+            
+            if not QUOTA_HIT:
+                # REAL MODE: butuh chart signal atau akum
+                if not (is_buy_chart or ("AKUM" in status and net>0) or akum>0):
+                    return None
+            else:
+                # QUOTA HABIS MODE: cuma chart signal 1D
+                if not is_buy_chart:
+                    return None
+            
             an=get_analysis(sym)
-            sc,lab,rs=calculate_score_v2(sym,hd,akum,dist,net,an)
-            if sc>=35:
-                prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc; chg=(lc/prev-1)*100 if prev else 0
-                tp=calculate_trading_plan(hd,multi_tf=multi,timeframe="1d")
-                return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":akum,"dist_value":dist,"broker_net":net,"broker_status":st,"reasons":rs,"history_df":hd,"trading_plan":tp,"brokers":multi.get('brokers',[]),"multi_tf":multi}
-        except: return None
+            sc,lab,rs=calculate_score_v2(sym, hd, akum, dist, net, an)
+            
+            if sc>=35 or (QUOTA_HIT and is_buy_chart):
+                prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc
+                chg=(lc/prev-1)*100 if prev else 0
+                tp=calculate_trading_plan(hd, multi_tf=multi, timeframe="1d")
+                if has_chart_signal:
+                    rs=[f"CHART 1D: {chart_type}"] + rs
+                if QUOTA_HIT:
+                    rs.append("⚠️ QUOTA HABIS - CHART 1D ONLY")
+                    if "NEUTRAL" in status:
+                        status=f"BUY CHART 1D 🟢 {chart_type}" if chart_type else "BUY CHART 1D 🟢"
+                return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":akum,"dist_value":dist,"broker_net":net,"broker_status":status,"reasons":rs,"history_df":hd,"trading_plan":tp,"brokers":multi.get('brokers',[]) if multi else [],"multi_tf":multi or {"akum_d":akum,"dist_d":dist,"net_d":net,"status_d":status,"source_d":src_mark,"brokers":[]}}
+        except Exception as e:
+            #print(f"proc {sym} err {e}")
+            pass
+        return None
     for idx,sym in enumerate(cands):
-        if QUOTA_HIT: print(f"⛔ Quota habis di {idx}/{len(cands)}"); break
+        # JANGAN break kalau quota habis - tetap lanjut scan pakai chart 1D
+        if QUOTA_HIT and idx % 50 == 0:
+            print(f"⚠️ Quota habis tapi tetap scan CHART 1D di {idx}/{len(cands)}...")
         r=proc(sym)
-        if r: det.append(r); print(f"✅ {r['symbol']} {r['score']}%")
-        time.sleep(0.7)
+        if r: 
+            det.append(r)
+            qtag="📊 CHART 1D" if QUOTA_HIT else "🏦 REAL"
+            print(f"✅ {r['symbol']} {r['score']}% {qtag} {r['broker_status']}")
+        time.sleep(0.3 if QUOTA_HIT else 0.7)
     det.sort(key=lambda x: (x['multi_tf'].get('net_d',0),x['score']),reverse=True)
     return det
 
@@ -1097,7 +1111,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.4.5 MENU FIX + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.4.6 SCANBUY CHART 1D QUOTA SAFE + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1312,7 +1326,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.4.5 MENU FIX + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.4.6 SCANBUY CHART 1D QUOTA SAFE + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
