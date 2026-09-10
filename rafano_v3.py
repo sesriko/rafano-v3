@@ -943,7 +943,7 @@ def scan_v3_full(force_today=False, limit_candidates=60):
             except:
                 pass
             
-            # ===== LOGIC BUY CHART 1D - CUMA BO EMA50 HARI INI =====
+            # ===== LOGIC BUY CHART 1D - BO/BOS/BOW/BOB TODAY ONLY =====
             ema20=hd['Close'].ewm(span=20).mean().iloc[-1]
             ema50=hd['Close'].ewm(span=50).mean().iloc[-1]
             ema200=hd['Close'].ewm(span=200).mean().iloc[-1]
@@ -952,17 +952,27 @@ def scan_v3_full(force_today=False, limit_candidates=60):
             
             is_buy_chart=False
             chart_today_type=""
-            # Cek apakah ada sinyal BO EMA50 yang terjadi HARI INI (candle terakhir)
             today_idx = len(hd)-1
+            filt = (signal_type_filter or "BO EMA50").upper()
+            allowed=[]
+            if filt in ["BO","BO EMA50","BO50"]:
+                allowed=["BO EMA50"]
+            elif filt in ["BOS","BOS EMA"]:
+                allowed=["BOS EMA"]
+            elif filt in ["BOW","BOW BB"]:
+                allowed=["BOW BB"]
+            elif filt in ["BOB","BOB EMA200","BOB200"]:
+                allowed=["BOB EMA200"]
+            elif filt in ["ALL","SEMUA"]:
+                allowed=["BO EMA50","BOS EMA","BOW BB","BOB EMA200"]
+            else:
+                allowed=["BO EMA50"]
             for sig in buy_sigs:
-                sig_idx = sig.get('index', -1)
-                sig_type = sig.get('type','')
-                # CUMA ambil BO EMA50 yang terjadi hari ini
-                if sig_type == 'BO EMA50' and sig_idx == today_idx:
+                if sig.get('index',-1)==today_idx and sig.get('type','') in allowed:
                     is_buy_chart=True
-                    chart_today_type=sig_type
+                    chart_today_type=sig.get('type','')
                     has_chart_signal=True
-                    chart_type=sig_type
+                    chart_type=sig.get('type','')
                     break
                 # Kalau mau include BOS EMA hari ini juga, uncomment bawah:
                 # if sig_type in ['BO EMA50','BOS EMA'] and sig_idx == today_idx:
@@ -1029,7 +1039,7 @@ def send_photo_reply(cid,pp,cap="", caption=None):
             requests.post(url,data={'chat_id':cid,'caption':final_cap,'parse_mode':'Markdown'},files={'photo':ph},timeout=30)
     except Exception as e: print(f"Photo err {e}")
 
-def broadcast_v3(signals):
+def broadcast_v3(signals, filter_label="BO EMA50"):
     if not signals:
         msg="Scan: Tidak ada BUY / Quota habis."+("\n♻️ Cache" if QUOTA_HIT else "")
         send_reply(TARGET_CHAT_ID,msg); return
@@ -1126,7 +1136,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.4.7 BO EMA50 TODAY ONLY + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.4.8 BO/BOS/BOW/BOB TODAY + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1146,38 +1156,29 @@ def telegram_bot_listener():
                 elif "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=txt.split()[0].lower() if txt else ""
                     if first in ["/start","/help","/menu"]:
-                        help_text = (
-                            "🔥 *RAFANO V4.4.5 300 LIQUID NO FCA/SUSPEND*\n"
-                            "Quota habis pun tetap scan pakai chart 1D & vol spike\n"
-                            "============================\n\n"
-                            "📊 *CHART & BANDAR*\n"
-                            "`/c <KODE> [TF]` - Chart lengkap + label BO/BOS/BOW\n"
-                            "  TF: 5m 15m 30m 1h 4h 1d 1w 1M\n"
-                            "  Contoh: `/c BIPI`, `/c ANTM 5m`\n"
-                            "`/b <KODE>` - Detail broker akum/dist REAL\n"
-                            "  Contoh: `/b BIPI`\n\n"
-                            "🔍 *AUTO SCAN BUY (300 liquid no FCA)*\n"
-                            "`/scan` - Scan BUY 300 saham paling liquid\n"
-                            "  - REAL MODE: pakai akum broker + chart 1D\n"
-                            "  - QUOTA HABIS: tetap jalan pakai chart 1D (BO EMA50/BOS/BOW)\n"
-                            "`/scanfast` - Fast scan 20 saham\n\n"
-                            "🔥 *SCAN VOLUME SPIKE (tetap jalan walau quota habis)*\n"
-                            "`/scanvol [x] [n]` - Vol spike >x (default 2x)\n"
-                            "  Contoh: `/scanvol 2`, `/scanvol 3 150`\n"
-                            "`/volakum [x] [n]` - Vol spike + filter AKUM REAL\n"
-                            "  Contoh: `/volakum 2 150`\n"
-                            "`/scanvolall [x]` - 300 saham SORT by Rp gede 🔥\n"
-                            "  Paling liquid di atas, tau duit gede\n"
-                            "`/volallakum [x]` - 300 saham + AKUM + SORT Rp (paling valid)\n"
-                            "  Contoh: `/scanvolall 2`, `/volallakum 2`\n\n"
-                            "⚙️ *SYSTEM*\n"
-                            "`/quota` - Cek status quota Arjum\n"
-                            "`/clearcache` - Clear cache (jangan pas quota habis!)\n"
-                            "`/help` - Menu ini\n\n"
-                            "📌 *300 LIQUID = exclude FCA, suspend, gocap 50 tipis, delisted*\n"
-                            "Top: BBCA BBRI BMRI BBNI BRIS TLKM ASII dll"
-                        )
-                        send_reply(chat_id, help_text)
+                        txt_help = """🔥 *RAFANO V4.4.8 SIMPLE* 300 liquid no FCA
+Quota habis tetap jalan pakai chart 1D
+==========================
+📊 *CHART*
+/c KODE [TF] ex: /c BIPI /c ANTM 5m
+/b KODE ex: /b BIPI
+
+🔍 *SCAN BUY TODAY (candle hari ini)*
+/scan = BO EMA50 hari ini (default)
+/scan bos = BOS EMA hari ini
+/scan bow = BOW BB hari ini
+/scan bob = BOB EMA200 hari ini
+/scan all = semua BO+BOS+BOW+BOB
+
+🔥 *VOL SPIKE (quota habis tetap jalan)*
+/vol 2 = vol >2x 60 saham
+/vol 2 150 = vol >2x 150 saham
+/volakum 2 = vol + akum
+/volall 2 = 300 saham sort Rp
+/volallakum 2 = 300 + akum + sort Rp
+
+⚙️ /quota /clear /help"""
+                        send_reply(chat_id, txt_help)
                     elif first in ["/c","/chart"]:
                         parts=txt.split()
                         if len(parts)>=2:
@@ -1213,11 +1214,26 @@ def telegram_bot_listener():
                                 if os.path.exists("/tmp/rafano_cache.json"): os.remove("/tmp/rafano_cache.json")
                                 send_reply(chat_id,"🧹 Cleared")
                         except Exception as e: send_reply(chat_id,f"❌ {e}")
-                    elif first in ["/scan","!scan","/scanall","/scanfull"]:
-                        send_reply(chat_id,"🔍 *SCAN BUY 300 LIQUID NO FCA* (2-4 menit, quota habis pun tetap jalan pakai chart 1D)...")
-                        def ms(tg=chat_id):
+                    elif first in ["/scan","!scan","/scanall","/scanfull","/scanbuy","/bo","/bos","/bow","/bob"]:
+                        parts = txt.lower().split()
+                        sf = "BO EMA50"
+                        if len(parts)>=2:
+                            a=parts[1]
+                            if a in ["bos","bos_ema"]: sf="BOS EMA"
+                            elif a in ["bow","bow_bb"]: sf="BOW BB"
+                            elif a in ["bob","bob_ema200","bob200"]: sf="BOB EMA200"
+                            elif a in ["all","semua"]: sf="ALL"
+                            elif a in ["bo","bo_ema50","bo50"]: sf="BO EMA50"
+                        if first=="/bos": sf="BOS EMA"
+                        if first=="/bow": sf="BOW BB"
+                        if first=="/bob": sf="BOB EMA200"
+                        if first=="/bo": sf="BO EMA50"
+                        send_reply(chat_id,f"🔍 *SCAN {sf} TODAY* 300 liquid no FCA...")
+                        def ms(tg=chat_id, sfil=sf):
                             global LAST_SIGNALS_CACHE
-                            sigs=scan_v3_full(); LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}; broadcast_v3(sigs)
+                            sigs=scan_v3_full(force_today=False, limit_candidates=300, signal_type_filter=sfil)
+                            LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
+                            broadcast_v3(sigs, filter_label=sfil)
                         threading.Thread(target=ms,args=(chat_id,)).start()
                     elif first in ["/scanfast"]:
                         send_reply(chat_id,"⚡ *FAST SCAN 20 saham paling liquid...*")
@@ -1341,7 +1357,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.4.7 BO EMA50 TODAY ONLY + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.4.8 BO/BOS/BOW/BOB TODAY + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
