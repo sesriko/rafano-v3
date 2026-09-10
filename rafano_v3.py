@@ -741,130 +741,99 @@ def calculate_score_v2(sym,hist,akum,dist,net,an):
     return score,lab,rs
 
 # ==================== NEW: SCAN VOLUME SPIKE >2x ====================
-def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False, sort_by_rp=False):
-    # sort_by_rp = True untuk scanvolall, sort by Rp gede bukan ratio
 
-    mode = "AKUM REAL ONLY" if akum_only else "ALL"
-    print(f"[{get_now_wib()}] 🚀 SCAN VOLUME SPIKE >{threshold}x {mode} ...")
-    screener_data=get_screener_latest()
-    if not screener_data:
-        candidates=["BBCA","BBRI","BMRI","BBNI","BRIS","TLKM","ASII","ADRO","ANTM","MDKA","BRMS","BREN","CUAN","WIFI","BIPI","BULL","NIKL","DEWA","PGEO","RAJA","MEDC","ELSA","PGAS","PTBA","ITMG","ANTM","BRPT","TPIA","GOTO","BUKA","EMTK","AMMN","MBMA","NCKL","TINS","HRUM","INCO","ESSA","AKRA","INDY","SMGR","INTP","UNTR","AUTO","ICBP","INDF","MYOR","KLBF","SIDO","CPIN","JPFA","UNVR","BRIS","BNGA"]
+def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False, sort_by_rp=False):
+    """SCAN VOL SPIKE >2x - TETAP JALAN WALAU QUOTA HABIS, cuma hitung volume"""
+    print(f"[{get_now_wib()}] 🚀 SCAN VOLUME SPIKE >{threshold}x - QUOTA {'HABIS' if QUOTA_HIT else 'OK'} - TETAP JALAN...")
+    sd=get_screener_latest(force_today=False)
+    if sd:
+        cands=[(it.get('symbol') or it.get('code') or "").replace(".JK","").upper() for it in sd]
+        cands=[c for c in cands if c]
     else:
-        candidates=[]
-        for item in screener_data:
-            sym=item.get('symbol') or item.get('code')
-            if sym: candidates.append(sym.replace(".JK","").upper())
-        candidates=list(dict.fromkeys([c.upper() for c in candidates]))[:limit_candidates]
+        cands=IDX_LIQUID_400
     
+    # dedup + filter FCA
+    seen=set(); uniq=[]
+    for c in cands:
+        cu=c.upper().strip()
+        if cu and cu not in seen and cu not in FCA_EXCLUDE:
+            seen.add(cu); uniq.append(cu)
+    
+    # gabung dengan liquid 400 untuk capai limit
+    for c in IDX_LIQUID_400:
+        if len(uniq)>=limit_candidates: break
+        if c not in seen and c not in FCA_EXCLUDE:
+            uniq.append(c); seen.add(c)
+    
+    cands=uniq[:limit_candidates]
+    print(f"📋 Scan {len(cands)} saham: {cands[:10]} ...")
+
     detected=[]
     def process_vol(sym):
         try:
-            df=get_history_pro(sym, limit=60, timeframe="1d")
-            if df is None or len(df)<25: return None
-            v_avg=df['Volume'].rolling(20).mean().iloc[-2]  # avg sebelum hari ini
-            v_last=df['Volume'].iloc[-1]
-            if v_avg==0 or pd.isna(v_avg): return None
+            hd=get_history_pro(sym, limit=60, timeframe="1d")
+            if hd is None or len(hd)<20:
+                return None
+            # hitung volume spike - TIDAK BUTUH BROKER API
+            v_last=hd['Volume'].iloc[-1]
+            v_avg=hd['Volume'].tail(20).mean()
+            if v_avg==0:
+                return None
             ratio=v_last/v_avg
-            if ratio < threshold: return None
-            # tambahan filter: candle hijau atau minimal tidak merah dalam
-            close=df['Close'].iloc[-1]; open_=df['Open'].iloc[-1]
-            chg_pct=(close/df['Close'].iloc[-2]-1)*100 if len(df)>=2 else 0
-            # hitung VSA Buy%
-            df['V1']=df['Volume'].rolling(20).mean()
-            df,_=calculate_vsa_metrics(df)
-            buy_pct=df['Buy_Pct'].iloc[-1] if 'Buy_Pct' in df.columns else 50
+            if ratio < threshold:
+                return None
             
-            # broker info
+            close=hd['Close'].iloc[-1]
+            open_=hd['Open'].iloc[-1]
+            prev=hd['Close'].iloc[-2] if len(hd)>=2 else close
+            chg_pct=(close/prev-1)*100 if prev else 0
+            
+            # VSA buy%
+            df_v,_=calculate_vsa_metrics(hd.copy())
+            buy_pct=df_v['Buy_Pct'].iloc[-1] if 'Buy_Pct' in df_v.columns else 50
+            
+            # broker info opsional kalau quota OK
             multi=None
-            try: multi=get_broker_multi_tf(sym, df)
-            except: multi=None
-            
-            # FILTER AKUM REAL ONLY - LOOSE + VSA FALLBACK
-            if akum_only:
-                # Kalau ada data broker REAL AKUM -> lolos langsung
-                if multi:
-                    status = multi.get('status_d','')
-                    net_d = multi.get('net_d',0)
-                    src = multi.get('source_d','')
-                    # REAL AKUM atau CACHE dengan Net >0
-                    if "AKUM" in status and net_d > 0:
-                        # Buy% minimal 55 biar gak terlalu ketat
-                        if buy_pct >= 55:
-                            pass  # lolos
-                        else:
-                            return None
-                    else:
-                        # Tidak AKUM di broker, cek VSA fallback kalau quota habis
-                        # Kalau quota habis, pakai VSA sebagai proxy AKUM
-                        # Syarat VSA AKUM: Buy% >=70, candle hijau, chg >1%
-                        if not (buy_pct >= 70 and close >= open_ and chg_pct > 1.0):
-                            return None
-                        # kasih tag VSA AKUM
-                        multi = multi or {}
-                        multi['status_d'] = 'AKUM 🟢 (VSA)'
-                        multi['source_d'] = 'VSA_ESTIMATE'
-                else:
-                    # Tidak ada data broker sama sekali (quota habis / cache kosong)
-                    # Fallback VSA: Buy% >=75, hijau, naik >1.5%
-                    if not (buy_pct >= 75 and close >= open_ and chg_pct > 1.5):
+            if not QUOTA_HIT and akum_only:
+                try:
+                    multi=get_broker_multi_tf(sym, hd)
+                    if multi and "AKUM" not in multi.get('status_d',''):
                         return None
-                    # buat dummy multi biar tampil
-                    multi = {
-                        'status_d': 'AKUM 🟢 (VSA)',
-                        'source_d': 'VSA_ESTIMATE',
-                        'net_d': v_last*close,
-                        'akum_d': v_last*close,
-                        'dist_d': 0,
-                        'net_5d': 0,
-                        'net_20d': 0,
-                        'brokers': [],
-                        'brokers_5d': [],
-                        'brokers_20d': []
-                    }
+                    if multi and multi.get('net_d',0) <=0 and multi.get('akum_d',0)==0:
+                        # fallback VSA akum
+                        if buy_pct < 60:
+                            return None
+                except:
+                    if akum_only and buy_pct < 70:
+                        return None
             
-            # scoring untuk vol spike
-            score=50
-            if ratio>=5: score+=30
-            elif ratio>=3: score+=20
-            elif ratio>=2: score+=10
-            if buy_pct>=70: score+=10
-            if chg_pct>3: score+=10
-            
-            label="VOL SPIKE"
-            if ratio>=5: label="TURBO SPIKE 🔥🔥"
-            elif ratio>=3: label="STRONG SPIKE 🔥"
+            vol_rp = v_last*close
+            vol_avg_rp = v_avg*close
             
             return {
-                "symbol": sym,
-                "close": int(close),
-                "change_pct": chg_pct,
-                "vol_ratio": ratio,
-                "vol_last": v_last,
-                "vol_avg": v_avg,
-                "vol_rp": v_last*close,
-                "vol_avg_rp": v_avg*close,
-                "buy_pct": buy_pct,
-                "score": score,
-                "score_label": label,
-                "broker_net": multi.get('net_d',0) if multi else 0,
-                "broker_status": multi.get('status_d','') if multi else '',
-                "multi_tf": multi,
-                "history_df": df,
-                "brokers": multi.get('brokers',[]) if multi else []
+                "symbol":sym,
+                "close":int(close),
+                "change_pct":chg_pct,
+                "vol_ratio":ratio,
+                "vol_last":v_last,
+                "vol_avg":v_avg,
+                "vol_rp":vol_rp,
+                "vol_avg_rp":vol_avg_rp,
+                "buy_pct":buy_pct,
+                "multi":multi,
+                "history_df":hd
             }
         except Exception as e:
-            print(f"vol {sym} err {e}")
+            #print(f"Vol err {sym}: {e}")
             return None
-    
-    print(f"📋 Scan {len(candidates)} saham: {candidates[:10]} ...")
-    for sym in candidates:
+
+    for sym in cands:
         r=process_vol(sym)
         if r:
             detected.append(r)
-            print(f"✅ {r['symbol']} Vol {r['vol_ratio']:.1f}x Buy {r['buy_pct']:.0f}% {r['change_pct']:+.1f}%")
-        time.sleep(0.3)
-    
-    # dedup by symbol keep highest ratio
+            print(f"🔥 VOL {r['symbol']} {r['vol_ratio']:.1f}x Rp {format_large_number(r['vol_rp'])} Buy {r['buy_pct']:.0f}%")
+
+    # dedup
     seen={}
     for d in detected:
         if d['symbol'] not in seen or d['vol_ratio']>seen[d['symbol']]['vol_ratio']:
@@ -875,6 +844,7 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False, sort_
     else:
         detected.sort(key=lambda x: x['vol_ratio'], reverse=True)
     return detected
+
 
 def broadcast_vol_spike(signals, threshold=2.0, akum_only=False, sort_by_rp=False):
     if not signals:
@@ -942,21 +912,18 @@ def scan_v3_full(force_today=False, limit_candidates=60):
     
     det=[]
     def proc(sym):
-        # Kalau quota habis, jangan return None langsung, coba pakai cache + VSA fallback
+        # Kalau quota habis, pakai cache kalau ada, kalau tidak ada cache pakai VSA murni biar tetap ada BUY
         if QUOTA_HIT:
-            # coba pakai cache expired
             ck = get_cached_broker(f"multi_{sym}", allow_expired=True)
+            hd = get_history_pro(sym,limit=120,timeframe="1d")
+            if hd is None or len(hd)<20:
+                return None
+            lc=hd['Close'].iloc[-1]
             if ck:
                 multi = ck
-                hd = get_history_pro(sym,limit=120,timeframe="1d")
-                if hd is None or len(hd)<20:
-                    return None
                 akum=multi.get('akum_d',0); dist=multi.get('dist_d',0); net=multi.get('net_d',0); st=multi.get('status_d','NEUTRAL ⚪')
-                lc=hd['Close'].iloc[-1]
-                # tetap proses walau quota
                 is_buy=("AKUM" in st and net>0) or (akum>0) or (net>0)
                 if not is_buy:
-                    # fallback VSA: close > EMA50 dan Buy% >60
                     try:
                         e50=hd['Close'].ewm(span=50).mean().iloc[-1]
                         if lc>e50:
@@ -973,7 +940,25 @@ def scan_v3_full(force_today=False, limit_candidates=60):
                     return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":akum,"dist_value":dist,"broker_net":net,"broker_status":st,"reasons":rs,"history_df":hd,"trading_plan":tp,"brokers":multi.get('brokers',[]),"multi_tf":multi}
                 return None
             else:
-                # tidak ada cache, skip dengan log
+                # TIDAK ADA CACHE + QUOTA HABIS -> VSA MURNI FALLBACK (biar tetap ada BUY)
+                try:
+                    e20=hd['Close'].ewm(span=20).mean().iloc[-1]
+                    e50=hd['Close'].ewm(span=50).mean().iloc[-1]
+                    vol_avg=hd['Volume'].tail(20).mean()
+                    last_vol=hd['Volume'].iloc[-1]
+                    # Syarat VSA BUY murni: close > EMA20 > EMA50 + volume di atas rata + naik >1%
+                    prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc
+                    chg=(lc/prev-1)*100 if prev else 0
+                    if lc>e20 and lc>e50 and last_vol>vol_avg*0.8 and chg>-2:
+                        an=get_analysis(sym)
+                        # buat multi dummy VSA
+                        dummy_multi={"akum_d":last_vol*lc*0.6,"dist_d":last_vol*lc*0.4,"net_d":last_vol*lc*0.2,"status_d":"AKUM 🟢 (VSA QUOTA)","source_d":"VSA_ESTIMATE","brokers":[],"avg_d":lc}
+                        sc,lab,rs=calculate_score_v2(sym,hd,dummy_multi["akum_d"],dummy_multi["dist_d"],dummy_multi["net_d"],an)
+                        if sc>=35:
+                            tp=calculate_trading_plan(hd,multi_tf=dummy_multi,timeframe="1d")
+                            return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":dummy_multi["akum_d"],"dist_value":dummy_multi["dist_d"],"broker_net":dummy_multi["net_d"],"broker_status":dummy_multi["status_d"],"reasons":rs+["VSA QUOTA FALLBACK"],"history_df":hd,"trading_plan":tp,"brokers":[],"multi_tf":dummy_multi}
+                except Exception as e:
+                    pass
                 return None
         try:
             hd=get_history_pro(sym,limit=120,timeframe="1d")
@@ -1112,7 +1097,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.4 300 LIQUID NO FCA/SUSPEND Running...")
+    offset=0; print("🤖 V4.4.5 MENU FIX + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1131,8 +1116,39 @@ def telegram_bot_listener():
                         if len(parts)>=3: threading.Thread(target=process_chart_request,args=(chat_id,parts[1],parts[2],LAST_SIGNALS_CACHE)).start()
                 elif "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=txt.split()[0].lower() if txt else ""
-                    if first in ["/start","/help"]:
-                        send_reply(chat_id,"🤖 *V4.3.8 SCAN 300 SORT Rp*\n`/c <KODE> [TF]` Chart\n`/b <KODE>` Bandar\n`/scan` BUY 60\n`/scanvol [x] [n]` Vol >x (n=60-300)\n`/volakum [x] [n]` Vol + AKUM\n`/scanvolall [x]` 300 saham SORT Rp gede di atas 🔥\n`/volallakum [x]` 300 + AKUM + SORT Rp")
+                    if first in ["/start","/help","/menu"]:
+                        help_text = (
+                            "🔥 *RAFANO V4.4.5 300 LIQUID NO FCA/SUSPEND*\n"
+                            "Quota habis pun tetap scan pakai chart 1D & vol spike\n"
+                            "============================\n\n"
+                            "📊 *CHART & BANDAR*\n"
+                            "`/c <KODE> [TF]` - Chart lengkap + label BO/BOS/BOW\n"
+                            "  TF: 5m 15m 30m 1h 4h 1d 1w 1M\n"
+                            "  Contoh: `/c BIPI`, `/c ANTM 5m`\n"
+                            "`/b <KODE>` - Detail broker akum/dist REAL\n"
+                            "  Contoh: `/b BIPI`\n\n"
+                            "🔍 *AUTO SCAN BUY (300 liquid no FCA)*\n"
+                            "`/scan` - Scan BUY 300 saham paling liquid\n"
+                            "  - REAL MODE: pakai akum broker + chart 1D\n"
+                            "  - QUOTA HABIS: tetap jalan pakai chart 1D (BO EMA50/BOS/BOW)\n"
+                            "`/scanfast` - Fast scan 20 saham\n\n"
+                            "🔥 *SCAN VOLUME SPIKE (tetap jalan walau quota habis)*\n"
+                            "`/scanvol [x] [n]` - Vol spike >x (default 2x)\n"
+                            "  Contoh: `/scanvol 2`, `/scanvol 3 150`\n"
+                            "`/volakum [x] [n]` - Vol spike + filter AKUM REAL\n"
+                            "  Contoh: `/volakum 2 150`\n"
+                            "`/scanvolall [x]` - 300 saham SORT by Rp gede 🔥\n"
+                            "  Paling liquid di atas, tau duit gede\n"
+                            "`/volallakum [x]` - 300 saham + AKUM + SORT Rp (paling valid)\n"
+                            "  Contoh: `/scanvolall 2`, `/volallakum 2`\n\n"
+                            "⚙️ *SYSTEM*\n"
+                            "`/quota` - Cek status quota Arjum\n"
+                            "`/clearcache` - Clear cache (jangan pas quota habis!)\n"
+                            "`/help` - Menu ini\n\n"
+                            "📌 *300 LIQUID = exclude FCA, suspend, gocap 50 tipis, delisted*\n"
+                            "Top: BBCA BBRI BMRI BBNI BRIS TLKM ASII dll"
+                        )
+                        send_reply(chat_id, help_text)
                     elif first in ["/c","/chart"]:
                         parts=txt.split()
                         if len(parts)>=2:
@@ -1169,13 +1185,13 @@ def telegram_bot_listener():
                                 send_reply(chat_id,"🧹 Cleared")
                         except Exception as e: send_reply(chat_id,f"❌ {e}")
                     elif first in ["/scan","!scan","/scanall","/scanfull"]:
-                        send_reply(chat_id,"🔍 *SCAN 60 saham...*")
+                        send_reply(chat_id,"🔍 *SCAN BUY 300 LIQUID NO FCA* (2-4 menit, quota habis pun tetap jalan pakai chart 1D)...")
                         def ms(tg=chat_id):
                             global LAST_SIGNALS_CACHE
                             sigs=scan_v3_full(); LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}; broadcast_v3(sigs)
                         threading.Thread(target=ms,args=(chat_id,)).start()
                     elif first in ["/scanfast"]:
-                        send_reply(chat_id,"⚡ *FAST 20...*")
+                        send_reply(chat_id,"⚡ *FAST SCAN 20 saham paling liquid...*")
                         def fs(tg=chat_id):
                             global LAST_SIGNALS_CACHE
                             old=get_screener_latest()
@@ -1274,6 +1290,8 @@ def auto_screener_loop():
             # Kalau broker di-clear total, 300 saham langsung hit API -> 429 langsung
             SCREENER_CACHE.clear()
             HISTORY_CACHE.clear()
+            # JANGAN hapus file cache broker di disk biar besok quota reset tetap REAL
+            # BROKER_CACHE tetap di memory kalau ada
             # BROKER_CACHE biarkan, nanti get_cached_broker(allow_expired=True) dipakai kalau quota habis
             print(f"[{get_now_wib()}] Broker cache kept: {len(BROKER_CACHE)} biar gak 429")
             print(f"[{get_now_wib()}] 🔄 Clear ALL cache (screener+history+broker) -> Scan TODAY fresh 150 saham")
@@ -1294,7 +1312,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.4 300 LIQUID TERBAIK NO FCA/SUSPEND")
+    print("🔥 RAFANO V4.4.5 MENU FIX + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
