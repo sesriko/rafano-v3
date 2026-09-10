@@ -22,6 +22,110 @@ def safe_get_env(k):
     except: pass
     return None
 
+
+# ===== FILTER FCA & SUSPEND + LIQUID 300 =====
+FCA_EXCLUDE = {
+    # dari BEI announcement + yang sering FCA
+    "FUTR","FITT","HOTEL","ITIC","PUDP","PUDJIADI","COIN","SHID","RELI","ASPI","MEJA","MINA",
+    "ESTA","ASLI","VKTR","IMJS","GTSI","IRSX","ATAP","RONY","BCIC","DEFI","ROCK","YPAS","NIRO",
+    "BBHA","BKSW","NAGA","BEEF","BPTR","CBMF","CPRI","CRAB","DAAZ","DEAL","DGNS","DMND","DUCK",
+    "ELSA","ENRG","ENVY","ERAA","ESTI","ETWA","FIRE","FORU","GAMA","GOLL","HAIS","HATM","HITS",
+    "HOMI","IATA","INPS","IPOL","JGLE","KAYU","KBAG","KIOS","KPAL","KPAS","LCGP","LPLI","LPLR",
+    "MAGP","MAMI","MARI","MABA","MABA-W","MBMA-W","NINE","NUSA","PALM","PADI","PDPP","PEVE","PGLI",
+    "PGJO","PICO","POWR","PSAB","PTDU","PURA","RAJA-W","RIGS","RODA","SATI","SINI","SKYB","SMKM",
+    "SOCI","SONA","SOSS","SUGI","TALF","TDPM","TEBE","TOPS","TRAM","TRIL","TRIO","TRUS","UFOE",
+    "WIFI-W","WOWS","YELO","ZATA","ZONE","ZINC","TINS-W","BIPI-W","BULL-W","DEWA-W","ARKA",
+    "ARTO-W","BBYB-W","KPAS","LPCK","MMLP","MTFN","NELY","NOBU","PNBN","PNBS","BNGA-W","BTPS-W"
+}
+
+SUSPEND_KEYWORDS = {"SUSPEND"}
+
+def is_fca_or_suspend(sym, df=None):
+    s = sym.upper().strip()
+    # 1. ada di list FCA exclude
+    if s in FCA_EXCLUDE:
+        return True, "FCA LIST"
+    # 2. harga gocap 50-51 mati + volume tipis = suspend/FCA kriteria 1
+    if df is not None and len(df)>=5:
+        try:
+            last_close = df['Close'].iloc[-1]
+            avg_vol = df['Volume'].tail(20).mean()
+            last_vol = df['Volume'].iloc[-1]
+            # gocap 50 dengan volume <500k selama 20 hari = tidak liquid / FCA kriteria 1
+            if last_close <= 51 and avg_vol < 500_000:
+                return True, f"GOCAP 50 Vol {avg_vol:.0f}"
+            # volume 0 atau sangat tipis 3 hari berturut
+            if df['Volume'].tail(3).sum() == 0:
+                return True, "SUSPEND Vol 0"
+            # harga tidak gerak 5 hari + volume <100k
+            if df['Close'].tail(5).nunique() == 1 and avg_vol < 200_000:
+                return True, "STAGNAN SUSPEND"
+        except:
+            pass
+    return False, ""
+
+def filter_liquid_stocks(candidates, min_avg_value_rp=500_000_000, min_avg_vol=300_000):
+    """Filter 300 saham paling liquid, exclude FCA/suspend"""
+    scored=[]
+    for sym in candidates:
+        # skip FCA list cepat
+        if sym.upper() in FCA_EXCLUDE:
+            continue
+        try:
+            df = get_history_pro(sym, limit=25, timeframe="1d")
+            if df is None or len(df)<10:
+                continue
+            is_bad, reason = is_fca_or_suspend(sym, df)
+            if is_bad:
+                continue
+            avg_vol = df['Volume'].tail(20).mean()
+            avg_close = df['Close'].tail(20).mean()
+            avg_value = avg_vol * avg_close
+            # filter liquiditas minimal
+            if avg_vol < min_avg_vol:
+                continue
+            if avg_value < min_avg_value_rp:
+                continue
+            # last price tidak boleh gocap suspend
+            if df['Close'].iloc[-1] < 60 and avg_value < 1_000_000_000:
+                continue
+            scored.append((sym, avg_value, avg_vol, df))
+        except:
+            continue
+    # sort by avg value descending - paling liquid di atas
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored  # list of (sym, avg_value, avg_vol, df)
+
+# TOP 400 universe paling liquid IDX (market cap besar + liquid)
+IDX_LIQUID_400 = [
+    "BBCA","BBRI","BMRI","BBNI","BRIS","TLKM","ASII","ADRO","ANTM","MDKA","BRMS","BREN","CUAN","WIFI","BIPI","BULL","NIKL",
+    "DEWA","PGEO","RAJA","MEDC","ELSA","PGAS","PTBA","ITMG","BRPT","TPIA","GOTO","BUKA","EMTK","AMMN","MBMA","NCKL","TINS",
+    "HRUM","INCO","ESSA","AKRA","INDY","SMGR","INTP","UNTR","AUTO","ICBP","INDF","MYOR","KLBF","SIDO","CPIN","JPFA","UNVR",
+    "BNGA","BMTR","MNCN","SCMA","BELI","TECH","DCII","WIRG","BOBA","PTRO","BYAN","DSSA","ADMR","PSAB","ARCI","BUMI","WOWS",
+    "HUMI","MTEL","TOWR","TBIG","JSMR","ISAT","EXCL","DSSA","EMAS","SGER","ELPI","MSJA","SPRE","SAPX","SHID","DSSZ","BUMI",
+    "ADHI","ADRO","AKRA","AMRT","APLN","ASII","ASRI","BBKP","BBTN","BDMN","BFIN","BIRD","BJBR","BJTM","BKSL","BMTR","BNLI",
+    "BRPT","BSDE","BUMI","CEKA","CTRA","DMAS","DOID","ELSA","ENRG","ERAA","EXCL","GGRM","GJTL","HMSP","HRUM","ICBP","INCO",
+    "INDF","INKP","INDY","INTP","ISAT","ITMG","JPFA","JSMR","KLBF","LPKR","LSIP","MAPI","MNCN","PGAS","PTBA","PTPP","PWON",
+    "SCMA","SIDO","SMGR","SMRA","SRIL","SSMS","TLKM","TINS","TKIM","TPIA","UNTR","UNVR","WIKA","WSKT","WINS","WIIM","ADMF",
+    "AGII","AALI","ACES","ACST","AISA","AKSI","ALDO","AMOR","APEX","ARNA","ASDM","ASJT","ASSA","ATAP","AUTO","BACA","BATA",
+    "BAYU","BBHI","BBKP","BBLD","BBMD","BBYB","BCAP","BDMN","BEKS","BELL","BEST","BFIN","BGTG","BHAK","BINA","BIPI","BISI",
+    "BKDP","BKSW","BLTA","BMAS","BOGA","BOLA","BOLT","BOSS","BPFI","BRAM","BRMS","BRNA","BSIM","BSSR","BTEK","BTPS","BUKA",
+    "BUMI","BWPT","BYAN","CAMP","CASA","CASS","CEKA","CENT","CINT","CITA","CLAY","CMNP","CMPP","CNKO","CPIN","CPRI","CSAP",
+    "CTTH","DART","DEWA","DGIK","DILD","DMAS","DNAR","DNET","DOOH","DPNS","DSFI","DSNG","DSSA","DUCK","ECII","EKAD","ELSA",
+    "EMAS","EMTK","ENAK","EPMT","ERAA","ESSA","ESTA","ETWA","EXCL","FASW","FREN","GDST","GIAA","GJTL","GMFI","GOLD","GPRA",
+    "GWSA","HDFA","HERO","HMSP","HRUM","IATA","IBST","ICBP","ICON","IMAS","IMJS","INAF","INCI","INCO","INDF","INDX","INDY",
+    "INKP","INPC","INTA","INTP","IPOL","ISAT","ITMG","JAST","JECC","JPFA","JRPT","JSMR","KAEF","KBLI","KBLM","KBLV","KBRI",
+    "KDSI","KIJA","KLBF","KPIG","LAMI","LION","LMPI","LPCK","LPKR","LPPF","LSIP","LTLS","MAIN","MAMI","MAPI","MARI","MARK",
+    "MASA","MBAP","MBSS","MCOR","MDKA","MEDC","MEGA","MICE","MIDI","MIKA","MMLP","MNCN","MPPA","MRAT","MTDL","MTFN","MYOH",
+    "MYOR","NELY","NISP","NOBU","OCAP","PADI","PANR","PBSA","PDES","PEGE","PGAS","PGLI","PICO","PJAA","PKPK","PLIN","PNBN",
+    "PNBS","PNIN","POWR","PRDA","PTBA","PTIS","PTPP","PTRO","PWON","PYFA","RAJA","RALS","RANC","RDTX","RICY","RODA","SAME",
+    "SCMA","SGER","SGRO","SIDO","SILO","SIMP","SINI","SIPD","SKBM","SKLT","SMAR","SMCB","SMDM","SMGR","SMMA","SMRA","SMSM",
+    "SOCI","SPMA","SRAJ","SRTG","SSIA","SSMS","SSTM","STTP","SUGI","TALF","TARA","TBIG","TBLA","TCID","TFCO","TGKA","TINS",
+    "TKIM","TMAS","TOTL","TOWR","TPIA","TRAM","TRIS","TRST","TSPC","TURI","UANG","ULTJ","UNSP","UNTR","UNVR","VOKS","VIVA",
+    "WAPO","WEHA","WIKA","WINS","WIIM","WSKT","WTON","YPAS","ZONE"
+]
+
+
 TIMEZONE_WIB=pytz.timezone('Asia/Jakarta')
 TELEGRAM_BOT_TOKEN=safe_get_env("TELEGRAM_BOT_TOKEN")
 TARGET_CHAT_ID=safe_get_env("TARGET_CHAT_ID")
@@ -772,18 +876,42 @@ def broadcast_vol_spike(signals, threshold=2.0, akum_only=False, sort_by_rp=Fals
     if msg:
         send_reply(TARGET_CHAT_ID, msg, rm={"inline_keyboard": kb})
 
-def scan_v3_full(force_today=False):
-    today_str=get_now_wib().strftime('%d %b %Y')
-    print(f"[{get_now_wib()}] 🚀 SCAN RINGKAS TODAY={today_str} force_today={force_today}...")
+def scan_v3_full(force_today=False, limit_candidates=60):
+    today_str=get_now_wib().strftime('%d %b %Y %H:%M')
+    print(f"[{get_now_wib()}] 🚀 SCAN RINGKAS TODAY={today_str} force_today={force_today} limit={limit_candidates}...")
+    # ===== 300 LIQUID TERBAIK, NO FCA/SUSPEND =====
+    print(f"[{get_now_wib()}] 🔍 Ambil universe liquid 300, filter FCA/suspend...")
     sd=get_screener_latest(force_today=force_today)
-    if not sd:
-        cands=["BBCA","BBRI","BMRI","BBNI","BRIS","TLKM","ASII","ADRO","ANTM","MDKA","BRMS","BREN","CUAN","WIFI","BIPI","BULL","NIKL"]
-    else:
-        cands=[]
+    
+    # Gabung screener + liquid 400
+    base_cands=[]
+    if sd:
         for it in sd:
             sym=it.get('symbol') or it.get('code')
-            if sym: cands.append(sym.replace(".JK","").upper())
-        cands=list(dict.fromkeys(cands))
+            if sym: base_cands.append(sym.replace(".JK","").upper())
+    
+    combined_raw = base_cands + IDX_LIQUID_400
+    # dedup awal
+    seen=set(); uniq_raw=[]
+    for c in combined_raw:
+        cu=c.upper().strip()
+        if cu and cu not in seen:
+            seen.add(cu); uniq_raw.append(cu)
+    
+    # Filter liquid + exclude FCA/suspend, ambil top 300 by value
+    print(f"[{get_now_wib()}] Filter {len(uniq_raw)} -> liquid + no FCA...")
+    scored = filter_liquid_stocks(uniq_raw, min_avg_value_rp=300_000_000, min_avg_vol=200_000)
+    
+    # Kalau hasil filter < limit, longgarkan threshold
+    if len(scored) < limit_candidates:
+        print(f"[{get_now_wib()}] Hasil filter {len(scored)} < {limit_candidates}, longgarkan threshold...")
+        scored = filter_liquid_stocks(uniq_raw, min_avg_value_rp=100_000_000, min_avg_vol=100_000)
+    
+    # Ambil top N
+    cands = [x[0] for x in scored[:limit_candidates]]
+    
+    print(f"[{get_now_wib()}] ✅ Liquid 300: {len(cands)} saham | Top 5: {cands[:5]} | Avg Value tertinggi: {format_large_number(scored[0][1]) if scored else '0'}")
+    
     det=[]
     def proc(sym):
         if QUOTA_HIT: return None
@@ -924,7 +1052,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.3.10 AUTO SCAN TODAY ONLY Running...")
+    offset=0; print("🤖 V4.4 300 LIQUID NO FCA/SUSPEND Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1071,8 +1199,8 @@ def telegram_bot_listener():
             print(f"Listener err {e}"); time.sleep(3)
 
 def auto_screener_loop():
-    global LAST_SIGNALS_CACHE, SCREENER_CACHE, HISTORY_CACHE
-    print("🚀 Auto Scan TODAY ONLY...")
+    global LAST_SIGNALS_CACHE, SCREENER_CACHE, HISTORY_CACHE, BROKER_CACHE
+    print("🚀 Auto Scan TODAY FULL CLEAR...")
     while True:
         try:
             if not is_market_open(): 
@@ -1082,12 +1210,17 @@ def auto_screener_loop():
                 print("⏸️ Quota habis, pause 30m")
                 time.sleep(1800); continue
             
-            # CLEAR CACHE biar data hari ini, bukan kemarin
+            # CLEAR ALL CACHE biar data hari ini, bukan kemarin - termasuk BROKER
             SCREENER_CACHE.clear()
             HISTORY_CACHE.clear()
-            print(f"[{get_now_wib()}] 🔄 Clear cache -> Scan TODAY fresh")
+            BROKER_CACHE.clear()
+            try:
+                if pathlib.Path("/tmp/rafano_cache.json").exists():
+                    pathlib.Path("/tmp/rafano_cache.json").unlink()
+            except: pass
+            print(f"[{get_now_wib()}] 🔄 Clear ALL cache (screener+history+broker) -> Scan TODAY fresh 150 saham")
             
-            sigs=scan_v3_full(force_today=True)
+            sigs=scan_v3_full(force_today=True, limit_candidates=300)
             LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
             filt=filter_signals_with_cooldown(sigs)
             if filt: 
@@ -1103,7 +1236,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.3.10 AUTO TODAY + LABEL + SCAN 300")
+    print("🔥 RAFANO V4.4 300 LIQUID TERBAIK NO FCA/SUSPEND")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
