@@ -1011,13 +1011,50 @@ def scan_v3_full(force_today=False, limit_candidates=60):
                 allowed=["BO EMA50","BOS EMA","BOW BB","BOB EMA200"]
             else:
                 allowed=["BO EMA50"]
+            
+            # Cek sinyal dalam 2 hari terakhir (bukan cuma hari ini) biar gak kelewat karena yfinance delay
             for sig in buy_sigs:
-                if sig.get('index',-1)==today_idx and sig.get('type','') in allowed:
+                sig_idx = sig.get('index',-1)
+                # allow today or yesterday (today_idx or today_idx-1)
+                if sig_idx >= today_idx-1 and sig.get('type','') in allowed:
                     is_buy_chart=True
                     chart_today_type=sig.get('type','')
                     has_chart_signal=True
                     chart_type=sig.get('type','')
                     break
+            
+            # FALLBACK SIMPLE: kalau detect_buy_signals kosong (vol filter ketat), cek manual crossover EMA50/EMA200
+            if not is_buy_chart and len(hd)>=60:
+                try:
+                    c = hd['Close'].iloc[-1]
+                    o = hd['Open'].iloc[-1]
+                    pc = hd['Close'].iloc[-2]
+                    e50 = hd['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
+                    pe50 = hd['Close'].ewm(span=50, adjust=False).mean().iloc[-2]
+                    e200 = hd['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
+                    pe200 = hd['Close'].ewm(span=200, adjust=False).mean().iloc[-2]
+                    # BO EMA50 today/yesterday simple
+                    if "BO EMA50" in allowed and pc <= pe50 and c > e50:
+                        is_buy_chart=True
+                        chart_today_type="BO EMA50"
+                        has_chart_signal=True
+                        chart_type="BO EMA50"
+                    # BOB EMA200
+                    elif "BOB EMA200" in allowed and pc <= pe200 and c > e200:
+                        is_buy_chart=True
+                        chart_today_type="BOB EMA200"
+                        has_chart_signal=True
+                        chart_type="BOB EMA200"
+                    # BOS EMA: close > EMA50 dalam 3 hari terakhir dan naik
+                    elif "BOS EMA" in allowed and c > e50 and hd['Close'].iloc[-2] > hd['Close'].ewm(span=50).mean().iloc[-2]:
+                        # cek apakah baru breakout 2 hari terakhir
+                        if any(hd['Close'].iloc[-k] <= hd['Close'].ewm(span=50).mean().iloc[-k] for k in range(2,5)):
+                            is_buy_chart=True
+                            chart_today_type="BOS EMA"
+                            has_chart_signal=True
+                            chart_type="BOS EMA"
+                except:
+                    pass
                 # Kalau mau include BOS EMA hari ini juga, uncomment bawah:
                 # if sig_type in ['BO EMA50','BOS EMA'] and sig_idx == today_idx:
                 #     is_buy_chart=True; chart_today_type=sig_type; break
@@ -1037,7 +1074,7 @@ def scan_v3_full(force_today=False, limit_candidates=60):
             an=get_analysis(sym)
             sc,lab,rs=calculate_score_v2(sym, hd, akum, dist, net, an)
             
-            if sc>=35 or (QUOTA_HIT and is_buy_chart):
+            if (sc>=30 and is_buy_chart) or (QUOTA_HIT and is_buy_chart):
                 prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc
                 chg=(lc/prev-1)*100 if prev else 0
                 tp=calculate_trading_plan(hd, multi_tf=multi, timeframe="1d")
@@ -1180,7 +1217,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.5.0 NO WARRANT + /c 5 FIX + SCAN FILTER FIX + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.5.1 BO TODAY + FALLBACK CROSSOVER FIX + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1426,7 +1463,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.5.0 NO WARRANT + /c 5 FIX + SCAN FILTER FIX + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.5.1 BO TODAY + FALLBACK CROSSOVER FIX + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
