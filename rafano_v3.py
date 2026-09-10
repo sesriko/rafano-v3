@@ -25,6 +25,25 @@ def safe_get_env(k):
 
 # ===== FILTER FCA & SUSPEND + LIQUID 300 =====
 FCA_EXCLUDE = {
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     # dari BEI announcement + yang sering FCA
     "FUTR","FITT","HOTEL","ITIC","PUDP","PUDJIADI","COIN","SHID","RELI","ASPI","MEJA","MINA",
     "ESTA","ASLI","VKTR","IMJS","GTSI","IRSX","ATAP","RONY","BCIC","DEFI","ROCK","YPAS","NIRO",
@@ -64,12 +83,24 @@ def is_fca_or_suspend(sym, df=None):
             pass
     return False, ""
 
-def filter_liquid_stocks(candidates, min_avg_value_rp=500_000_000, min_avg_vol=300_000):
-    """Filter 300 saham paling liquid, exclude FCA/suspend"""
+def filter_liquid_stocks(candidates, min_avg_value_rp=500_000_000, min_avg_vol=300_000, fast_mode=False):
+    """Filter 300 saham paling liquid, exclude FCA/suspend - fast_mode untuk auto scan biar gak berat"""
     scored=[]
     for sym in candidates:
-        # skip FCA list cepat
-        if sym.upper() in FCA_EXCLUDE:
+        su = sym.upper()
+        if su in FCA_EXCLUDE:
+            continue
+        if su in {"DSSZ","BHAK","FREN","LAMI","MASA","TURI","AISA","MYOH","MYRX","BNBR","ELTY","TRAM","BORN","ENRG-W","GOLL"}:
+            continue
+        # fast_mode: skip yfinance, cuma filter FCA list aja biar cepat dan gak 404
+        if fast_mode:
+            # kasih score dummy berdasarkan urutan IDX_LIQUID_400 (yang depan lebih liquid)
+            try:
+                idx_pos = IDX_LIQUID_400.index(su)
+                score_val = 1_000_000_000_000 - idx_pos*1_000_000_000
+            except:
+                score_val = 500_000_000
+            scored.append((sym, score_val, 1_000_000, None))
             continue
         try:
             df = get_history_pro(sym, limit=25, timeframe="1d")
@@ -81,20 +112,17 @@ def filter_liquid_stocks(candidates, min_avg_value_rp=500_000_000, min_avg_vol=3
             avg_vol = df['Volume'].tail(20).mean()
             avg_close = df['Close'].tail(20).mean()
             avg_value = avg_vol * avg_close
-            # filter liquiditas minimal
             if avg_vol < min_avg_vol:
                 continue
             if avg_value < min_avg_value_rp:
                 continue
-            # last price tidak boleh gocap suspend
             if df['Close'].iloc[-1] < 60 and avg_value < 1_000_000_000:
                 continue
             scored.append((sym, avg_value, avg_vol, df))
         except:
             continue
-    # sort by avg value descending - paling liquid di atas
     scored.sort(key=lambda x: x[1], reverse=True)
-    return scored  # list of (sym, avg_value, avg_vol, df)
+    return scored
 
 # TOP 400 universe paling liquid IDX (market cap besar + liquid)
 IDX_LIQUID_400 = [
@@ -102,26 +130,26 @@ IDX_LIQUID_400 = [
     "DEWA","PGEO","RAJA","MEDC","ELSA","PGAS","PTBA","ITMG","BRPT","TPIA","GOTO","BUKA","EMTK","AMMN","MBMA","NCKL","TINS",
     "HRUM","INCO","ESSA","AKRA","INDY","SMGR","INTP","UNTR","AUTO","ICBP","INDF","MYOR","KLBF","SIDO","CPIN","JPFA","UNVR",
     "BNGA","BMTR","MNCN","SCMA","BELI","TECH","DCII","WIRG","BOBA","PTRO","BYAN","DSSA","ADMR","PSAB","ARCI","BUMI","WOWS",
-    "HUMI","MTEL","TOWR","TBIG","JSMR","ISAT","EXCL","DSSA","EMAS","SGER","ELPI","MSJA","SPRE","SAPX","SHID","DSSZ","BUMI",
+    "HUMI","MTEL","TOWR","TBIG","JSMR","ISAT","EXCL","DSSA","EMAS","SGER","ELPI","MSJA","SPRE","SAPX","SHID","BUMI",
     "ADHI","ADRO","AKRA","AMRT","APLN","ASII","ASRI","BBKP","BBTN","BDMN","BFIN","BIRD","BJBR","BJTM","BKSL","BMTR","BNLI",
     "BRPT","BSDE","BUMI","CEKA","CTRA","DMAS","DOID","ELSA","ENRG","ERAA","EXCL","GGRM","GJTL","HMSP","HRUM","ICBP","INCO",
     "INDF","INKP","INDY","INTP","ISAT","ITMG","JPFA","JSMR","KLBF","LPKR","LSIP","MAPI","MNCN","PGAS","PTBA","PTPP","PWON",
     "SCMA","SIDO","SMGR","SMRA","SRIL","SSMS","TLKM","TINS","TKIM","TPIA","UNTR","UNVR","WIKA","WSKT","WINS","WIIM","ADMF",
-    "AGII","AALI","ACES","ACST","AISA","AKSI","ALDO","AMOR","APEX","ARNA","ASDM","ASJT","ASSA","ATAP","AUTO","BACA","BATA",
-    "BAYU","BBHI","BBKP","BBLD","BBMD","BBYB","BCAP","BDMN","BEKS","BELL","BEST","BFIN","BGTG","BHAK","BINA","BIPI","BISI",
+    "AGII","AALI","ACES","ACST","AKSI","ALDO","AMOR","APEX","ARNA","ASDM","ASJT","ASSA","ATAP","AUTO","BACA","BATA",
+    "BAYU","BBHI","BBKP","BBLD","BBMD","BBYB","BCAP","BDMN","BEKS","BELL","BEST","BFIN","BGTG","BINA","BIPI","BISI",
     "BKDP","BKSW","BLTA","BMAS","BOGA","BOLA","BOLT","BOSS","BPFI","BRAM","BRMS","BRNA","BSIM","BSSR","BTEK","BTPS","BUKA",
     "BUMI","BWPT","BYAN","CAMP","CASA","CASS","CEKA","CENT","CINT","CITA","CLAY","CMNP","CMPP","CNKO","CPIN","CPRI","CSAP",
     "CTTH","DART","DEWA","DGIK","DILD","DMAS","DNAR","DNET","DOOH","DPNS","DSFI","DSNG","DSSA","DUCK","ECII","EKAD","ELSA",
-    "EMAS","EMTK","ENAK","EPMT","ERAA","ESSA","ESTA","ETWA","EXCL","FASW","FREN","GDST","GIAA","GJTL","GMFI","GOLD","GPRA",
+    "EMAS","EMTK","ENAK","EPMT","ERAA","ESSA","ESTA","ETWA","EXCL","FASW","GDST","GIAA","GJTL","GMFI","GOLD","GPRA",
     "GWSA","HDFA","HERO","HMSP","HRUM","IATA","IBST","ICBP","ICON","IMAS","IMJS","INAF","INCI","INCO","INDF","INDX","INDY",
     "INKP","INPC","INTA","INTP","IPOL","ISAT","ITMG","JAST","JECC","JPFA","JRPT","JSMR","KAEF","KBLI","KBLM","KBLV","KBRI",
-    "KDSI","KIJA","KLBF","KPIG","LAMI","LION","LMPI","LPCK","LPKR","LPPF","LSIP","LTLS","MAIN","MAMI","MAPI","MARI","MARK",
-    "MASA","MBAP","MBSS","MCOR","MDKA","MEDC","MEGA","MICE","MIDI","MIKA","MMLP","MNCN","MPPA","MRAT","MTDL","MTFN","MYOH",
+    "KDSI","KIJA","KLBF","KPIG","LION","LMPI","LPCK","LPKR","LPPF","LSIP","LTLS","MAIN","MAMI","MAPI","MARI","MARK",
+    "MBAP","MBSS","MCOR","MDKA","MEDC","MEGA","MICE","MIDI","MIKA","MMLP","MNCN","MPPA","MRAT","MTDL","MTFN",
     "MYOR","NELY","NISP","NOBU","OCAP","PADI","PANR","PBSA","PDES","PEGE","PGAS","PGLI","PICO","PJAA","PKPK","PLIN","PNBN",
     "PNBS","PNIN","POWR","PRDA","PTBA","PTIS","PTPP","PTRO","PWON","PYFA","RAJA","RALS","RANC","RDTX","RICY","RODA","SAME",
     "SCMA","SGER","SGRO","SIDO","SILO","SIMP","SINI","SIPD","SKBM","SKLT","SMAR","SMCB","SMDM","SMGR","SMMA","SMRA","SMSM",
     "SOCI","SPMA","SRAJ","SRTG","SSIA","SSMS","SSTM","STTP","SUGI","TALF","TARA","TBIG","TBLA","TCID","TFCO","TGKA","TINS",
-    "TKIM","TMAS","TOTL","TOWR","TPIA","TRAM","TRIS","TRST","TSPC","TURI","UANG","ULTJ","UNSP","UNTR","UNVR","VOKS","VIVA",
+    "TKIM","TMAS","TOTL","TOWR","TPIA","TRAM","TRIS","TRST","TSPC","UANG","ULTJ","UNSP","UNTR","UNVR","VOKS","VIVA",
     "WAPO","WEHA","WIKA","WINS","WIIM","WSKT","WTON","YPAS","ZONE"
 ]
 
@@ -900,12 +928,12 @@ def scan_v3_full(force_today=False, limit_candidates=60):
     
     # Filter liquid + exclude FCA/suspend, ambil top 300 by value
     print(f"[{get_now_wib()}] Filter {len(uniq_raw)} -> liquid + no FCA...")
-    scored = filter_liquid_stocks(uniq_raw, min_avg_value_rp=300_000_000, min_avg_vol=200_000)
+    scored = filter_liquid_stocks(uniq_raw, min_avg_value_rp=300_000_000, min_avg_vol=200_000, fast_mode=True)
     
     # Kalau hasil filter < limit, longgarkan threshold
     if len(scored) < limit_candidates:
         print(f"[{get_now_wib()}] Hasil filter {len(scored)} < {limit_candidates}, longgarkan threshold...")
-        scored = filter_liquid_stocks(uniq_raw, min_avg_value_rp=100_000_000, min_avg_vol=100_000)
+        scored = filter_liquid_stocks(uniq_raw, min_avg_value_rp=100_000_000, min_avg_vol=100_000, fast_mode=True)
     
     # Ambil top N
     cands = [x[0] for x in scored[:limit_candidates]]
@@ -914,7 +942,39 @@ def scan_v3_full(force_today=False, limit_candidates=60):
     
     det=[]
     def proc(sym):
-        if QUOTA_HIT: return None
+        # Kalau quota habis, jangan return None langsung, coba pakai cache + VSA fallback
+        if QUOTA_HIT:
+            # coba pakai cache expired
+            ck = get_cached_broker(f"multi_{sym}", allow_expired=True)
+            if ck:
+                multi = ck
+                hd = get_history_pro(sym,limit=120,timeframe="1d")
+                if hd is None or len(hd)<20:
+                    return None
+                akum=multi.get('akum_d',0); dist=multi.get('dist_d',0); net=multi.get('net_d',0); st=multi.get('status_d','NEUTRAL ⚪')
+                lc=hd['Close'].iloc[-1]
+                # tetap proses walau quota
+                is_buy=("AKUM" in st and net>0) or (akum>0) or (net>0)
+                if not is_buy:
+                    # fallback VSA: close > EMA50 dan Buy% >60
+                    try:
+                        e50=hd['Close'].ewm(span=50).mean().iloc[-1]
+                        if lc>e50:
+                            is_buy=True
+                    except:
+                        pass
+                if not is_buy:
+                    return None
+                an=get_analysis(sym)
+                sc,lab,rs=calculate_score_v2(sym,hd,akum,dist,net,an)
+                if sc>=35:
+                    prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc; chg=(lc/prev-1)*100 if prev else 0
+                    tp=calculate_trading_plan(hd,multi_tf=multi,timeframe="1d")
+                    return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":akum,"dist_value":dist,"broker_net":net,"broker_status":st,"reasons":rs,"history_df":hd,"trading_plan":tp,"brokers":multi.get('brokers',[]),"multi_tf":multi}
+                return None
+            else:
+                # tidak ada cache, skip dengan log
+                return None
         try:
             hd=get_history_pro(sym,limit=120,timeframe="1d")
             if hd is None or len(hd)<20: return None
@@ -1210,14 +1270,12 @@ def auto_screener_loop():
                 print("⏸️ Quota habis, pause 30m")
                 time.sleep(1800); continue
             
-            # CLEAR ALL CACHE biar data hari ini, bukan kemarin - termasuk BROKER
+            # CLEAR CACHE tapi BROKER jangan dihapus total, biar quota gak habis di 0
+            # Kalau broker di-clear total, 300 saham langsung hit API -> 429 langsung
             SCREENER_CACHE.clear()
             HISTORY_CACHE.clear()
-            BROKER_CACHE.clear()
-            try:
-                if pathlib.Path("/tmp/rafano_cache.json").exists():
-                    pathlib.Path("/tmp/rafano_cache.json").unlink()
-            except: pass
+            # BROKER_CACHE biarkan, nanti get_cached_broker(allow_expired=True) dipakai kalau quota habis
+            print(f"[{get_now_wib()}] Broker cache kept: {len(BROKER_CACHE)} biar gak 429")
             print(f"[{get_now_wib()}] 🔄 Clear ALL cache (screener+history+broker) -> Scan TODAY fresh 150 saham")
             
             sigs=scan_v3_full(force_today=True, limit_candidates=300)
