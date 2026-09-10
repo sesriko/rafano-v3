@@ -1180,7 +1180,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.4.9 NO WARRANT + TF 5 (tanpa m) FIX + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.5.0 NO WARRANT + /c 5 FIX + SCAN FILTER FIX + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1296,7 +1296,11 @@ Quota habis tetap jalan pakai chart 1D
                         send_reply(chat_id,f"🔍 *SCAN {sf} TODAY* 300 liquid no FCA...")
                         def ms(tg=chat_id, sfil=sf):
                             global LAST_SIGNALS_CACHE
-                            sigs=scan_v3_full(force_today=False, limit_candidates=300, signal_type_filter=sfil)
+                            try:
+                                sigs=scan_v3_full(force_today=False, limit_candidates=300, signal_type_filter=sfil)
+                            except TypeError:
+                                # fallback kalau file lama belum ada param signal_type_filter
+                                sigs=scan_v3_full(force_today=False, limit_candidates=300)
                             LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
                             broadcast_v3(sigs, filter_label=sfil)
                         threading.Thread(target=ms,args=(chat_id,)).start()
@@ -1422,7 +1426,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.4.9 NO WARRANT + TF 5 (tanpa m) FIX + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.5.0 NO WARRANT + /c 5 FIX + SCAN FILTER FIX + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
