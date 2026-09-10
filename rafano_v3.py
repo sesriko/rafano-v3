@@ -195,7 +195,9 @@ import json
 from pathlib import Path
 BROKER_CACHE={}; HISTORY_CACHE={}; SCREENER_CACHE={}
 CACHE_FILE=Path("/tmp/rafano_cache.json")
-BROKER_CACHE_TTL=1800; HISTORY_CACHE_TTL=3600; SCREENER_CACHE_TTL=600
+BROKER_CACHE_TTL=1800
+HISTORY_CACHE_TTL=300  # 5 menit biar data hari ini ke-update
+SCREENER_CACHE_TTL=120  # 2 menit biar screener today
 QUOTA_HIT=False; LAST_429_TIME=0
 try:
     if CACHE_FILE.exists():
@@ -398,6 +400,14 @@ def get_history_pro(sym,limit=150,timeframe="1d"):
             for col in ['Open','High','Low','Close','Volume']: df[col]=pd.to_numeric(df[col],errors='coerce')
             df=df.dropna(subset=['Close'])
             if len(df)>=10:
+                # cek apakah data sudah today? kalau masih kemarin, jangan cache lama
+                try:
+                    last_date=df.index[-1].date()
+                    today=get_now_wib().date()
+                    # kalau last_date < today dan masih jam market (sudah jam 10), coba yfinance fresh
+                    if last_date < today and is_market_open():
+                        pass  # tetap pakai tapi jangan cache lama? tetap cache tapi TTL pendek sudah 5m
+                except: pass
                 set_cached_history(hk,df); return df
         except: pass
     try:
@@ -411,17 +421,24 @@ def get_history_pro(sym,limit=150,timeframe="1d"):
             set_cached_history(hk,hist.tail(limit)); return hist.tail(limit)
     except: pass
     return None
-def get_screener_latest():
-    cached=get_cached_screener()
-    if cached:
-        if isinstance(cached,dict) and 'rows' in cached:
-            norm=[]
-            for r in cached['rows']:
-                code=r.get('stock_code') or r.get('symbol') or r.get('code')
-                if code: norm.append({'symbol':code.replace(".JK","").upper(),'raw':r})
-            return norm
-        return cached
-    data=arjum_get("/screener/latest",use_cache=True)
+def get_screener_latest(force_today=False):
+    # Kalau auto scan jam market, force refresh biar gak pakai kemarin
+    if not force_today:
+        cached=get_cached_screener()
+        if cached:
+            # cek apakah cache masih today? kalau sudah lewat 2 jam anggap stale
+            if isinstance(cached,dict) and 'rows' in cached:
+                # kalau force_today, skip cache
+                if not force_today:
+                    norm=[]
+                    for r in cached['rows']:
+                        code=r.get('stock_code') or r.get('symbol') or r.get('code')
+                        if code: norm.append({'symbol':code.replace(".JK","").upper(),'raw':r})
+                    return norm
+            elif not force_today:
+                return cached
+    # force fresh dari API
+    data=arjum_get("/screener/latest",use_cache=False if force_today else True)
     if not data: return []
     if isinstance(data,dict):
         if 'rows' in data and isinstance(data['rows'],list):
@@ -755,9 +772,10 @@ def broadcast_vol_spike(signals, threshold=2.0, akum_only=False, sort_by_rp=Fals
     if msg:
         send_reply(TARGET_CHAT_ID, msg, rm={"inline_keyboard": kb})
 
-def scan_v3_full():
-    print(f"[{get_now_wib()}] 🚀 SCAN RINGKAS...")
-    sd=get_screener_latest()
+def scan_v3_full(force_today=False):
+    today_str=get_now_wib().strftime('%d %b %Y')
+    print(f"[{get_now_wib()}] 🚀 SCAN RINGKAS TODAY={today_str} force_today={force_today}...")
+    sd=get_screener_latest(force_today=force_today)
     if not sd:
         cands=["BBCA","BBRI","BMRI","BBNI","BRIS","TLKM","ASII","ADRO","ANTM","MDKA","BRMS","BREN","CUAN","WIFI","BIPI","BULL","NIKL"]
     else:
@@ -906,7 +924,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.3.9 LABEL BUY RESTORED + SCAN 300 Running...")
+    offset=0; print("🤖 V4.3.10 AUTO SCAN TODAY ONLY Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1053,21 +1071,39 @@ def telegram_bot_listener():
             print(f"Listener err {e}"); time.sleep(3)
 
 def auto_screener_loop():
-    global LAST_SIGNALS_CACHE
-    print("🚀 Auto Scan...")
+    global LAST_SIGNALS_CACHE, SCREENER_CACHE, HISTORY_CACHE
+    print("🚀 Auto Scan TODAY ONLY...")
     while True:
         try:
-            if not is_market_open(): time.sleep(300); continue
-            if QUOTA_HIT: time.sleep(1800); continue
-            sigs=scan_v3_full(); LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
+            if not is_market_open(): 
+                print(f"[{get_now_wib()}] Market tutup, sleep 5m")
+                time.sleep(300); continue
+            if QUOTA_HIT: 
+                print("⏸️ Quota habis, pause 30m")
+                time.sleep(1800); continue
+            
+            # CLEAR CACHE biar data hari ini, bukan kemarin
+            SCREENER_CACHE.clear()
+            HISTORY_CACHE.clear()
+            print(f"[{get_now_wib()}] 🔄 Clear cache -> Scan TODAY fresh")
+            
+            sigs=scan_v3_full(force_today=True)
+            LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
             filt=filter_signals_with_cooldown(sigs)
-            if filt: broadcast_v3(filt)
-            time.sleep(1800)
-        except Exception as e: print(f"Auto err {e}"); time.sleep(60)
+            if filt: 
+                print(f"[{get_now_wib()}] Broadcast {len(filt)} BUY TODAY")
+                broadcast_v3(filt)
+            else:
+                print(f"[{get_now_wib()}] No BUY today")
+            time.sleep(1800)  # 30 menit
+        except Exception as e: 
+            print(f"Auto err {e}")
+            import traceback; traceback.print_exc()
+            time.sleep(60)
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.3.9 LABEL BUY + SCAN 300")
+    print("🔥 RAFANO V4.3.10 AUTO TODAY + LABEL + SCAN 300")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
