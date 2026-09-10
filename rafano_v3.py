@@ -943,7 +943,7 @@ def scan_v3_full(force_today=False, limit_candidates=60):
             except:
                 pass
             
-            # LOGIC BUY CHART 1D
+            # ===== LOGIC BUY CHART 1D - CUMA BO EMA50 HARI INI =====
             ema20=hd['Close'].ewm(span=20).mean().iloc[-1]
             ema50=hd['Close'].ewm(span=50).mean().iloc[-1]
             ema200=hd['Close'].ewm(span=200).mean().iloc[-1]
@@ -951,12 +951,25 @@ def scan_v3_full(force_today=False, limit_candidates=60):
             buy_pct=df_v['Buy_Pct'].iloc[-1] if 'Buy_Pct' in df_v.columns else 50
             
             is_buy_chart=False
-            if has_chart_signal:
-                is_buy_chart=True
-            elif lc>ema20 and lc>ema50 and buy_pct>=55:
-                is_buy_chart=True
-            elif lc>ema200 and lc>ema50 and buy_pct>=60:
-                is_buy_chart=True
+            chart_today_type=""
+            # Cek apakah ada sinyal BO EMA50 yang terjadi HARI INI (candle terakhir)
+            today_idx = len(hd)-1
+            for sig in buy_sigs:
+                sig_idx = sig.get('index', -1)
+                sig_type = sig.get('type','')
+                # CUMA ambil BO EMA50 yang terjadi hari ini
+                if sig_type == 'BO EMA50' and sig_idx == today_idx:
+                    is_buy_chart=True
+                    chart_today_type=sig_type
+                    has_chart_signal=True
+                    chart_type=sig_type
+                    break
+                # Kalau mau include BOS EMA hari ini juga, uncomment bawah:
+                # if sig_type in ['BO EMA50','BOS EMA'] and sig_idx == today_idx:
+                #     is_buy_chart=True; chart_today_type=sig_type; break
+            
+            # JANGAN pakai logic ema20>ema50 umum, cuma BO EMA50 hari ini
+            # is_buy_chart hanya True kalau BO EMA50 today
             
             if not QUOTA_HIT:
                 # REAL MODE: butuh chart signal atau akum
@@ -974,7 +987,9 @@ def scan_v3_full(force_today=False, limit_candidates=60):
                 prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc
                 chg=(lc/prev-1)*100 if prev else 0
                 tp=calculate_trading_plan(hd, multi_tf=multi, timeframe="1d")
-                if has_chart_signal:
+                if is_buy_chart and chart_today_type:
+                    rs=[f"CHART 1D TODAY: {chart_today_type}"] + rs
+                elif has_chart_signal:
                     rs=[f"CHART 1D: {chart_type}"] + rs
                 if QUOTA_HIT:
                     rs.append("⚠️ QUOTA HABIS - CHART 1D ONLY")
@@ -986,7 +1001,7 @@ def scan_v3_full(force_today=False, limit_candidates=60):
             pass
         return None
     for idx,sym in enumerate(cands):
-        # JANGAN break kalau quota habis - tetap lanjut scan pakai chart 1D
+        # SCAN BO EMA50 TODAY ONLY
         if QUOTA_HIT and idx % 50 == 0:
             print(f"⚠️ Quota habis tapi tetap scan CHART 1D di {idx}/{len(cands)}...")
         r=proc(sym)
@@ -1111,7 +1126,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.4.6 SCANBUY CHART 1D QUOTA SAFE + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.4.7 BO EMA50 TODAY ONLY + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1326,7 +1341,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.4.6 SCANBUY CHART 1D QUOTA SAFE + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.4.7 BO EMA50 TODAY ONLY + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
