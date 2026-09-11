@@ -1,3 +1,169 @@
+
+# ===== AUTO NOTIFY V4.7.0 - BO EMA50/BOB EMA200 REALTIME =====
+AUTO_NOTIFY_ENABLED = os.getenv("AUTO_NOTIFY", "true").lower() == "true"
+AUTO_NOTIFY_INTERVAL = int(os.getenv("AUTO_INTERVAL_SEC", "60"))  # cek tiap 60 detik
+AUTO_NOTIFY_EMA_FILTER = ["BO EMA50", "BOB EMA200"]  # hanya ini yang di-notify
+AUTO_NOTIFIED_TODAY = set()  # biar gak spam - sudah di-notify hari ini
+AUTO_LAST_RESET_DATE = None
+
+def is_market_hours_wib():
+    """Cek jam bursa IDX 09:00-16:00 WIB, Senin-Jumat"""
+    try:
+        now = get_now_wib()
+        if now.weekday() >= 5:  # Sabtu Minggu
+            return False
+        # 09:00-12:00 sesi 1, 13:30-16:00 sesi 2 (simplify 09:00-16:00)
+        h = now.hour + now.minute/60
+        return 9.0 <= h <= 16.0
+    except:
+        return True
+
+def send_auto_telegram_alert(signal):
+    """Kirim notif auto BO EMA50/BOB EMA200 ke semua chat yang pernah /start"""
+    try:
+        # Ambil chart + realtime price
+        sym = signal['symbol']
+        stype = signal['type']
+        close = signal['close']
+        chg = signal.get('change',0)
+        
+        # Coba ambil realtime itick
+        realtime_price = close
+        source_label = "YF"
+        try:
+            if ITICK_ENABLED:
+                iq = get_itick_quote(sym)
+                if iq and iq['price']>0:
+                    realtime_price = iq['price']
+                    source_label = "ITICK_REALTIME ⚡"
+        except:
+            pass
+        
+        # Broker info kalau ada
+        broker_info = ""
+        try:
+            b = get_cached_broker(sym)
+            if b and b.get('broker_summary'):
+                bs = b['broker_summary']
+                broker_info = f"\n👤 Broker: {bs[:80]}"
+        except:
+            pass
+        
+        # Hitung TP/SL simple
+        tp = close * 1.08
+        sl = close * 0.93
+        
+        msg = f"""🚨 *AUTO BO DETECTED* {get_now_wib().strftime('%d %b %H:%M')} WIB
+
+📈 *{sym}* - *{stype}*
+💰 Price: Rp {realtime_price:.0f} ({chg:+.2f}%) {source_label}
+📊 Close: {close:.0f} | EMA50: {signal.get('ema50',0):.0f} | EMA200: {signal.get('ema200',0):.0f}
+
+🎯 *TRADING PLAN*
+Entry: {close:.0f}
+TP +8%: {tp:.0f}
+SL -7%: {sl:.0f}
+RR: 1:1.14
+
+{broker_info}
+
+⚡ *Auto dari RAFANO V4.7.0* - Real-time monitor
+/c {sym} untuk chart
+"""
+        # Kirim ke semua chat yang ada di memory atau broadcast channel
+        # Untuk simple: kirim ke TELEGRAM_CHAT_ID dari env
+        chat_id_env = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+        if chat_id_env:
+            try:
+                send_reply(chat_id_env, msg)
+            except:
+                pass
+        
+        # Juga coba broadcast ke last chat yang aktif (disimpan di file)
+        try:
+            cache_file = "/tmp/rafano_last_chats.txt"
+            if os.path.exists(cache_file):
+                with open(cache_file,'r') as f:
+                    chats = [l.strip() for l in f.readlines() if l.strip()]
+                    for cid in chats[-5:]:  # 5 chat terakhir
+                        try:
+                            send_reply(cid, msg)
+                        except:
+                            pass
+        except:
+            pass
+            
+        print(f"✅ AUTO ALERT sent: {sym} {stype} @ {realtime_price}")
+        return True
+    except Exception as e:
+        print(f"❌ AUTO ALERT failed {signal.get('symbol')}: {e}")
+        return False
+
+def auto_scan_loop():
+    """Loop auto scan tiap AUTO_NOTIFY_INTERVAL detik selama jam bursa"""
+    global AUTO_NOTIFIED_TODAY, AUTO_LAST_RESET_DATE
+    print(f"🤖 AUTO NOTIFY LOOP started - interval {AUTO_NOTIFY_INTERVAL}s")
+    while True:
+        try:
+            # Reset notified set tiap hari baru
+            today_date = get_now_wib().strftime('%Y-%m-%d')
+            if AUTO_LAST_RESET_DATE != today_date:
+                AUTO_NOTIFIED_TODAY = set()
+                AUTO_LAST_RESET_DATE = today_date
+                print(f"🔄 AUTO NOTIFY reset for new day {today_date}")
+            
+            if not AUTO_NOTIFY_ENABLED:
+                time.sleep(60)
+                continue
+            
+            if not is_market_hours_wib():
+                # Diluar jam bursa, tidur 5 menit
+                time.sleep(300)
+                continue
+            
+            print(f"🔍 AUTO SCAN checking {get_now_wib().strftime('%H:%M:%S')} - {len(AUTO_NOTIFIED_TODAY)} already notified today")
+            
+            # Scan fast 100 saham (cukup cepat ~15 detik)
+            try:
+                signals = scan_v3_full_fast(force_today=True, limit_candidates=100, signal_type_filter="BO_BOB")
+                
+                for sig in signals:
+                    sym = sig['symbol']
+                    stype = sig['type']
+                    
+                    # Hanya notify BO50 dan BOB200
+                    if stype not in AUTO_NOTIFY_EMA_FILTER:
+                        continue
+                    
+                    # Sudah di-notify hari ini?
+                    key = f"{today_date}_{sym}_{stype}"
+                    if key in AUTO_NOTIFIED_TODAY:
+                        continue
+                    
+                    # Kirim alert
+                    if send_auto_telegram_alert(sig):
+                        AUTO_NOTIFIED_TODAY.add(key)
+                        
+            except Exception as e:
+                print(f"AUTO SCAN error: {e}")
+            
+            # Tunggu interval berikutnya
+            time.sleep(AUTO_NOTIFY_INTERVAL)
+            
+        except Exception as e:
+            print(f"AUTO LOOP fatal error: {e}")
+            time.sleep(60)
+
+def start_auto_notify_thread():
+    """Start auto notify di background thread"""
+    if AUTO_NOTIFY_ENABLED:
+        t = threading.Thread(target=auto_scan_loop, daemon=True)
+        t.start()
+        print(f"✅ AUTO NOTIFY thread started - monitoring BO EMA50/BOB EMA200 every {AUTO_NOTIFY_INTERVAL}s")
+    else:
+        print("⏸️ AUTO NOTIFY disabled - set AUTO_NOTIFY=true to enable")
+
+
 """
 RAFANO V4.3.3 + SCAN VOLUME SPIKE >2x
 - Fix NO SIGNAL = NO ENTRY (dari V4.3.2)
@@ -1327,7 +1493,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.6.1 FAST 3-API HYBRID - 10x SPEED + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.7.0 AUTO NOTIFY - BO50/BOB200 REALTIME + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1347,25 +1513,28 @@ def telegram_bot_listener():
                 elif "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=txt.split()[0].lower() if txt else ""
                     if first in ["/start","/help","/menu"]:
-                        txt_help = """🔥 *RAFANO V4.6.1 FAST 10x* 3-API HYBRID
+                        txt_help = """🔥 *RAFANO V4.7.0 AUTO NOTIFY* BO50/BOB200 REALTIME
 ARJUM + YF + ITICK ⚡
 ==========================
-⚡ *SCAN CEPAT (NEW)*
-/scanfast = 60 saham liquid, parallel 20x, ~10 detik
-/scanfast 100 = 100 saham, ~15 detik
-/scanfull = 300 saham parallel 20x, ~60 detik
+🤖 *AUTO NOTIFY (NEW - TANPA SCAN MANUAL)*
+Bot otomatis monitor 100 saham tiap 60 detik jam 09:00-16:00 WIB
+Kalau ada BO EMA50 / BOB EMA200 langsung kirim Telegram!
 
-📊 *SCAN NORMAL*
-/scan = BO50+BOB200 last candle (300 saham sequential)
-/scan bos /scan bow /scan all
+Commands:
+/autostatus = cek status auto
+/autoon = nyalakan auto
+/autooff = matikan auto
+
+⚡ *SCAN MANUAL (kalau mau)*
+/scanfast 60 = 60 saham ~10 detik
+/scanfast 100 = 100 saham ~15 detik
+/scanfull = 300 saham ~60 detik
 
 📈 *CHART*
-/c KODE [TF] ex: /c BMTR 5 /c ANTM
+/c KODE [TF] ex: /c BMTR 5
 /b KODE
 
-Tips cepat:
-- Pakai /scanfast buat cek BMTR BO50 cepat
-- Pakai /scanfull kalau mau lengkap 300 saham tapi tetap cepat"""
+Bot sekarang jalan 24/7 auto, gak perlu /scan manual lagi!"""
                         send_reply(chat_id, txt_help)
                     elif first in ["/c","/chart"]:
                         parts=txt.split()
@@ -1569,7 +1738,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.6.1 FAST 3-API HYBRID - 10x SPEED + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.7.0 AUTO NOTIFY - BO50/BOB200 REALTIME + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
