@@ -9,6 +9,65 @@ import os, time, datetime, threading, requests, pytz, numpy as np, pandas as pd,
 from dotenv import load_dotenv
 load_dotenv()
 
+# ===== ITICK.ORG INTEGRATION - V4.6.0 3-API HYBRID =====
+ITICK_TOKEN = os.getenv("ITICK_TOKEN") or os.getenv("ITICK_API_KEY") or "7a470a83276242309fb940684046d35a88e450fdb95b46c383670e1e0c5e96f5"
+ITICK_BASE = "https://api.itick.org"
+ITICK_ENABLED = bool(ITICK_TOKEN)
+
+def get_itick_quote(sym):
+    """Get realtime quote from itick.org region=ID - 0 delay"""
+    if not ITICK_ENABLED:
+        return None
+    try:
+        url = f"{ITICK_BASE}/stock/quote?region=ID&code={sym}"
+        headers = {"accept": "application/json", "token": ITICK_TOKEN}
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get('code') == 0 and j.get('data'):
+                d = j['data']
+                return {
+                    'price': float(d.get('ld') or d.get('c') or 0),
+                    'open': float(d.get('o') or 0),
+                    'high': float(d.get('h') or 0),
+                    'low': float(d.get('l') or 0),
+                    'volume': float(d.get('v') or 0),
+                    'change': float(d.get('ch') or 0),
+                    'changepct': float(d.get('chp') or 0),
+                    'source': 'ITICK_REALTIME'
+                }
+    except Exception as e:
+        print(f"itick quote error {sym}: {e}")
+    return None
+
+def get_itick_quotes_batch(symbols, max_batch=15):
+    """Batch quotes - max 15 for free tier"""
+    if not ITICK_ENABLED or not symbols:
+        return {}
+    try:
+        codes = ",".join(symbols[:max_batch])
+        url = f"{ITICK_BASE}/stock/quotes?region=ID&codes={codes}"
+        headers = {"accept": "application/json", "token": ITICK_TOKEN}
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get('code') == 0 and j.get('data'):
+                result = {}
+                for item in j['data']:
+                    code = item.get('s') or item.get('code')
+                    if code:
+                        result[code] = {
+                            'price': float(item.get('ld') or 0),
+                            'change': float(item.get('ch') or 0),
+                            'changepct': float(item.get('chp') or 0),
+                            'source': 'ITICK_REALTIME'
+                        }
+                return result
+    except Exception as e:
+        print(f"itick batch error: {e}")
+    return {}
+
+
 def safe_get_env(k):
     v=os.getenv(k)
     if v: return str(v).strip().strip('"').strip("'")
@@ -1219,7 +1278,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.5.3 AUDITED - BO50+BOB200 LAST CANDLE + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.6.0 3-API HYBRID - ARJUM+YF+ITICK REALTIME + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1239,24 +1298,32 @@ def telegram_bot_listener():
                 elif "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=txt.split()[0].lower() if txt else ""
                     if first in ["/start","/help","/menu"]:
-                        txt_help = """🔥 *RAFANO V4.5.3 SIMPLE* 300 liquid no FCA
-Quota habis tetap jalan pakai chart 1D
+                        txt_help = """🔥 *RAFANO V4.6.0 3-API HYBRID* 300 liquid no FCA
+ARJUM (broker) + YFINANCE (history) + ITICK (realtime 0 delay)
 ==========================
 📊 *CHART*
 /c KODE [TF] ex: /c BIPI /c ANTM 5
 /b KODE ex: /b BIPI
+Realtime: ITICK ⚡ > YF 15m delay
 
-🔍 *SCAN BUY TODAY (last candle daily)*
+🔍 *SCAN BUY TODAY (last candle)*
 /scan = BO EMA50 + BOB EMA200 last candle
 /scan bos = BOS EMA hari ini
 /scan bow = BOW BB hari ini
 /scan all = semua BO+BOS+BOW+BOB
 
+Keunggulan V4.6.0:
+✅ History EMA dari YF (gratis unlimited)
+✅ Price realtime 0 delay dari ITICK (free token)
+✅ Broker akum/dist dari ARJUM (kalau quota habis → VSA)
+✅ BMTR BO50/BOB200 last candle pasti muncul
+
 🔥 *VOL SPIKE*
 /vol 2 = vol >2x 60 saham
 /volall 2 = 300 saham sort Rp
 
-⚙️ /quota /clear /help"""
+⚙️ /quota /clear /help
+ITICK Free: 1000 req/day, max 15 batch"""
                         send_reply(chat_id, txt_help)
                     elif first in ["/c","/chart"]:
                         parts=txt.split()
@@ -1460,7 +1527,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.5.3 AUDITED - BO50+BOB200 LAST CANDLE + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.6.0 3-API HYBRID - ARJUM+YF+ITICK REALTIME + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
