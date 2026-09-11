@@ -234,6 +234,55 @@ def calculate_score_v48(item):
     total=min(base+bonus,100)
     return base, bonus, total
 
+
+def _check_strict_bo_today(sym, hd, today_date, signal_type_filter="BO_BOB"):
+    try:
+        if hd is None or len(hd) < 55: return None
+        try:
+            last_dt = pd.to_datetime(hd.index[-1])
+            last_candle_date = last_dt.date()
+        except:
+            return None
+        delta = (today_date - last_candle_date).days
+        if delta != 0: return None
+        c = float(hd['Close'].iloc[-1]); pc = float(hd['Close'].iloc[-2])
+        if c < 50: return None
+        ema50_s = hd['Close'].ewm(span=50, adjust=False).mean()
+        ema200_s = hd['Close'].ewm(span=200, adjust=False).mean()
+        ema50 = float(ema50_s.iloc[-1]); ema200 = float(ema200_s.iloc[-1])
+        pe50 = float(ema50_s.iloc[-2]); pe200 = float(ema200_s.iloc[-2])
+        is_bo=False; stype=""
+        if pc <= pe50 and c > ema50 and c > pe50: is_bo=True; stype="BO EMA50"
+        elif pc <= pe200 and c > ema200 and c > pe200: is_bo=True; stype="BOB EMA200"
+        if not is_bo: return None
+        vol_today = float(hd['Volume'].iloc[-1])
+        avg_vol_20 = float(hd['Volume'].iloc[-21:-1].mean()) if len(hd)>=21 else float(hd['Volume'].iloc[:-1].mean())
+        if avg_vol_20 <= 0 or vol_today <= 0: return None
+        vol_ratio = vol_today / avg_vol_20
+        if vol_ratio < 1.5: return None
+        chg = (c/pc-1)*100 if pc>0 else 0
+        return {"symbol":sym,"type":stype,"close":c,"change":chg,"ema50":ema50,"ema200":ema200,"last_date":str(last_candle_date),"vol_today":vol_today,"avg_vol_20":avg_vol_20,"vol_ratio":vol_ratio,"source":"STRICT_TODAY_VOL","score":vol_ratio*10}
+    except:
+        return None
+
+def calculate_vsa_metrics(df):
+    df=df.copy()
+    pr=(df['High']-df['Low']).replace(0,0.1); cp=(df['Close']-df['Low'])/pr; cp=np.clip(cp,0.05,0.95)
+    br=0.30+cp*0.60
+    if 'V1' in df.columns:
+        vr=df['Volume']/df['V1'].replace(0,1); ig=df['Close']>=df['Open']
+        boost=np.where((vr>1.5)&ig,0.10,0)+np.where((vr>2.5)&ig,0.10,0); br=br+boost
+        br=np.where(vr<0.3,0.30+cp*0.60,br)
+    br=np.clip(br,0.10,0.95)
+    df['Vol_Buy']=df['Volume']*br; df['Vol_Sell']=df['Volume']-df['Vol_Buy']
+    df['Net_Vol_VSA']=df['Vol_Buy']-df['Vol_Sell']; df['Net_Val_VSA']=df['Net_Vol_VSA']*df['Close']; df['Buy_Pct']=br*100
+    return df,br
+
+def calculate_bollinger_bands(df,p=20,s=2):
+    sma=df['Close'].rolling(p).mean(); std=df['Close'].rolling(p).std()
+    return sma,sma+(std*s),sma-(std*s)
+
+
 def scan_v48(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6):
     print(f"[{get_now_wib()}] 🚀 V4.8: ARJUM {top_gainer_arjum}->ITICK {top_itick} VOL>{vol_thr}x")
     screener = get_screener_latest(force_today=True)
@@ -364,7 +413,119 @@ def calculate_atr(df,p=14):
     tr1=df['High']-df['Low']; tr2=(df['High']-df['Close'].shift(1)).abs(); tr3=(df['Low']-df['Close'].shift(1)).abs()
     tr=pd.concat([tr1,tr2,tr3],axis=1).max(axis=1); return tr.rolling(window=p,min_periods=1).mean()
 
-def generate_simple_chart(df, symbol, output_filename="chart.png"):
+# OLD simple chart replaced by PRO CHART
+def generate_pro_chart(df,symbol="BBCA",timeframe="1d",sector_info="IHSG",output_filename="chart.png",extra_info=None):
+    try:
+        extra_info=extra_info or {}
+        tf_label_disp=extra_info.get('tf_label') or format_timeframe_label(timeframe)
+        df=df.copy().ffill().bfill()
+        if not isinstance(df.index,pd.DatetimeIndex): df.index=pd.to_datetime(df.index)
+        else: df=df.sort_index()
+        df['EMA13']=df['Close'].ewm(span=13,adjust=False).mean()
+        df['EMA20']=df['Close'].ewm(span=20,adjust=False).mean()
+        df['EMA50']=df['Close'].ewm(span=50,adjust=False).mean()
+        df['EMA200']=df['Close'].ewm(span=200,adjust=False).mean()
+        df['V1']=df['Volume'].rolling(20,min_periods=1).mean()
+        df['V2']=df['Volume'].rolling(50,min_periods=1).mean()
+        df,buy_ratios=calculate_vsa_metrics(df)
+        last_close=df['Close'].iloc[-1]; last_open=df['Open'].iloc[-1]; last_high=df['High'].iloc[-1]; last_low=df['Low'].iloc[-1]; last_vol=df['Volume'].iloc[-1]
+        prev_close=df['Close'].iloc[-2] if len(df)>1 else last_close
+        chg_pct=((last_close/prev_close)-1)*100 if prev_close else 0
+        avg_price=df['Close'].tail(20).mean()
+        vchg1=(last_vol/df['Volume'].iloc[-2]) if len(df)>1 and df['Volume'].iloc[-2]>0 else 1
+        avg5=df['Volume'].tail(5).mean()
+        vchg5=(last_vol/avg5) if avg5>0 else 1
+        speed="FAST" if vchg1>2.0 else "SLOW" if vchg1<0.8 else "NORMAL"
+        buy_pct_temp=int(buy_ratios[-1]*100)
+        power="TURBO" if buy_pct_temp>=85 and vchg1>=1.2 else "STRONG" if buy_pct_temp>=70 or vchg1>=1.5 else "NORMAL" if buy_pct_temp>=60 else "WEAK"
+        safety="GOOD" if last_close>df['EMA200'].iloc[-1] else "BAD"
+        ema13=df['EMA13'].iloc[-1]; ema20=df['EMA20'].iloc[-1]; ema50=df['EMA50'].iloc[-1]; ema200=df['EMA200'].iloc[-1]
+        buy_pct=int(buy_ratios[-1]*100); sell_pct=100-buy_pct
+        net_vol=df['Net_Vol_VSA'].iloc[-1]; net_vol_5d=df['Net_Vol_VSA'].tail(5).sum()
+
+        plt.style.use('dark_background')
+        fig=plt.figure(figsize=(16,9),dpi=200,facecolor='#000000')
+        gs=gridspec.GridSpec(4,1,height_ratios=[4.5,1.1,0.9,0.8],hspace=0.05)
+        ax_main=fig.add_subplot(gs[0]); ax_vol=fig.add_subplot(gs[1],sharex=ax_main); ax_nbsa=fig.add_subplot(gs[2],sharex=ax_main); ax_mm=fig.add_subplot(gs[3],sharex=ax_main)
+        fig.subplots_adjust(left=0.08,right=0.92,top=0.88,bottom=0.06)
+        for ax in [ax_main,ax_vol,ax_nbsa,ax_mm]:
+            ax.set_facecolor('#000000')
+            ax.tick_params(colors='#aaaaaa',labelsize=8)
+            ax.yaxis.tick_right()
+            ax.grid(False)
+
+        x=np.arange(len(df))
+        # Candle
+        for i in range(len(df)):
+            o,h,l,c=df['Open'].iloc[i],df['High'].iloc[i],df['Low'].iloc[i],df['Close'].iloc[i]
+            ax_main.plot([i,i],[l,h],color='#00ff00' if c>=o else '#ff0000',linewidth=0.8,alpha=0.8)
+            body_low=min(o,c); body_h=max(0.5,abs(c-o))
+            if c>=o:
+                rect=patches.Rectangle((i-0.35,body_low),0.7,body_h,facecolor='none',edgecolor='#00ff00',linewidth=0.8)
+            else:
+                rect=patches.Rectangle((i-0.35,body_low),0.7,body_h,facecolor='#ff3333',edgecolor='#ff3333',linewidth=0.8)
+            ax_main.add_patch(rect)
+
+        ax_main.plot(x,df['EMA13'],color='#ffff00',linewidth=1.0,alpha=0.9)
+        ax_main.plot(x,df['EMA20'],color='#ff0000',linewidth=1.0,alpha=0.9)
+        ax_main.plot(x,df['EMA50'],color='#ffffff',linewidth=1.0,alpha=0.9)
+        ax_main.plot(x,df['EMA200'],color='#a020f0',linewidth=1.2,alpha=0.9)
+
+        ax_main.set_xlim(-1,len(df)-1+10)
+        ax_main.set_ylim(df['Low'].min()*0.95,df['High'].max()*1.08)
+
+        left_text=f"Avg Price : {avg_price:,.1f}\nVchg 1 Bar: {vchg1:.1f} x\nVchg 5 Bar: {vchg5:.1f} x\nSpeed : {speed}\nPower : {power}\nSafety : {safety}\n\nEMA 13 : {ema13:,.1f}\nEMA 20 : {ema20:,.1f}\nEMA 50 : {ema50:,.1f}\nEMA 200: {ema200:,.1f}"
+        ax_main.text(0.01,0.98,left_text,transform=ax_main.transAxes,va='top',ha='left',fontsize=8,family='monospace',color='#e0e0e0',bbox=dict(facecolor='black',alpha=0.6,edgecolor='none'))
+
+        fig.text(0.01,0.96,f"{symbol} :    {last_close:.0f} ({chg_pct:+.2f}%)",color='#ffff00',fontsize=13,fontweight='bold',ha='left',va='center')
+        fig.text(0.01,0.93,f"{sector_info}",color='#ffaa00',fontsize=8,ha='left')
+        fig.text(0.5,0.96,"RAFANO TRADER",color='white',fontsize=14,fontweight='bold',ha='center',va='center')
+        ds=df.index[-1].strftime('%d %b %Y') if hasattr(df.index[-1],'strftime') else get_now_wib().strftime('%d %b %Y')
+        fig.text(0.99,0.96,f"{tf_label_disp} | {ds}",color='#ffcc00',fontsize=10,ha='right',va='center')
+        fig.text(0.99,0.93,f"Command BOT /C {symbol}",color='white',fontsize=8,ha='right')
+        fig.text(0.01,0.885,f"High:{last_high:.0f} Low:{last_low:.0f} Open:{last_open:.0f} Vol:{last_vol:,.0f}",color='#00ffff',fontsize=8,ha='left')
+
+        vol_info=f"Buy % = {buy_pct}% Sell % = {sell_pct}% Net Vol = {net_vol:,.0f} 5D = {net_vol_5d:,.0f}"
+        ax_vol.text(0.005,0.88,vol_info,transform=ax_vol.transAxes,color='#ffffff',fontsize=8,va='top')
+        ax_vol.bar(x,df['Vol_Sell'],color='#cc0000',width=0.8,alpha=0.8)
+        ax_vol.bar(x,df['Vol_Buy'],bottom=df['Vol_Sell'],color='#00cc00',width=0.8,alpha=0.9)
+        ax_vol.plot(x,df['V1'],color='white',linewidth=0.8,alpha=0.9)
+        ax_vol.set_ylim(0,df['Volume'].max()*1.8)
+        plt.setp(ax_vol.get_xticklabels(),visible=False)
+
+        # NBSA
+        nbsa_label=f"NBSA Rp. {abs(net_vol*last_close)/1e9:.2f} B"
+        ax_nbsa.text(0.005,0.85,nbsa_label,transform=ax_nbsa.transAxes,color='#ffffff',fontsize=8,va='top')
+        nbsa_vals=df['Net_Vol_VSA'].tail(80)/(df['Net_Vol_VSA'].abs().max() or 1)*50
+        xn=np.arange(len(df)-len(nbsa_vals),len(df))
+        for i,v in zip(xn,nbsa_vals):
+            ax_nbsa.bar(i,v,color='#00ffff' if v>=0 else '#ff4444',width=0.6)
+        ax_nbsa.axhline(0,color='#444444',linewidth=0.5)
+        ax_nbsa.set_ylim(-60,60)
+
+        # MM
+        ax_mm.text(0.005,0.85,"Market Maker",transform=ax_mm.transAxes,color='#ffffff',fontsize=8,va='top')
+        if 'MM' not in df.columns: df['MM']=(df['Close']-df['EMA50'])/df['EMA50']*1000
+        mm_vals=df['MM'].tail(80)
+        xm=np.arange(len(df)-len(mm_vals),len(df))
+        ax_mm.bar(xm,mm_vals,color='#cccccc',width=0.5,alpha=0.8)
+        step=max(1,len(df)//8)
+        ax_mm.set_xticks(x[::step])
+        ax_mm.set_xticklabels([df.index[i].strftime('%b') if hasattr(df.index[i],'strftime') else str(i) for i in range(0,len(df),step)],fontsize=7)
+
+        plt.savefig(output_filename,dpi=200,bbox_inches='tight',facecolor='#000000')
+        plt.close('all')
+        return output_filename
+    except Exception as e:
+        print(f"Chart error {e}")
+        import traceback; traceback.print_exc()
+        return None
+    finally:
+        try: plt.clf(); plt.close('all')
+        except: pass
+
+
+def generate_simple_chart_BACKUP(df, symbol, output_filename="chart.png"):
     try:
         plt.style.use('dark_background')
         fig, (ax1, ax2) = plt.subplots(2,1, figsize=(12,8), gridspec_kw={'height_ratios':[3,1]}, facecolor='black')
@@ -396,7 +557,7 @@ def process_chart_request(cid, code, tf="1d", cache=None):
     if df is None or len(df)<20:
         send_reply(cid, f"⚠ Data {code} tidak ada"); return
     chart_file=f"chart_{code.upper()}_{int(time.time())}.png"
-    fp=generate_simple_chart(df, code.upper(), chart_file)
+    fp=generate_pro_chart(df, symbol=code.upper(), timeframe="1d", sector_info=f"{code.upper()} | IHSG", output_filename=chart_file, extra_info={})
     if not fp or not os.path.exists(fp):
         send_reply(cid, "❌ Gagal render chart"); return
     caption=f"*{code.upper()}* {int(df['Close'].iloc[-1])} | Vol {format_large_number(df['Volume'].iloc[-1])} | EMA50 {int(df['Close'].ewm(span=50).mean().iloc[-1])}"
