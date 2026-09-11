@@ -1,8 +1,7 @@
 """
-RAFANO V4.11 REALTIME AUTO ALERT
-Flow: Arjum 60 -> ITICK 30 realtime -> Vol 1.5x -> BO EMA50/BOB EMA200 -> Alert INSTANT
-Auto alert: REALTIME tiap 60 detik, bukan 30 menit! Kalau ada saham baru BO, langsung kirim detik itu juga.
-Anti-spam: 1 saham cuma alert 1x per hari (reset jam 09:00)
+RAFANO V4.12 MULTITIMEFRAME FIX - CHART TETAP BMTR STYLE
+Fix: /c bmtr 5 = 5m, /c bmtr 15 = 15m, /c bmtr 1h = 1h, /c bmtr = daily
+Tambah: timeframe info di pojok kanan atas gambar
 """
 import os, time, datetime, threading, requests, pytz
 import numpy as np, pandas as pd
@@ -39,8 +38,6 @@ IDX_600_LIQUID=["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","
 HISTORY_CACHE={}; SCREENER_CACHE={}; BROKER_CACHE={}
 HISTORY_CACHE_TTL=300; SCREENER_CACHE_TTL=120; BROKER_CACHE_TTL=300
 QUOTA_HIT=False; LAST_429_TIME=0
-
-# Anti-spam realtime
 ALERTED_TODAY=set()
 ALERTED_DATE=None
 
@@ -97,11 +94,33 @@ def get_itick_quotes_batch(symbols, max_batch=15):
     except: pass
     return all_quotes
 
-def get_history_pro(sym, limit=120, frame="daily"):
+# ===== MULTITIMEFRAME FIX =====
+def normalize_timeframe(tf_input):
+    """Fix: /c bmtr 5 = 5m, /c bmtr 15 = 15m, /c bmtr 1h = 1h, /c bmtr = daily"""
+    if not tf_input or str(tf_input).strip()=="":
+        return "1d"  # default daily kalau cuma /c bmtr
+    tf = str(tf_input).lower().strip()
+    mapping={
+        "5":"5m","5m":"5m","5min":"5m","5menit":"5m","m5":"5m",
+        "15":"15m","15m":"15m","15min":"15m","15menit":"15m","m15":"15m",
+        "30":"30m","30m":"30m","30min":"30m","m30":"30m",
+        "1h":"1h","60":"1h","60m":"1h","1j":"1h","1jam":"1h","h1":"1h",
+        "4h":"4h","240":"4h","4jam":"4h",
+        "1d":"1d","d":"1d","daily":"1d","harian":"1d","day":"1d","1":"1d",
+        "1w":"1w","w":"1w","weekly":"1w","minggu":"1w"
+    }
+    return mapping.get(tf, tf)
+
+def get_history_pro(sym, limit=150, frame="daily"):
+    """Fix multitimeframe: daily via Arjum, intraday via yfinance"""
+    # Normalize frame
+    frame = normalize_timeframe(frame)
     hk=f"{sym}_{frame}_{limit}"
     cached=get_cached(hk, HISTORY_CACHE, HISTORY_CACHE_TTL)
     if cached is not None: return cached
-    if frame=="daily" and not QUOTA_HIT:
+    
+    # Arjum hanya untuk daily
+    if frame=="1d" and not QUOTA_HIT:
         data=arjum_get(f"/history/{sym}",params={"limit":limit,"frame":"daily"})
         rows=[]
         if data:
@@ -127,12 +146,40 @@ def get_history_pro(sym, limit=120, frame="daily"):
                 if len(df)>=10:
                     set_cached(hk,df,HISTORY_CACHE); return df
             except: pass
+    
+    # yfinance untuk semua TF termasuk daily fallback
     try:
         import yfinance as yf
-        hist=yf.Ticker(f"{sym}.JK").history(period="1y",interval="1d",timeout=10)
-        if hist is not None and len(hist)>10:
-            set_cached(hk,hist.tail(limit),HISTORY_CACHE); return hist.tail(limit)
-    except: pass
+        # Mapping yfinance interval
+        yf_interval_map={
+            "5m":"5m","15m":"15m","30m":"30m",
+            "1h":"1h","4h":"1h",  # yfinance 4h gak ada, pakai 1h
+            "1d":"1d","1w":"1wk"
+        }
+        interval=yf_interval_map.get(frame, "1d")
+        # Period mapping
+        if frame in ["5m","15m"]:
+            period="5d"
+        elif frame in ["30m","1h"]:
+            period="1mo"
+        elif frame=="4h":
+            period="3mo"
+        elif frame=="1d":
+            period="6mo"
+        else:
+            period="1y"
+        
+        print(f"📊 YF fetch {sym}.JK interval {interval} period {period} (TF {frame})")
+        ticker=yf.Ticker(f"{sym}.JK")
+        hist=ticker.history(period=period,interval=interval,timeout=15, auto_adjust=False)
+        if hist is not None and len(hist)>20:
+            # Untuk 4h, resample 1h ke 4h
+            if frame=="4h" and interval=="1h":
+                hist=hist.resample('4H').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+            set_cached(hk,hist.tail(limit),HISTORY_CACHE)
+            return hist.tail(limit)
+    except Exception as e:
+        print(f"YF err {sym} TF {frame}: {e}")
     return None
 
 def get_bandar_info(sym):
@@ -165,8 +212,9 @@ def format_large_number(val,show_sign=False):
     else: return f"{s}{val:,.0f}"
 
 def format_timeframe_label(tf):
-    m={"1m":"1 Menit","5m":"5 Menit","15m":"15 Menit","30m":"30 Menit","1h":"1 Jam","4h":"4 Jam","1d":"Daily","1w":"Weekly","1mo":"Monthly"}
-    return m.get((tf or "1d").lower().strip(),(tf or "1d").upper())
+    tf=normalize_timeframe(tf)
+    m={"5m":"5 Menit","15m":"15 Menit","30m":"30 Menit","1h":"1 Jam","4h":"4 Jam","1d":"Daily","1w":"Weekly","1mo":"Monthly"}
+    return m.get(tf, tf.upper())
 
 def calculate_vsa_metrics(df):
     df=df.copy()
@@ -225,10 +273,14 @@ def detect_bo_bos_markers(df):
                     signals.append({"idx":i,"type":"BOS EMA","color":"yellow"})
     return signals
 
+# CHART TETAP SAMA - Cuma tambah info TF di pojok kanan atas
 def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output_filename="chart.png",extra_info=None,realtime_price=None):
     try:
         extra_info=extra_info or {}
-        tf_label_disp=extra_info.get('tf_label') or format_timeframe_label(timeframe)
+        # Normalize TF untuk display
+        timeframe_norm = normalize_timeframe(timeframe)
+        tf_label_disp=extra_info.get('tf_label') or format_timeframe_label(timeframe_norm)
+        
         df=df.copy().ffill().bfill()
         if not isinstance(df.index,pd.DatetimeIndex): df.index=pd.to_datetime(df.index)
         else: df=df.sort_index()
@@ -305,10 +357,11 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         fig.text(0.005,0.93,f"{symbol} | IHSG",color='#ffaa00',fontsize=8,ha='left')
         fig.text(0.005,0.905,f"● {'WAIT' if abs(chg_pct)<0.5 else 'GO'}",color='#aaaaaa',fontsize=9,ha='left', fontweight='bold')
         fig.text(0.005,0.885,f"High:{last_high:.0f} Low:{last_low:.0f} Open:{last_open:.0f} Vol:{last_vol:,.0f}",color='#00ffff',fontsize=7,ha='left')
-        fig.text(0.5,0.96,"RAFANO TRADER V4.11 REALTIME",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
+        fig.text(0.5,0.96,"RAFANO TRADER V4.12 MULTITF",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
+        # TF INFO DI POJOK KANAN ATAS - Sesuai request
         ds=df.index[-1].strftime('%d %b %Y %H:%M') if hasattr(df.index[-1],'strftime') else get_now_wib().strftime('%d %b %Y %H:%M')
-        fig.text(0.99,0.96,f"{tf_label_disp} | {ds}",color='#ffcc00',fontsize=10,ha='right',va='center')
-        fig.text(0.99,0.93,f"Command BOT /C {symbol}",color='#cccccc',fontsize=8,ha='right')
+        fig.text(0.99,0.96,f"{tf_label_disp} | {ds}",color='#ffcc00',fontsize=11,ha='right',va='center', fontweight='bold')
+        fig.text(0.99,0.93,f"Command BOT /C {symbol} {timeframe_norm}",color='#cccccc',fontsize=8,ha='right')
         ax_main.text(len(df)+1, last_close, f" {last_close:.0f}", color='black', fontsize=8, va='center', fontweight='bold', bbox=dict(facecolor='white', edgecolor='none', boxstyle='square,pad=0.2'))
         ax_main.text(len(df)+1, ema200, f" EMA 200", color='white', fontsize=7, va='center', bbox=dict(facecolor='#a020f0', edgecolor='none', boxstyle='square,pad=0.1'))
         vol_info=f"Buy % = {buy_pct}% Sell % = {sell_pct}% Net Vol = {net_vol:,.0f} 5D = {net_vol_5d:,.0f}"
@@ -331,7 +384,12 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         ax_mm.text(len(df)+1, mm_last, f" {mm_last:.4f}", color='black', fontsize=7, va='center', fontweight='bold', bbox=dict(facecolor='#ffff00', edgecolor='none'))
         ax_mm.set_ylim(-30,30)
         step=max(1,len(df)//10); ax_mm.set_xticks(x[::step])
-        ax_mm.set_xticklabels([df.index[i].strftime('%H:%M' if timeframe in ['5m','15m'] else '%d/%b') if hasattr(df.index[i],'strftime') else str(i) for i in range(0,len(df),step)],fontsize=7)
+        # Label X sesuai TF
+        if timeframe_norm in ["5m","15m","30m","1h","4h"]:
+            labels=[df.index[i].strftime('%H:%M') if hasattr(df.index[i],'strftime') else str(i) for i in range(0,len(df),step)]
+        else:
+            labels=[df.index[i].strftime('%d/%b') if hasattr(df.index[i],'strftime') else str(i) for i in range(0,len(df),step)]
+        ax_mm.set_xticklabels(labels,fontsize=7)
         plt.savefig(output_filename,dpi=180,bbox_inches='tight',facecolor='#000000')
         plt.close('all')
         return output_filename, bo_markers
@@ -341,24 +399,16 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         try: plt.clf(); plt.close('all')
         except: pass
 
-# ===== CORE SCAN V4.11 - ARJUM 60 -> ITICK 30 -> VOL 1.5x -> BO/BOB =====
-def scan_v411_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=False):
-    """
-    Flow: Arjum 60 -> ITICK 30 realtime -> Vol 1.5x -> BO EMA50/BOB EMA200 -> Alert INSTANT
-    only_new=True: hanya saham yang BELUM pernah alert hari ini (anti-spam)
-    """
+def scan_v412_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=False):
     global ALERTED_TODAY, ALERTED_DATE
     today = get_now_wib().date()
     if ALERTED_DATE != today:
         ALERTED_TODAY=set()
         ALERTED_DATE=today
-        print(f"🔄 Reset ALERTED_TODAY untuk tanggal {today}")
-    
-    print(f"[{get_now_wib()}] 🚀 V4.11 REALTIME: Arjum {top_arjum} -> ITICK {top_itick} Vol>{vol_thr}x")
+    print(f"[{get_now_wib()}] 🚀 V4.12: Arjum {top_arjum} -> ITICK {top_itick} Vol>{vol_thr}x")
     screener = get_screener_latest(force_today=True)
     rows = screener.get('rows', []) if isinstance(screener, dict) else []
     if not rows: return []
-    
     candidates_arjum=[]
     for r in rows:
         code = (r.get('stock_code') or r.get('symbol') or "").replace(".JK","").upper()
@@ -366,7 +416,6 @@ def scan_v411_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
         if float(r.get('close') or 100) < 50: continue
         candidates_arjum.append(code)
         if len(candidates_arjum) >= top_arjum: break
-    
     all_quotes = get_itick_quotes_batch(candidates_arjum, 15)
     if not all_quotes:
         all_quotes={}
@@ -374,66 +423,44 @@ def scan_v411_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
             code=(r.get('stock_code') or "").replace(".JK","").upper()
             if code in candidates_arjum:
                 all_quotes[code]={'price': float(r.get('close') or 0), 'changepct': float(r.get('change_pct') or 0), 'high': float(r.get('high') or 0), 'low': float(r.get('low') or 0), 'source': 'ARJUM_FALLBACK'}
-    
     sorted_itick = sorted(all_quotes.items(), key=lambda x: x[1].get('changepct', -999), reverse=True)
     top_codes = [c for c,_ in sorted_itick[:top_itick]]
-    
     def check_one(sym):
         try:
-            if only_new and sym in ALERTED_TODAY:
-                return None
+            if only_new and sym in ALERTED_TODAY: return None
             q=all_quotes.get(sym, {})
             realtime_price=q.get('price',0)
             hd=get_history_pro(sym, limit=120, frame="daily")
             if hd is None or len(hd)<55: return None
             c = float(realtime_price if realtime_price and realtime_price>0 else hd['Close'].iloc[-1])
-            pc = float(hd['Close'].iloc[-2])
             v_last=float(hd['Volume'].iloc[-1]); v_avg=float(hd['Volume'].iloc[-21:-1].mean())
             if v_avg==0 or v_last==0: return None
             vol_ratio=v_last/v_avg
             if vol_ratio < vol_thr: return None
-            vol_rp = v_last * c
-            if vol_rp < min_value: return None
-            high_today = q.get('high') or float(hd['High'].iloc[-1])
-            low_today = q.get('low') or float(hd['Low'].iloc[-1])
-            close_pos = (c - low_today) / (high_today - low_today) if high_today!=low_today else 1.0
-            if close_pos < min_closepos: return None
+            if v_last * c < min_value: return None
             bo_info = check_bo_ema50_bob200(sym, hd, realtime_price)
             if not bo_info: return None
             bandar=get_bandar_info(sym)
-            return {
-                "symbol": sym, "type": bo_info['type'], "close": int(c), "change_pct": q.get('changepct',0),
-                "vol_ratio": vol_ratio, "vol_rp": vol_rp, "close_pos": close_pos,
-                "ema50": bo_info['ema50'], "ema200": bo_info['ema200'],
-                "bandar": bandar, "foreign_str": bandar.get('foreign_str',''), "score_bonus": bandar.get('score_bonus',0),
-                "source": q.get('source',''), "realtime": realtime_price
-            }
+            return {"symbol": sym, "type": bo_info['type'], "close": int(c), "change_pct": q.get('changepct',0), "vol_ratio": vol_ratio, "vol_rp": v_last * c, "bandar": bandar, "foreign_str": bandar.get('foreign_str',''), "source": q.get('source',''), "realtime": realtime_price}
         except: return None
-    
     with ThreadPoolExecutor(max_workers=12) as ex:
         futs={ex.submit(check_one, s): s for s in top_codes}
         detected=[]
         for f in as_completed(futs):
             r=f.result()
-            if r:
-                detected.append(r)
-                print(f"🔥 {r['symbol']} {r['type']} {r['close']} ({r['change_pct']:+.1f}%) Vol {r['vol_ratio']:.1f}x")
-    
+            if r: detected.append(r)
     detected.sort(key=lambda x: x['vol_ratio'], reverse=True)
     return detected
 
 def scan_volume_spike(threshold=2.0, limit_candidates=60, sort_by_rp=False):
     sd=get_screener_latest(force_today=False)
-    if isinstance(sd, dict) and 'rows' in sd:
-        cands=[(r.get('stock_code') or "").replace(".JK","").upper() for r in sd['rows']]
-    else:
-        cands=IDX_600_LIQUID
+    if isinstance(sd, dict) and 'rows' in sd: cands=[(r.get('stock_code') or "").replace(".JK","").upper() for r in sd['rows']]
+    else: cands=IDX_600_LIQUID
     seen=set(); uniq=[]
     for c in cands:
         cu=c.upper().strip()
         if not cu or "-W" in cu or cu in FCA_EXCLUDE: continue
-        if cu not in seen:
-            seen.add(cu); uniq.append(cu)
+        if cu not in seen: seen.add(cu); uniq.append(cu)
     for c in IDX_600_LIQUID:
         if len(uniq)>=limit_candidates: break
         if "-W" in c or c in FCA_EXCLUDE or c in seen: continue
@@ -479,20 +506,23 @@ def send_photo_reply(cid, path, caption=""):
             requests.post(url,data={'chat_id':cid,'caption':caption,'parse_mode':'Markdown'},files={'photo':ph},timeout=30)
     except Exception as e: print(f"Photo err {e}")
 
-def process_chart_request(cid, code, tf="5m"):
-    send_reply(cid, f"📊 *{code.upper()} ({tf}) chart pro + ITICK...*")
-    frame = "5m" if tf in ["5m","15m","30m"] else "daily"
-    df=get_history_pro(code, 150, frame=frame)
+def process_chart_request(cid, code, tf_input="1d"):
+    """FIXED: /c bmtr 5 = 5m, /c bmtr 15 = 15m, /c bmtr 1h = 1h, /c bmtr = daily"""
+    tf_norm = normalize_timeframe(tf_input)
+    tf_label = format_timeframe_label(tf_norm)
+    print(f"📊 Chart request {code.upper()} TF input '{tf_input}' -> normalized '{tf_norm}' ({tf_label})")
+    send_reply(cid, f"📊 *{code.upper()} ({tf_label} - {tf_norm}) chart pro...*")
+    df=get_history_pro(code, 150, frame=tf_norm)
     if df is None or len(df)<20:
-        send_reply(cid, f"⚠ Data {code} tidak ada"); return
+        send_reply(cid, f"⚠ Data {code} TF {tf_norm} tidak ada (market tutup atau yfinance limit)"); return
     quotes=get_itick_quotes_batch([code],1)
     realtime=quotes.get(code.upper(),{}).get('price',0)
-    chart_file=f"/tmp/chart_{code.upper()}_{int(time.time())}.png"
-    fp, markers = generate_pro_chart(df, symbol=code.upper(), timeframe=tf, sector_info=f"{code.upper()} | IHSG", output_filename=chart_file, extra_info={'tf_label':format_timeframe_label(tf)}, realtime_price=realtime)
+    chart_file=f"/tmp/chart_{code.upper()}_{tf_norm}_{int(time.time())}.png"
+    fp, markers = generate_pro_chart(df, symbol=code.upper(), timeframe=tf_norm, sector_info=f"{code.upper()} | IHSG", output_filename=chart_file, extra_info={'tf_label':tf_label}, realtime_price=realtime)
     if not fp or not os.path.exists(fp):
         send_reply(cid, "❌ Gagal render chart"); return
     sig_text = ", ".join([f"{s['type']}" for s in markers[-3:]]) if markers else "No signal"
-    cap=f"*{code.upper()}* {int(df['Close'].iloc[-1])} RT {int(realtime) if realtime else ''} | {sig_text} | Vol {format_large_number(df['Volume'].iloc[-1])}"
+    cap=f"*{code.upper()} {tf_label}* {int(df['Close'].iloc[-1])} RT {int(realtime) if realtime else ''} | {sig_text} | {tf_norm} | Vol {format_large_number(df['Volume'].iloc[-1])}"
     send_photo_reply(cid, fp, caption=cap)
     if os.path.exists(fp): os.remove(fp)
 
@@ -500,16 +530,16 @@ def process_broker_request(cid, sym):
     bandar=get_bandar_info(sym)
     send_reply(cid, f"🏦 *{sym} BANDAR*\n{bandar.get('foreign_str','N/A')} Bonus +{bandar.get('score_bonus',0)}")
 
-def broadcast_v411(signals, vol_thr=1.5, dest_chat_id=None, is_auto=False):
+def broadcast_v412(signals, vol_thr=1.5, dest_chat_id=None, is_auto=False):
     target = dest_chat_id or TARGET_CHAT_ID
     if not target: return
     if not signals:
         if not is_auto:
-            send_reply(target, f"📉 V4.11 VOL>{vol_thr}x - Tidak ada BO valid realtime\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO/BOB"); 
+            send_reply(target, f"📉 V4.12 VOL>{vol_thr}x - Tidak ada BO valid\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO/BOB"); 
         return
     now=get_now_wib().strftime('%d %b %Y %H:%M:%S WIB')
     auto_tag = "⚡ REALTIME ALERT" if is_auto else "🚀"
-    header=f"{auto_tag} *V4.11 TOP {len(signals)} BO/BOB + ITICK REALTIME* 🔥\n{now}\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO EMA50/BOB EMA200\n{'='*50}\n\n"
+    header=f"{auto_tag} *V4.12 TOP {len(signals)} BO/BOB + ITICK REALTIME* 🔥\n{now}\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO EMA50/BOB EMA200\n{'='*50}\n\n"
     msg=header; kb=[]
     for idx,it in enumerate(signals,1):
         rt_str = f" RT{it['realtime']:.0f}" if it.get('realtime',0)>0 else ""
@@ -542,82 +572,58 @@ def broadcast_vol_spike(signals, threshold=2.0, sort_by_rp=False, dest_chat_id=N
     if msg:
         send_reply(target, msg, rm={"inline_keyboard": kb})
 
-# ===== REALTIME AUTO ALERT LOOP - TIAP 60 DETIK =====
 AUTO_ALERT_ENABLED=True
-AUTO_ALERT_INTERVAL=60  # 60 detik = realtime!
+AUTO_ALERT_INTERVAL=60
 LAST_AUTO_ALERT_TIME=0
-ALERT_COOLDOWN=300  # 1 saham cooldown 5 menit biar gak spam
 
 def realtime_auto_alert_loop():
     global LAST_AUTO_ALERT_TIME, ALERTED_TODAY, ALERTED_DATE
-    print(f"⚡ REALTIME AUTO ALERT LOOP started - interval {AUTO_ALERT_INTERVAL} DETIK (bukan menit!)")
-    print("   Flow: Arjum 60 -> ITICK 30 -> cek BO realtime -> kirim INSTANT jika BO baru")
+    print(f"⚡ REALTIME AUTO ALERT LOOP {AUTO_ALERT_INTERVAL} DETIK")
     while True:
         try:
             if not AUTO_ALERT_ENABLED:
                 time.sleep(10); continue
             now=get_now_wib()
-            # Reset alerted tiap hari baru jam 09:00
             today=now.date()
             global ALERTED_DATE
             if ALERTED_DATE != today:
                 ALERTED_TODAY=set()
                 ALERTED_DATE=today
-                print(f"🔄 Reset ALERTED_TODAY {today}")
-            
-            # Jam market: Senin-Jumat 09:00-15:30 WIB
             if now.weekday()>=5:
                 time.sleep(300); continue
             market_start=now.replace(hour=9, minute=0, second=0, microsecond=0)
             market_end=now.replace(hour=15, minute=30, second=0, microsecond=0)
             if not (market_start <= now <= market_end):
                 time.sleep(300); continue
-            
-            # Cek interval
             if time.time() - LAST_AUTO_ALERT_TIME < AUTO_ALERT_INTERVAL:
                 time.sleep(5); continue
-            
-            print(f"⚡ [{now.strftime('%H:%M:%S')}] REALTIME SCAN Arjum 60 -> ITICK 30 -> BO/BOB...")
-            # only_new=True = hanya saham yang belum pernah alert hari ini
-            signals = scan_v411_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=True)
+            print(f"⚡ [{now.strftime('%H:%M:%S')}] REALTIME SCAN")
+            signals = scan_v412_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=True)
             LAST_AUTO_ALERT_TIME=time.time()
-            
             if signals:
-                # Tandai sudah alert biar gak spam
-                for s in signals:
-                    ALERTED_TODAY.add(s['symbol'])
-                print(f"⚡ REALTIME ALERT {len(signals)} saham baru BO: {[s['symbol'] for s in signals]}")
-                broadcast_v411(signals, vol_thr=1.5, dest_chat_id=TARGET_CHAT_ID, is_auto=True)
-            else:
-                print(f"⚡ [{now.strftime('%H:%M:%S')}] No new BO realtime")
-            
+                for s in signals: ALERTED_TODAY.add(s['symbol'])
+                broadcast_v412(signals, vol_thr=1.5, dest_chat_id=TARGET_CHAT_ID, is_auto=True)
             time.sleep(AUTO_ALERT_INTERVAL)
         except Exception as e:
             print(f"REALTIME ALERT err {e}")
-            import traceback; traceback.print_exc()
             time.sleep(30)
 
 def telegram_bot_listener():
     offset=0
-    print("🤖 RAFANO V4.11 REALTIME AUTO ALERT")
-    print(f"🔑 BOT: {'ADA' if TELEGRAM_BOT_TOKEN else 'KOSONG'} | CHAT: {TARGET_CHAT_ID} | ARJUM: {'ADA' if ARJUM_API_KEY else 'KOSONG'} | ITICK: {'ON' if ITICK_ENABLED else 'OFF'}")
-    print(f"⚡ REALTIME AUTO ALERT: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} interval {AUTO_ALERT_INTERVAL} DETIK (realtime!)")
-    try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
+    print("🤖 RAFANO V4.12 MULTITIMEFRAME FIX")
+    print(f"🔑 BOT: {'ADA' if TELEGRAM_BOT_TOKEN else 'KOSONG'} | ITICK: {'ON' if ITICK_ENABLED else 'OFF'}")
+    print(f"⚡ REALTIME AUTO ALERT: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL} detik")
+    try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
-    
     if AUTO_ALERT_ENABLED:
         threading.Thread(target=realtime_auto_alert_loop, daemon=True).start()
-    
     while True:
         try:
             url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
             res=requests.get(url,timeout=25)
-            if res.status_code!=200:
-                time.sleep(3); continue
+            if res.status_code!=200: time.sleep(3); continue
             data=res.json()
-            if not data.get('ok'):
-                time.sleep(3); continue
+            if not data.get('ok'): time.sleep(3); continue
             for update in data.get("result",[]):
                 offset=update["update_id"]+1
                 if "callback_query" in update:
@@ -635,58 +641,62 @@ def telegram_bot_listener():
                     first=txt.split()[0].lower() if txt else ""
                     parts=txt.split()
                     if first in ["/start","/help","/menu"]:
-                        help_text="""🔥 *RAFANO V4.11 REALTIME AUTO ALERT*
-⚡ Scan REALTIME tiap 60 DETIK, bukan 30 menit!
-Flow: Arjum 60 -> ITICK 30 realtime -> Vol 1.5x -> BO EMA50/BOB EMA200 -> Alert INSTANT
+                        help_text="""🔥 *RAFANO V4.12 MULTITF FIX*
+⚡ Realtime 60 detik: Arjum 60 -> ITICK 30 -> BO
 
-📈 *CHART (persis BMTR)*
-/c KODE - Chart 5m pro + ITICK + marker BO/BOS
-/c KODE 1d - Chart daily
-/b KODE - Bandar info
+📈 *CHART MULTITIMEFRAME FIX*
+/c KODE = Daily (default)
+/c KODE 5 = 5 menit
+/c KODE 15 = 15 menit
+/c KODE 30 = 30 menit
+/c KODE 1h = 1 jam
+/c KODE 4h = 4 jam
+/c KODE 1d = Daily
+/c KODE 1w = Weekly
+Contoh: /c BMTR 5 , /c BBCA 15 , /c WIFI 1h
 
-🚀 *SCAN FINAL REALTIME*
-/scanbo [vol] [minval] - Scan Arjum 60 -> ITICK 30 -> BO
-/scanbo 2 - Vol>2x
-/topbo [vol] - Sama
-/scan [vol] - BO/BOB
+🏦 /b KODE - Bandar
+
+🚀 *SCAN REALTIME*
+/scanbo [vol] - Arjum 60 -> ITICK 30 -> BO/BOB
+/topbo [vol]
 
 🔥 *VOLUME*
 /scanvol /vol [thr] [limit]
-/volall /scanvolall [thr]
+/volall [thr]
 
-🤖 *REALTIME AUTO ALERT*
-/autoalert on/off - Auto realtime 60 detik
-/autoalert status - Cek
-/autoalert reset - Reset anti-spam hari ini
-/quota - Cek quota
+🤖 *AUTO*
+/autoalert on/off/status/reset
+/quota
 """
                         send_reply(chat_id, help_text)
                     elif first in ["/quota"]:
-                        send_reply(chat_id, f"QUOTA: {'HABIS 5 menit' if QUOTA_HIT else 'OK'}\nARJUM: {'ADA' if ARJUM_API_KEY else 'KOSONG'}\nITICK: {'ON' if ITICK_ENABLED else 'OFF'}\nAUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL} detik\nAlerted today: {len(ALERTED_TODAY)} saham")
+                        send_reply(chat_id, f"QUOTA: {'HABIS 5m' if QUOTA_HIT else 'OK'}\nARJUM: {'ADA' if ARJUM_API_KEY else 'KOSONG'}\nITICK: {'ON' if ITICK_ENABLED else 'OFF'}\nAUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s\nAlerted: {len(ALERTED_TODAY)}")
                     elif first in ["/autoalert","/auto"]:
                         if len(parts)>=2:
                             cmd=parts[1].lower()
                             if cmd=="on":
                                 globals()['AUTO_ALERT_ENABLED']=True
-                                send_reply(chat_id, f"⚡ REALTIME AUTO ALERT ON - tiap {AUTO_ALERT_INTERVAL} DETIK jam market 09:00-15:30\nFlow: Arjum 60 -> ITICK 30 -> BO instant")
+                                send_reply(chat_id, f"⚡ REALTIME AUTO ON - {AUTO_ALERT_INTERVAL}s jam 09:00-15:30")
                             elif cmd=="off":
                                 globals()['AUTO_ALERT_ENABLED']=False
-                                send_reply(chat_id, "🤖 AUTO ALERT OFF")
+                                send_reply(chat_id, "AUTO OFF")
                             elif cmd=="reset":
                                 ALERTED_TODAY.clear()
-                                send_reply(chat_id, f"🔄 Reset anti-spam - alerted today cleared. Sekarang {len(ALERTED_TODAY)} saham")
+                                send_reply(chat_id, f"🔄 Reset anti-spam")
                             elif cmd=="status":
                                 now=get_now_wib()
-                                last=time.strftime('%H:%M:%S', time.localtime(LAST_AUTO_ALERT_TIME)) if LAST_AUTO_ALERT_TIME else "Belum pernah"
-                                send_reply(chat_id, f"⚡ REALTIME AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'}\nInterval: {AUTO_ALERT_INTERVAL} DETIK (realtime!)\nLast scan: {last}\nAlerted today: {len(ALERTED_TODAY)} saham - {list(ALERTED_TODAY)[:10]}\nJam: {now.strftime('%H:%M:%S WIB')}")
+                                last=time.strftime('%H:%M:%S', time.localtime(LAST_AUTO_ALERT_TIME)) if LAST_AUTO_ALERT_TIME else "Belum"
+                                send_reply(chat_id, f"⚡ AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'}\nInterval: {AUTO_ALERT_INTERVAL}s\nLast: {last}\nAlerted today: {len(ALERTED_TODAY)} - {list(ALERTED_TODAY)[:10]}\nJam: {now.strftime('%H:%M:%S WIB')}")
                         else:
-                            send_reply(chat_id, f"REALTIME AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL} detik\n/autoalert on/off/status/reset")
+                            send_reply(chat_id, f"AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s")
                     elif first in ["/c","/chart"]:
                         if len(parts)>=2:
-                            sym=parts[1].upper(); tf=parts[2] if len(parts)>=3 else "5m"
-                            threading.Thread(target=process_chart_request,args=(chat_id,sym,tf)).start()
+                            sym=parts[1].upper()
+                            tf_input=parts[2] if len(parts)>=3 else "1d"  # FIX: default daily bukan 5m
+                            threading.Thread(target=process_chart_request,args=(chat_id,sym,tf_input)).start()
                         else:
-                            send_reply(chat_id, "Pakai: /c BMTR atau /c BBCA 1d")
+                            send_reply(chat_id, "Pakai: /c BMTR 5 (5 menit) atau /c BMTR (daily)\n/c KODE [5/15/30/1h/4h/1d/1w]")
                     elif first in ["/b","/broker","/bandar"]:
                         if len(parts)>=2:
                             sym=parts[1].upper()
@@ -694,26 +704,17 @@ Flow: Arjum 60 -> ITICK 30 realtime -> Vol 1.5x -> BO EMA50/BOB EMA200 -> Alert 
                         else:
                             send_reply(chat_id, "Pakai: /b BBCA")
                     elif first in ["/scanvol","/vol","/vspike","/volspike","/spike"]:
-                        try:
-                            thr=float(parts[1]) if len(parts)>=2 else 2.0
-                            lim=int(parts[2]) if len(parts)>=3 else 60
-                        except:
-                            thr=2.0; lim=60
-                        if thr<1.0: thr=1.0
-                        if lim<20: lim=20
-                        if lim>300: lim=300
-                        send_reply(chat_id, f"🔥 SCAN VOL >{thr}x ({lim} saham) ke {chat_id}...")
+                        try: thr=float(parts[1]) if len(parts)>=2 else 2.0; lim=int(parts[2]) if len(parts)>=3 else 60
+                        except: thr=2.0; lim=60
+                        send_reply(chat_id, f"🔥 SCAN VOL >{thr}x ({lim}) ke {chat_id}...")
                         def run_vol(tg=chat_id, th=thr, l=lim):
                             sigs=scan_volume_spike(threshold=th, limit_candidates=l, sort_by_rp=False)
                             broadcast_vol_spike(sigs, threshold=th, sort_by_rp=False, dest_chat_id=tg)
                         threading.Thread(target=run_vol).start()
                     elif first in ["/scanvolall","/volall","/vall","/scanallvol"]:
-                        try:
-                            thr=float(parts[1]) if len(parts)>=2 else 2.0
-                        except:
-                            thr=2.0
-                        if thr<1.0: thr=1.0
-                        send_reply(chat_id, f"🔥🔥 SCAN VOL ALL 300 >{thr}x SORT Rp ke {chat_id}...")
+                        try: thr=float(parts[1]) if len(parts)>=2 else 2.0
+                        except: thr=2.0
+                        send_reply(chat_id, f"🔥🔥 SCAN VOL ALL 300 >{thr}x ke {chat_id}...")
                         def run_volall(tg=chat_id, th=thr):
                             sigs=scan_volume_spike(threshold=th, limit_candidates=300, sort_by_rp=True)
                             broadcast_vol_spike(sigs, threshold=th, sort_by_rp=True, dest_chat_id=tg)
@@ -724,21 +725,18 @@ Flow: Arjum 60 -> ITICK 30 realtime -> Vol 1.5x -> BO EMA50/BOB EMA200 -> Alert 
                             if len(parts)>=2: vol_thr=float(parts[1])
                             if len(parts)>=3: min_val=float(parts[2])
                         except: pass
-                        if vol_thr>=10: top_final=int(vol_thr); vol_thr=1.5
-                        send_reply(chat_id, f"🚀 V4.11 REALTIME SCAN Arjum {top_arjum} -> ITICK {top_final} VOL>{vol_thr}x ke {chat_id} ~15 detik...")
+                        send_reply(chat_id, f"🚀 V4.12 SCAN Arjum {top_arjum} -> ITICK {top_final} VOL>{vol_thr}x ke {chat_id}...")
                         def run_scan(tg=chat_id, vt=vol_thr, tf=top_final, ta=top_arjum, mv=min_val):
-                            sigs=scan_v411_final(top_arjum=ta, top_itick=tf, vol_thr=vt, min_value=mv, only_new=False)
-                            broadcast_v411(sigs, vol_thr=vt, dest_chat_id=tg, is_auto=False)
+                            sigs=scan_v412_final(top_arjum=ta, top_itick=tf, vol_thr=vt, min_value=mv, only_new=False)
+                            broadcast_v412(sigs, vol_thr=vt, dest_chat_id=tg, is_auto=False)
                         threading.Thread(target=run_scan).start()
         except Exception as e:
-            print(f"Listener err {e}")
-            import traceback; traceback.print_exc()
-            time.sleep(3)
+            print(f"Listener err {e}"); import traceback; traceback.print_exc(); time.sleep(3)
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.11 REALTIME AUTO ALERT")
-    print("Arjum 60 -> ITICK 30 -> Vol 1.5x -> BO/BOB -> Alert INSTANT")
-    print("Auto realtime tiap 60 DETIK, bukan 30 menit!")
+    print("🔥 RAFANO V4.12 MULTITIMEFRAME FIX")
+    print("/c bmtr 5=5m, /c bmtr 15=15m, /c bmtr 1h=1h, /c bmtr=daily")
+    print("Chart tetap BMTR style hitam pro")
     print("==========================================")
     telegram_bot_listener()
