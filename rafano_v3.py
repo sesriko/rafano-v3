@@ -70,7 +70,7 @@ def get_itick_quotes_batch(symbols, max_batch=15):
 
 # ===== AUTO NOTIFY V4.7.1 - BO EMA50/BOB EMA200 REALTIME - FIXED =====
 AUTO_NOTIFY_ENABLED = os.getenv("AUTO_NOTIFY", "true").lower() == "true"
-AUTO_NOTIFY_INTERVAL = int(os.getenv("AUTO_INTERVAL_SEC", "180"))
+AUTO_NOTIFY_INTERVAL = int(os.getenv("AUTO_INTERVAL_SEC", "300"))
 AUTO_NOTIFY_EMA_FILTER = ["BO EMA50", "BOB EMA200"]
 AUTO_NOTIFIED_TODAY = set()
 AUTO_LAST_RESET_DATE = None
@@ -412,33 +412,57 @@ def filter_liquid_stocks(candidates, min_avg_value_rp=500_000_000, min_avg_vol=3
     return scored
 
 # TOP 400 universe paling liquid IDX (market cap besar + liquid)
-IDX_LIQUID_400 = [
-    "BBCA","BBRI","BMRI","BBNI","BRIS","TLKM","ASII","ADRO","ANTM","MDKA","BRMS","BREN","CUAN","WIFI","BIPI","BULL","NIKL",
-    "DEWA","PGEO","RAJA","MEDC","ELSA","PGAS","PTBA","ITMG","BRPT","TPIA","GOTO","BUKA","EMTK","AMMN","MBMA","NCKL","TINS",
-    "HRUM","INCO","ESSA","AKRA","INDY","SMGR","INTP","UNTR","AUTO","ICBP","INDF","MYOR","KLBF","SIDO","CPIN","JPFA","UNVR",
-    "BNGA","BMTR","MNCN","SCMA","BELI","TECH","DCII","WIRG","BOBA","PTRO","BYAN","DSSA","ADMR","PSAB","ARCI","BUMI","WOWS",
-    "HUMI","MTEL","TOWR","TBIG","JSMR","ISAT","EXCL","DSSA","EMAS","SGER","ELPI","MSJA","SPRE","SAPX","SHID","BUMI",
-    "ADHI","ADRO","AKRA","AMRT","APLN","ASII","ASRI","BBKP","BBTN","BDMN","BFIN","BIRD","BJBR","BJTM","BKSL","BMTR","BNLI",
-    "BRPT","BSDE","BUMI","CEKA","CTRA","DMAS","DOID","ELSA","ENRG","ERAA","EXCL","GGRM","GJTL","HMSP","HRUM","ICBP","INCO",
-    "INDF","INKP","INDY","INTP","ISAT","ITMG","JPFA","JSMR","KLBF","LPKR","LSIP","MAPI","MNCN","PGAS","PTBA","PTPP","PWON",
-    "SCMA","SIDO","SMGR","SMRA","SRIL","SSMS","TLKM","TINS","TKIM","TPIA","UNTR","UNVR","WIKA","WSKT","WINS","WIIM","ADMF",
-    "AGII","AALI","ACES","ACST","AKSI","ALDO","AMOR","APEX","ARNA","ASDM","ASJT","ASSA","ATAP","AUTO","BACA","BATA",
-    "BAYU","BBHI","BBKP","BBLD","BBMD","BBYB","BCAP","BDMN","BEKS","BELL","BEST","BFIN","BGTG","BINA","BIPI","BISI",
-    "BKDP","BKSW","BLTA","BMAS","BOGA","BOLA","BOLT","BOSS","BPFI","BRAM","BRMS","BRNA","BSIM","BSSR","BTEK","BTPS","BUKA",
-    "BUMI","BWPT","BYAN","CAMP","CASA","CASS","CEKA","CENT","CINT","CITA","CLAY","CMNP","CMPP","CNKO","CPIN","CPRI","CSAP",
-    "CTTH","DART","DEWA","DGIK","DILD","DMAS","DNAR","DNET","DOOH","DPNS","DSFI","DSNG","DSSA","DUCK","ECII","EKAD","ELSA",
-    "EMAS","EMTK","ENAK","EPMT","ERAA","ESSA","ESTA","ETWA","EXCL","FASW","GDST","GIAA","GJTL","GMFI","GOLD","GPRA",
-    "GWSA","HDFA","HERO","HMSP","HRUM","IATA","IBST","ICBP","ICON","IMAS","IMJS","INAF","INCI","INCO","INDF","INDX","INDY",
-    "INKP","INPC","INTA","INTP","IPOL","ISAT","ITMG","JAST","JECC","JPFA","JRPT","JSMR","KAEF","KBLI","KBLM","KBLV","KBRI",
-    "KDSI","KIJA","KLBF","KPIG","LION","LMPI","LPCK","LPKR","LPPF","LSIP","LTLS","MAIN","MAMI","MAPI","MARI","MARK",
-    "MBAP","MBSS","MCOR","MDKA","MEDC","MEGA","MICE","MIDI","MIKA","MMLP","MNCN","MPPA","MRAT","MTDL","MTFN",
-    "MYOR","NELY","NISP","NOBU","OCAP","PADI","PANR","PBSA","PDES","PEGE","PGAS","PGLI","PICO","PJAA","PKPK","PLIN","PNBN",
-    "PNBS","PNIN","POWR","PRDA","PTBA","PTIS","PTPP","PTRO","PWON","PYFA","RAJA","RALS","RANC","RDTX","RICY","RODA","SAME",
-    "SCMA","SGER","SGRO","SIDO","SILO","SIMP","SINI","SIPD","SKBM","SKLT","SMAR","SMCB","SMDM","SMGR","SMMA","SMRA","SMSM",
-    "SOCI","SPMA","SRAJ","SRTG","SSIA","SSMS","SSTM","STTP","SUGI","TALF","TARA","TBIG","TBLA","TCID","TFCO","TGKA","TINS",
-    "TKIM","TMAS","TOTL","TOWR","TPIA","TRAM","TRIS","TRST","TSPC","UANG","ULTJ","UNSP","UNTR","UNVR","VOKS","VIVA",
-    "WAPO","WEHA","WIKA","WINS","WIIM","WSKT","WTON","YPAS","ZONE"
+IDX_600_LIQUID = [
+    "AALI", "ACES", "ACRO", "ACST", "ADCP", "ADES", "ADHI", "ADMG", "ADMR", "ADRO", "AGAR", "AGII", "AIMS", "AKKU", "AKPI",
+    "AKRA", "AKSI", "ALDO", "ALKA", "AMAN", "AMFG", "AMIN", "AMMN", "ANDI", "ANJT", "ANTM", "APII", "APLN", "ARCI", "AREA",
+    "ARGO", "ARII", "ARNA", "ARTA", "ASGR", "ASHA", "ASII", "ASLC", "ASLI", "ASPI", "ASRI", "ATAP", "ATLA", "AUTO", "AVIA",
+    "AWAN", "AXIO", "AYAM", "AYLS", "BABY", "BAIK", "BALI", "BANK", "BAPA", "BATA", "BATR", "BAYU", "BBRM", "BCIP", "BDKR",
+    "BEBS", "BELI", "BELL", "BESS", "BEST", "BIKE", "BIMA", "BINO", "BIRD", "BISI", "BKDP", "BKSL", "BLES", "BLTA", "BLTZ",
+    "BLUE", "BMHS", "BMSR", "BMTR", "BOBA", "BOGA", "BOLT", "BRAM", "BRIS", "BRMS", "BRPT", "BSBK", "BSDE", "BSML", "BSSR",
+    "BTON", "BTPS", "BUAH", "BUDI", "BUKK", "BYAN", "CAKK", "CAMP", "CANI", "CARE", "CASS", "CBPE", "CBRE", "CCSI", "CEKA",
+    "CGAS", "CHEM", "CINT", "CITA", "CITY", "CLEO", "CLPI", "CMNP", "CMPP", "CMRY", "CNMA", "CPIN", "CPRO", "CRAB", "CRSN",
+    "CSAP", "CSIS", "CSMI", "CSRA", "CTBN", "CTRA", "CUAN", "CYBR", "DAAZ", "DADA", "DATA", "DAYA", "DCII", "DEPO", "DEWI",
+    "DGIK", "DGNS", "DILD", "DIVA", "DKFT", "DMAS", "DMMX", "DMND", "DOOH", "DOSS", "DPNS", "DRMA", "DSFI", "DSNG", "DSSA",
+    "DUTI", "DVLA", "DWGL", "DYAN", "EAST", "ECII", "EDGE", "EKAD", "ELIT", "ELPI", "ELTY", "EMDE", "EMTK", "ENAK", "EPAC",
+    "EPMT", "ERAA", "ERAL", "ESIP", "ESSA", "ESTA", "EXCL", "FAPA", "FAST", "FILM", "FIRE", "FISH", "FMII", "FOLK", "FOOD",
+    "FORU", "FPNI", "FREN", "FUTR", "FWCT", "GDST", "GDYR", "GEMA", "GEMS", "GGRP", "GHON", "GIAA", "GJTL", "GLVA", "GMTD",
+    "GOLD", "GOLF", "GOOD", "GOTO", "GPRA", "GPSO", "GRIA", "GRPH", "GTBO", "GTSI", "GULA", "GUNA", "GWSA", "GZCO", "HAIS",
+    "HALO", "HATM", "HDIT", "HEAL", "HERO", "HEXA", "HITS", "HOKI", "HOMI", "HOPE", "HRME", "HRUM", "HUMI", "HYGN", "IATA",
+    "IBST", "ICBP", "ICON", "IDPR", "IFII", "IFSH", "IGAR", "IKAN", "IKBI", "IKPM", "IMPC", "INCI", "INCO", "INDF", "INDR",
+    "INDS", "INDX", "INDY", "INET", "INKP", "INTD", "INTP", "IPCC", "IPCM", "IPOL", "IPPE", "IPTV", "IRRA", "IRSX", "ISAT",
+    "ISSP", "ITMA", "ITMG", "JAST", "JATI", "JAYA", "JECC", "JGLE", "JIHD", "JKON", "JMAS", "JPFA", "JRPT", "JSPT", "JTPE",
+    "KARW", "KBLI", "KBLM", "KBLV", "KDSI", "KDTN", "KEEN", "KEJU", "KIAS", "KICI", "KIJA", "KINO", "KIOS", "KJEN", "KKES",
+    "KKGI", "KLAS", "KLBF", "KMDS", "KOBX", "KOCI", "KOKA", "KONI", "KOPI", "KOTA", "KPIG", "KREN", "KRYA", "KUAS", "LABA",
+    "LABS", "LAJU", "LAND", "LCKM", "LION", "LIVE", "LMPI", "LMSH", "LPCK", "LPIN", "LPKR", "LPLI", "LPPF", "LRNA", "LSIP",
+    "LTLS", "LUCK", "MAHA", "MAIN", "MAPA", "MAPB", "MAPI", "MARK", "MAXI", "MBAP", "MBMA", "MBSS", "MBTO", "MCAS", "MCOL",
+    "MDKA", "MDKI", "MEDC", "MEDS", "MERK", "META", "MFMI", "MGNA", "MHKI", "MICE", "MIDI", "MIKA", "MINA", "MIRA", "MITI",
+    "MKAP", "MKPI", "MKTR", "MLIA", "MLPL", "MLPT", "MMIX", "MMLP", "MNCN", "MORA", "MPIX", "MPMX", "MPOW", "MPPA", "MPRO",
+    "MPXL", "MSJA", "MSKY", "MSTI", "MTDL", "MTEL", "MTLA", "MTMH", "MTSM", "MUTU", "MYOH", "MYOR", "NAIK", "NASA", "NASI",
+    "NELY", "NEST", "NFCX", "NICE", "NICL", "NIKL", "NPGF", "NRCA", "NTBK", "NZIA", "OBMD", "OILS", "OKAS", "OMED", "OMRE",
+    "OPMS", "PADA", "PALM", "PAMG", "PANI", "PANR", "PBID", "PBSA", "PCAR", "PDPP", "PEHA", "PEVE", "PGAS", "PGEO", "PGLI",
+    "PGUN", "PIPA", "PJAA", "PKPK", "PLIN", "PMJS", "PNBS", "PNGO", "PNSE", "POLI", "PORT", "POWR", "PPRE", "PPRI", "PRAY",
+    "PRDA", "PSAB", "PSDN", "PSGO", "PSKT", "PSSI", "PTBA", "PTIS", "PTMP", "PTMR", "PTPP", "PTPS", "PTPW", "PTRO", "PTSN",
+    "PTSP", "PURA", "PURI", "PWON", "PZZA", "RAAM", "RAFI", "RAJA", "RALS", "RANC", "RBMS", "RDTX", "REAL", "RGAS", "RIGS",
+    "RISE", "RMKE", "ROCK", "RODA", "RONY", "ROTI", "RSCH", "RSGK", "RUIS", "SAGE", "SAME", "SAMF", "SAPX", "SATU", "SBMA",
+    "SCCO", "SCMA", "SCNP", "SCPI", "SDPC", "SEMA", "SGER", "SGRO", "SHID", "SICO", "SIDO", "SILO", "SIMP", "SIPD", "SKBM",
+    "SKLT", "SKRN", "SLIS", "SMAR", "SMBR", "SMCB", "SMDM", "SMDR", "SMGA", "SMGR", "SMIL", "SMKL", "SMLE", "SMMT", "SMRA",
+    "SMSM", "SNLK", "SOCI", "SOHO", "SOLA", "SONA", "SOSS", "SOTS", "SPMA", "SPTO", "SRAJ", "SRTG", "SSIA", "SSTM", "STAA",
+    "STTP", "SUNI", "SUPR", "SURI", "SWID", "TAMA", "TAMU", "TAPG", "TAYS", "TBMS", "TCID", "TCPI", "TEBE", "TFAS", "TFCO",
+    "TGKA", "TGUK", "TINS", "TIRA", "TKIM", "TLDN", "TLKM", "TMAS", "TMPO", "TNCA", "TOOL", "TOSK", "TOTL", "TOTO", "TOYS",
+    "TPIA", "TPMA", "TRIS", "TRON", "TRST", "TRUE", "TRUK", "TSPC", "TYRE", "UANG", "UCID", "UFOE", "ULTJ", "UNIC", "UNIQ",
+    "UNTR", "UNVR", "UVCR", "VAST", "VERN", "VICI", "VISI", "VKTR", "VOKS", "WAPO", "WEGE", "WEHA", "WIFI", "WINR", "WINS",
+    "WIRG", "WMUU", "WOOD", "WOWS", "WTON", "YPAS", "ZATA", "ZONE", "ZYRX", "BBCA", "BBRI", "BMRI", "BBNI", "BREN", "BIPI",
+    "BUKA", "NCKL", "AMRT", "TOWR", "TBIG", "DEWA", "ELSA", "BULL", "BEKS", "BBKP", "BNGA", "BDMN", "BJBR", "BJTM", "CDIA",
 ]
+
+FCA_SUSPEND_EXCLUDE = ['AISA', 'APLI', 'BAUT', 'BBSS', 'BTEK', 'COWL', 'CPRI', 'DNET', 'FORZ', 'HDTX', 'KRAH', 'LMAS', 'MYRX', 'NIPS', 'PRIM', 'TRIO', 'UNIT', 'ZBRA', 'GOLL', 'KOIN', 'MABA', 'KBAG', 'ARKA', 'BAUT', 'BULL', 'BUMI', 'BUVA', 'BOLA', 'BEEF', 'ENZO', 'ESTI', 'FINN', 'IIKP', 'INRU', 'IOTF', 'JKSW', 'KSK', 'LCGP', 'MAGP', 'MARA', 'MASA', 'MTPS', 'POLA', 'POLU', 'RIMO', 'SUGI', 'TDPM', 'WANA', 'WIDI', 'WOMF', 'YELO', 'NUSA', 'SRSN', 'CBMF', 'BNBR', 'BIPP', 'TAXI', 'SULI', 'TAXI', 'TALF', 'TDPM', 'BAPI', 'BNBR', 'BIPP', 'DEWA', 'ELSA', 'ENRG', 'BUMI', 'GOLL']
+
+def get_liquid_candidates():
+    return IDX_600_LIQUID
+
+def get_all_bursa_candidates():
+    return IDX_600_LIQUID
+
 
 
 TIMEZONE_WIB=pytz.timezone('Asia/Jakarta')
@@ -1467,7 +1491,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.7.6 STRICT TODAY REAL - ALL LIQUID BO+VOL1.5x FIX BMTR/KPIG + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.7.9 600 EXACT - 600 SAHAM PALING LIQUID NO FCA/WARRANT/SUSPEND/HARGA<50 - ISSI+IDX80 - STRICT TODAY+VOL1.5x Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1704,18 +1728,167 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.7.6 STRICT TODAY REAL - ALL LIQUID BO+VOL1.5x FIX BMTR/KPIG + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.7.9 600 EXACT - 600 SAHAM PALING LIQUID NO FCA/WARRANT/SUSPEND/HARGA<50 - ISSI+IDX80 - STRICT TODAY+VOL1.5x")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
     telegram_bot_listener()
 
 
+
+
+
+def _check_strict_bo_today(sym, hd, today_date, signal_type_filter="BO_BOB"):
+    """Unified check: TODAY only + BO EMA50/200 + VOL 1.5x - return dict or None"""
+    try:
+        if hd is None or len(hd) < 55:
+            return None
+        # Last candle must be TODAY
+        try:
+            last_dt = pd.to_datetime(hd.index[-1])
+            last_candle_date = last_dt.date()
+        except:
+            return None
+        delta = (today_date - last_candle_date).days
+        if delta != 0:  # HARUS TODAY, tolak kemarin
+            return None
+        
+        c = float(hd['Close'].iloc[-1])
+        pc = float(hd['Close'].iloc[-2])
+        # EMA adjust=False biar sama chart TradingView
+        ema50_s = hd['Close'].ewm(span=50, adjust=False).mean()
+        ema200_s = hd['Close'].ewm(span=200, adjust=False).mean()
+        ema50 = float(ema50_s.iloc[-1])
+        ema200 = float(ema200_s.iloc[-1])
+        pe50 = float(ema50_s.iloc[-2])
+        pe200 = float(ema200_s.iloc[-2])
+        
+        # HARUS cross di today: pc <= pe dan c > ema
+        is_bo=False
+        stype=""
+        if pc <= pe50 and c > ema50:
+            is_bo=True
+            stype="BO EMA50"
+        elif pc <= pe200 and c > ema200:
+            is_bo=True
+            stype="BOB EMA200"
+        if not is_bo:
+            return None
+        if signal_type_filter=="BO_BOB" and stype not in ["BO EMA50","BOB EMA200"]:
+            return None
+        
+        # Tolak kalau sudah BO 2 hari lalu (BMTR case: 3 BO berurutan di chart)
+        if len(hd)>=4:
+            c2=float(hd['Close'].iloc[-3])
+            c3=float(hd['Close'].iloc[-4])
+            pe50_2=float(ema50_s.iloc[-3])
+            pe50_3=float(ema50_s.iloc[-4])
+            pe200_2=float(ema200_s.iloc[-3])
+            pe200_3=float(ema200_s.iloc[-4])
+            if stype=="BO EMA50":
+                if c2 > pe50_2 and c3 > pe50_3:
+                    return None
+                if c2 > pe50_2 and pc > pe50:
+                    return None
+            if stype=="BOB EMA200":
+                if c2 > pe200_2 and c3 > pe200_3:
+                    return None
+                if c2 > pe200_2 and pc > pe200:
+                    return None
+        
+        # VOLUME 1.5x WAJIB
+        vol_today = float(hd['Volume'].iloc[-1])
+        if len(hd) >= 21:
+            avg_vol_20 = float(hd['Volume'].iloc[-21:-1].mean())
+        else:
+            avg_vol_20 = float(hd['Volume'].iloc[:-1].mean())
+        if avg_vol_20 <= 0 or vol_today <= 0:
+            return None
+        vol_ratio = vol_today / avg_vol_20
+        if vol_ratio < 1.5:
+            return None
+        
+        if c < 50:
+            return None
+        chg = (c/pc-1)*100 if pc>0 else 0
+        return {
+            "symbol":sym,
+            "type":stype,
+            "close":c,
+            "change":chg,
+            "ema50":ema50,
+            "ema200":ema200,
+            "last_date":str(last_candle_date),
+            "vol_today":vol_today,
+            "avg_vol_20":avg_vol_20,
+            "vol_ratio":vol_ratio,
+            "source":"STRICT_TODAY_VOL",
+            "score":vol_ratio*10
+        }
+    except:
+        return None
+
+def scan_v3_full_fast(force_today=False, limit_candidates=60, signal_type_filter="BO_BOB"):
+    today_date=get_now_wib().date()
+    print(f"[{get_now_wib()}] ⚡ FAST SCAN ULTRA STRICT TODAY+VOL1.5x limit={limit_candidates}")
+    try:
+        candidates = get_liquid_candidates()[:limit_candidates]
+    except:
+        candidates = ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","BUKA","BBKP","BRIS"][:limit_candidates]
+    candidates = [c for c in candidates if "-W" not in c]
+    signals=[]
+    def proc(sym):
+        try:
+            hd=get_history_pro(sym,limit=100,timeframe="1d")
+            return _check_strict_bo_today(sym, hd, today_date, signal_type_filter)
+        except:
+            return None
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futs={ex.submit(proc,s):s for s in candidates}
+        for f in as_completed(futs):
+            r=f.result()
+            if r:
+                signals.append(r)
+    print(f"⚡ FAST RESULT: {len(signals)} signals dari {len(candidates)} - BMTR 115 vs EMA 117.3 & KPIG -5% harusnya 0")
+    return signals
+
+def scan_v3_full_ORIGINAL(force_today=False, limit_candidates=150):
+    """ORIGINAL diganti jadi STRICT juga"""
+    today_date=get_now_wib().date()
+    print(f"[{get_now_wib()}] 🔍 SCAN RINGKAS ULTRA STRICT TODAY+VOL1.5x limit={limit_candidates}")
+    try:
+        candidates = get_liquid_candidates()[:limit_candidates]
+    except:
+        candidates = ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","BUKA","BBKP","BRIS","ANTM","INCO","MDKA","ADRO","PTBA","PGAS","EXCL","ISAT"][:limit_candidates]
+    candidates = [c for c in candidates if "-W" not in c]
+    signals=[]
+    # Sequential tapi pakai check yang sama
+    for sym in candidates:
+        try:
+            hd=get_history_pro(sym,limit=100,timeframe="1d")
+            res=_check_strict_bo_today(sym, hd, today_date, "BO_BOB")
+            if res:
+                signals.append(res)
+                print(f"✅ {sym} {res['vol_ratio']:.2f}x VOL {res['type']} - Close {res['close']:.0f} EMA50 {res['ema50']:.0f}")
+            else:
+                # Debug BMTR/KPIG kenapa fail
+                if sym in ["BMTR","KPIG","GMFI","KAEF"]:
+                    try:
+                        last_c = float(hd['Close'].iloc[-1]) if hd is not None else 0
+                        ema50 = float(hd['Close'].ewm(span=50, adjust=False).mean().iloc[-1]) if hd is not None else 0
+                        vol_t = float(hd['Volume'].iloc[-1]) if hd is not None else 0
+                        avg_v = float(hd['Volume'].iloc[-21:-1].mean()) if hd is not None and len(hd)>=21 else 0
+                        print(f"❌ {sym} REJECTED: Close {last_c:.0f} vs EMA50 {ema50:.0f} Vol {vol_t:.0f}/{avg_v:.0f}={vol_t/avg_v if avg_v>0 else 0:.2f}x")
+                    except:
+                        print(f"❌ {sym} REJECTED: error")
+        except Exception as e:
+            continue
+    print(f"🔍 RINGKAS RESULT: {len(signals)} BUY")
+    return signals
+
 def scan_v3_full(force_today=False, limit_candidates=150):
-    """WRAPPER STRICT - panggil fast scan biar konsisten TODAY+VOL1.5x"""
     if force_today:
-        # Jika force_today, pakai strict fast logic (sama dengan auto alert)
         return scan_v3_full_fast(force_today=True, limit_candidates=limit_candidates, signal_type_filter="BO_BOB")
     else:
         return scan_v3_full_ORIGINAL(force_today=False, limit_candidates=limit_candidates)
-
