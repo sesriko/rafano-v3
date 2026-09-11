@@ -1,7 +1,10 @@
 """
-RAFANO V4.12 MULTITIMEFRAME FIX - CHART TETAP BMTR STYLE
-Fix: /c bmtr 5 = 5m, /c bmtr 15 = 15m, /c bmtr 1h = 1h, /c bmtr = daily
-Tambah: timeframe info di pojok kanan atas gambar
+RAFANO V4.13 CAPTION PRO - Caption baru kayak BUMI, chart tetap BMTR hitam pro
+BUMI — Harga 206 (+7.29%)
+    ├  Buy Strength Score: 95% (VERY STRONG)
+    ├  RSI (14): 66.31
+    ├ Vol Spike: 2.1x V1 | Buy Vol: 89%
+    └ Bandar 1W: +1014.67B (ACCUM
 """
 import os, time, datetime, threading, requests, pytz
 import numpy as np, pandas as pd
@@ -51,15 +54,14 @@ def set_cached(k,d,cache):
 
 def arjum_get(path, params=None):
     global QUOTA_HIT, LAST_429_TIME
-    if QUOTA_HIT and time.time()-LAST_429_TIME<300:
-        return None
+    if QUOTA_HIT and time.time()-LAST_429_TIME<300: return None
     url=f"{ARJUM_BASE}{path}"
     try:
         headers={"X-API-Key": ARJUM_API_KEY.strip(),"Accept":"application/json","User-Agent":"Mozilla/5.0"}
         r=requests.get(url,headers=headers,params=params,timeout=12)
         if r.status_code==200: return r.json()
         elif r.status_code==429:
-            QUOTA_HIT=True; LAST_429_TIME=time.time(); print(f"🚨 429 {path}"); return None
+            QUOTA_HIT=True; LAST_429_TIME=time.time(); return None
     except: pass
     return None
 
@@ -94,11 +96,9 @@ def get_itick_quotes_batch(symbols, max_batch=15):
     except: pass
     return all_quotes
 
-# ===== MULTITIMEFRAME FIX =====
 def normalize_timeframe(tf_input):
-    """Fix: /c bmtr 5 = 5m, /c bmtr 15 = 15m, /c bmtr 1h = 1h, /c bmtr = daily"""
     if not tf_input or str(tf_input).strip()=="":
-        return "1d"  # default daily kalau cuma /c bmtr
+        return "1d"
     tf = str(tf_input).lower().strip()
     mapping={
         "5":"5m","5m":"5m","5min":"5m","5menit":"5m","m5":"5m",
@@ -112,14 +112,10 @@ def normalize_timeframe(tf_input):
     return mapping.get(tf, tf)
 
 def get_history_pro(sym, limit=150, frame="daily"):
-    """Fix multitimeframe: daily via Arjum, intraday via yfinance"""
-    # Normalize frame
     frame = normalize_timeframe(frame)
     hk=f"{sym}_{frame}_{limit}"
     cached=get_cached(hk, HISTORY_CACHE, HISTORY_CACHE_TTL)
     if cached is not None: return cached
-    
-    # Arjum hanya untuk daily
     if frame=="1d" and not QUOTA_HIT:
         data=arjum_get(f"/history/{sym}",params={"limit":limit,"frame":"daily"})
         rows=[]
@@ -146,34 +142,18 @@ def get_history_pro(sym, limit=150, frame="daily"):
                 if len(df)>=10:
                     set_cached(hk,df,HISTORY_CACHE); return df
             except: pass
-    
-    # yfinance untuk semua TF termasuk daily fallback
     try:
         import yfinance as yf
-        # Mapping yfinance interval
-        yf_interval_map={
-            "5m":"5m","15m":"15m","30m":"30m",
-            "1h":"1h","4h":"1h",  # yfinance 4h gak ada, pakai 1h
-            "1d":"1d","1w":"1wk"
-        }
+        yf_interval_map={"5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"1h","1d":"1d","1w":"1wk"}
         interval=yf_interval_map.get(frame, "1d")
-        # Period mapping
-        if frame in ["5m","15m"]:
-            period="5d"
-        elif frame in ["30m","1h"]:
-            period="1mo"
-        elif frame=="4h":
-            period="3mo"
-        elif frame=="1d":
-            period="6mo"
-        else:
-            period="1y"
-        
-        print(f"📊 YF fetch {sym}.JK interval {interval} period {period} (TF {frame})")
+        if frame in ["5m","15m"]: period="5d"
+        elif frame in ["30m","1h"]: period="1mo"
+        elif frame=="4h": period="3mo"
+        elif frame=="1d": period="6mo"
+        else: period="1y"
         ticker=yf.Ticker(f"{sym}.JK")
         hist=ticker.history(period=period,interval=interval,timeout=15, auto_adjust=False)
         if hist is not None and len(hist)>20:
-            # Untuk 4h, resample 1h ke 4h
             if frame=="4h" and interval=="1h":
                 hist=hist.resample('4H').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
             set_cached(hk,hist.tail(limit),HISTORY_CACHE)
@@ -186,12 +166,13 @@ def get_bandar_info(sym):
     cache_key=f"bandar_{sym}"
     cached=get_cached(cache_key, BROKER_CACHE, BROKER_CACHE_TTL)
     if cached is not None: return cached
-    result={"foreign_net":0,"is_foreign_buy":False,"foreign_str":"N/A","score_bonus":0}
+    result={"foreign_net":0,"foreign_net_1w":0,"is_foreign_buy":False,"foreign_str":"N/A","foreign_str_1w":"N/A","score_bonus":0,"accum_type":"NEUTRAL"}
     try:
-        fdata=arjum_get(f"/foreign/{sym}", params={"limit": 1, "frame": "daily"})
+        fdata=arjum_get(f"/foreign/{sym}", params={"limit": 5, "frame": "daily"})
         if fdata:
             rows=fdata.get('data') if isinstance(fdata, dict) else fdata
             if isinstance(rows, list) and len(rows)>0:
+                # 1 hari
                 last=rows[0]
                 fn=float(last.get('foreign_net') or last.get('net_foreign') or 0)
                 if fn!=0:
@@ -199,6 +180,16 @@ def get_bandar_info(sym):
                     result["is_foreign_buy"]=fn>0
                     result["foreign_str"]=f"{'FB' if fn>0 else 'FS'} {fn/1_000_000_000:+.1f}B" if abs(fn)>=1e9 else f"{'FB' if fn>0 else 'FS'} {fn/1_000_000:+.0f}M"
                     result["score_bonus"]+=15 if fn>0 else 0
+                # 1 minggu (5 hari)
+                fn_1w=0
+                for r in rows[:5]:
+                    fn_1w+=float(r.get('foreign_net') or r.get('net_foreign') or 0)
+                result["foreign_net_1w"]=fn_1w
+                if fn_1w!=0:
+                    result["foreign_str_1w"]=f"{'+' if fn_1w>0 else ''}{fn_1w/1_000_000_000:.2f}B" if abs(fn_1w)>=1e9 else f"{'+' if fn_1w>0 else ''}{fn_1w/1_000_000:.0f}M"
+                    if fn_1w>1_000_000_000: result["accum_type"]="ACCUM"
+                    elif fn_1w<-1_000_000_000: result["accum_type"]="DIST"
+                    else: result["accum_type"]="NEUTRAL"
     except: pass
     set_cached(cache_key, result, BROKER_CACHE)
     return result
@@ -213,8 +204,20 @@ def format_large_number(val,show_sign=False):
 
 def format_timeframe_label(tf):
     tf=normalize_timeframe(tf)
-    m={"5m":"5 Menit","15m":"15 Menit","30m":"30 Menit","1h":"1 Jam","4h":"4 Jam","1d":"Daily","1w":"Weekly","1mo":"Monthly"}
+    m={"5m":"5 Menit","15m":"15 Menit","30m":"30 Menit","1h":"1 Jam","4h":"4 Jam","1d":"Daily","1w":"Weekly"}
     return m.get(tf, tf.upper())
+
+def calculate_rsi(prices, period=14):
+    """RSI 14"""
+    try:
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss.replace(0, 0.001)
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1]) if len(rsi)>0 and not pd.isna(rsi.iloc[-1]) else 50.0
+    except:
+        return 50.0
 
 def calculate_vsa_metrics(df):
     df=df.copy()
@@ -273,14 +276,93 @@ def detect_bo_bos_markers(df):
                     signals.append({"idx":i,"type":"BOS EMA","color":"yellow"})
     return signals
 
-# CHART TETAP SAMA - Cuma tambah info TF di pojok kanan atas
+# ===== CAPTION PRO BARU - Kayak BUMI yang lu mau =====
+def generate_caption_pro(symbol, df, realtime_price=None, tf_norm="1d"):
+    """
+    BUMI — Harga 206 (+7.29%)
+        ├  Buy Strength Score: 95% (VERY STRONG)
+        ├  RSI (14): 66.31
+        ├ Vol Spike: 2.1x V1 | Buy Vol: 89%
+        └ Bandar 1W: +1014.67B (ACCUM
+    """
+    try:
+        df=df.copy()
+        if realtime_price and realtime_price>0 and len(df)>0:
+            df.iloc[-1, df.columns.get_loc('Close')] = realtime_price
+        
+        last_close=df['Close'].iloc[-1]
+        prev_close=df['Close'].iloc[-2] if len(df)>1 else last_close
+        chg_pct=((last_close/prev_close)-1)*100 if prev_close else 0
+        
+        # RSI
+        rsi = calculate_rsi(df['Close'], 14)
+        
+        # VSA Metrics
+        df['V1']=df['Volume'].rolling(20,min_periods=1).mean()
+        df_vsa, buy_ratios = calculate_vsa_metrics(df)
+        buy_pct = int(buy_ratios.iloc[-1]*100) if hasattr(buy_ratios,'iloc') else int(buy_ratios[-1]*100)
+        buy_pct = max(0, min(100, buy_pct))
+        
+        # Buy Strength Score = kombinasi Buy Vol + close pos + RSI
+        vchg = df['Volume'].iloc[-1] / df['V1'].iloc[-1] if df['V1'].iloc[-1]>0 else 1.0
+        high_today=df['High'].iloc[-1]; low_today=df['Low'].iloc[-1]
+        close_pos = (last_close - low_today) / (high_today - low_today) if high_today!=low_today else 1.0
+        # Score: buy_pct 40% + close_pos 30% + rsi normalized 30%
+        rsi_score = min(100, max(0, (rsi-30)/40*100))  # RSI 30=0%, 70=100%
+        buy_strength = int(buy_pct*0.4 + close_pos*100*0.3 + rsi_score*0.3)
+        buy_strength = max(0, min(100, buy_strength))
+        
+        if buy_strength>=90: strength_label="VERY STRONG"
+        elif buy_strength>=75: strength_label="STRONG"
+        elif buy_strength>=60: strength_label="MODERATE"
+        elif buy_strength>=40: strength_label="WEAK"
+        else: strength_label="VERY WEAK"
+        
+        # Vol Spike vs V1
+        v1=df['V1'].iloc[-1]
+        vol_spike = df['Volume'].iloc[-1] / v1 if v1>0 else 1.0
+        
+        # Bandar 1W
+        bandar=get_bandar_info(symbol)
+        bandar_1w_val=bandar.get('foreign_net_1w',0)
+        bandar_1w_str=bandar.get('foreign_str_1w','N/A')
+        accum_type=bandar.get('accum_type','NEUTRAL')
+        
+        # Format harga
+        harga_str = f"{int(last_close)}"
+        chg_str = f"{chg_pct:+.2f}%"
+        
+        # TF label
+        tf_label = format_timeframe_label(tf_norm)
+        
+        caption = f"""{symbol} — Harga {harga_str} ({chg_str}) | {tf_label}
+    ├  Buy Strength Score: {buy_strength}% ({strength_label})
+    ├  RSI (14): {rsi:.2f}
+    ├  Vol Spike: {vol_spike:.1f}x V1 | Buy Vol: {buy_pct}%
+    └  Bandar 1W: {bandar_1w_str} ({accum_type})"""
+        
+        return caption, {
+            "buy_strength": buy_strength,
+            "strength_label": strength_label,
+            "rsi": rsi,
+            "vol_spike": vol_spike,
+            "buy_vol": buy_pct,
+            "bandar_1w": bandar_1w_str,
+            "accum": accum_type,
+            "close": last_close,
+            "chg_pct": chg_pct
+        }
+    except Exception as e:
+        print(f"Caption err {e}")
+        import traceback; traceback.print_exc()
+        return f"{symbol} — Harga {int(df['Close'].iloc[-1]) if len(df)>0 else 0}", {}
+
+# CHART TETAP SAMA - BMTR HITAM PRO
 def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output_filename="chart.png",extra_info=None,realtime_price=None):
     try:
         extra_info=extra_info or {}
-        # Normalize TF untuk display
         timeframe_norm = normalize_timeframe(timeframe)
         tf_label_disp=extra_info.get('tf_label') or format_timeframe_label(timeframe_norm)
-        
         df=df.copy().ffill().bfill()
         if not isinstance(df.index,pd.DatetimeIndex): df.index=pd.to_datetime(df.index)
         else: df=df.sort_index()
@@ -357,8 +439,7 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         fig.text(0.005,0.93,f"{symbol} | IHSG",color='#ffaa00',fontsize=8,ha='left')
         fig.text(0.005,0.905,f"● {'WAIT' if abs(chg_pct)<0.5 else 'GO'}",color='#aaaaaa',fontsize=9,ha='left', fontweight='bold')
         fig.text(0.005,0.885,f"High:{last_high:.0f} Low:{last_low:.0f} Open:{last_open:.0f} Vol:{last_vol:,.0f}",color='#00ffff',fontsize=7,ha='left')
-        fig.text(0.5,0.96,"RAFANO TRADER V4.12 MULTITF",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
-        # TF INFO DI POJOK KANAN ATAS - Sesuai request
+        fig.text(0.5,0.96,"RAFANO TRADER V4.13 CAPTION PRO",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
         ds=df.index[-1].strftime('%d %b %Y %H:%M') if hasattr(df.index[-1],'strftime') else get_now_wib().strftime('%d %b %Y %H:%M')
         fig.text(0.99,0.96,f"{tf_label_disp} | {ds}",color='#ffcc00',fontsize=11,ha='right',va='center', fontweight='bold')
         fig.text(0.99,0.93,f"Command BOT /C {symbol} {timeframe_norm}",color='#cccccc',fontsize=8,ha='right')
@@ -384,7 +465,6 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         ax_mm.text(len(df)+1, mm_last, f" {mm_last:.4f}", color='black', fontsize=7, va='center', fontweight='bold', bbox=dict(facecolor='#ffff00', edgecolor='none'))
         ax_mm.set_ylim(-30,30)
         step=max(1,len(df)//10); ax_mm.set_xticks(x[::step])
-        # Label X sesuai TF
         if timeframe_norm in ["5m","15m","30m","1h","4h"]:
             labels=[df.index[i].strftime('%H:%M') if hasattr(df.index[i],'strftime') else str(i) for i in range(0,len(df),step)]
         else:
@@ -399,13 +479,12 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         try: plt.clf(); plt.close('all')
         except: pass
 
-def scan_v412_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=False):
+def scan_v413_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=False):
     global ALERTED_TODAY, ALERTED_DATE
     today = get_now_wib().date()
     if ALERTED_DATE != today:
         ALERTED_TODAY=set()
         ALERTED_DATE=today
-    print(f"[{get_now_wib()}] 🚀 V4.12: Arjum {top_arjum} -> ITICK {top_itick} Vol>{vol_thr}x")
     screener = get_screener_latest(force_today=True)
     rows = screener.get('rows', []) if isinstance(screener, dict) else []
     if not rows: return []
@@ -435,13 +514,12 @@ def scan_v412_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
             c = float(realtime_price if realtime_price and realtime_price>0 else hd['Close'].iloc[-1])
             v_last=float(hd['Volume'].iloc[-1]); v_avg=float(hd['Volume'].iloc[-21:-1].mean())
             if v_avg==0 or v_last==0: return None
-            vol_ratio=v_last/v_avg
-            if vol_ratio < vol_thr: return None
+            if v_last/v_avg < vol_thr: return None
             if v_last * c < min_value: return None
             bo_info = check_bo_ema50_bob200(sym, hd, realtime_price)
             if not bo_info: return None
             bandar=get_bandar_info(sym)
-            return {"symbol": sym, "type": bo_info['type'], "close": int(c), "change_pct": q.get('changepct',0), "vol_ratio": vol_ratio, "vol_rp": v_last * c, "bandar": bandar, "foreign_str": bandar.get('foreign_str',''), "source": q.get('source',''), "realtime": realtime_price}
+            return {"symbol": sym, "type": bo_info['type'], "close": int(c), "change_pct": q.get('changepct',0), "vol_ratio": v_last/v_avg, "vol_rp": v_last * c, "bandar": bandar, "foreign_str": bandar.get('foreign_str',''), "source": q.get('source',''), "realtime": realtime_price}
         except: return None
     with ThreadPoolExecutor(max_workers=12) as ex:
         futs={ex.submit(check_one, s): s for s in top_codes}
@@ -495,7 +573,6 @@ def send_reply(cid, txt, rm=None):
             pl.pop('parse_mode',None)
             r=requests.post(url,json=pl,timeout=15)
             return r.json().get('ok',False)
-        print(f"✅ Sent to {cid}")
         return True
     except: return False
 
@@ -507,39 +584,41 @@ def send_photo_reply(cid, path, caption=""):
     except Exception as e: print(f"Photo err {e}")
 
 def process_chart_request(cid, code, tf_input="1d"):
-    """FIXED: /c bmtr 5 = 5m, /c bmtr 15 = 15m, /c bmtr 1h = 1h, /c bmtr = daily"""
     tf_norm = normalize_timeframe(tf_input)
     tf_label = format_timeframe_label(tf_norm)
-    print(f"📊 Chart request {code.upper()} TF input '{tf_input}' -> normalized '{tf_norm}' ({tf_label})")
-    send_reply(cid, f"📊 *{code.upper()} ({tf_label} - {tf_norm}) chart pro...*")
+    send_reply(cid, f"📊 *{code.upper()} ({tf_label}) chart pro + ITICK...*")
     df=get_history_pro(code, 150, frame=tf_norm)
     if df is None or len(df)<20:
-        send_reply(cid, f"⚠ Data {code} TF {tf_norm} tidak ada (market tutup atau yfinance limit)"); return
+        send_reply(cid, f"⚠ Data {code} TF {tf_norm} tidak ada"); return
     quotes=get_itick_quotes_batch([code],1)
     realtime=quotes.get(code.upper(),{}).get('price',0)
     chart_file=f"/tmp/chart_{code.upper()}_{tf_norm}_{int(time.time())}.png"
     fp, markers = generate_pro_chart(df, symbol=code.upper(), timeframe=tf_norm, sector_info=f"{code.upper()} | IHSG", output_filename=chart_file, extra_info={'tf_label':tf_label}, realtime_price=realtime)
     if not fp or not os.path.exists(fp):
         send_reply(cid, "❌ Gagal render chart"); return
-    sig_text = ", ".join([f"{s['type']}" for s in markers[-3:]]) if markers else "No signal"
-    cap=f"*{code.upper()} {tf_label}* {int(df['Close'].iloc[-1])} RT {int(realtime) if realtime else ''} | {sig_text} | {tf_norm} | Vol {format_large_number(df['Volume'].iloc[-1])}"
-    send_photo_reply(cid, fp, caption=cap)
+    
+    # CAPTION PRO BARU - kayak BUMI
+    caption_pro, metrics = generate_caption_pro(code.upper(), df, realtime_price=realtime, tf_norm=tf_norm)
+    # Tambah marker info
+    sig_text = ", ".join([f"{s['type']}" for s in markers[-3:]]) if markers else "No BO signal"
+    full_caption = caption_pro + f"\n\n🔍 {sig_text} | Command: /C {code.upper()} {tf_norm}"
+    
+    send_photo_reply(cid, fp, caption=full_caption)
     if os.path.exists(fp): os.remove(fp)
 
 def process_broker_request(cid, sym):
     bandar=get_bandar_info(sym)
-    send_reply(cid, f"🏦 *{sym} BANDAR*\n{bandar.get('foreign_str','N/A')} Bonus +{bandar.get('score_bonus',0)}")
+    send_reply(cid, f"🏦 *{sym} BANDAR*\n{bandar.get('foreign_str','N/A')} | 1W: {bandar.get('foreign_str_1w','N/A')} ({bandar.get('accum_type','')})")
 
-def broadcast_v412(signals, vol_thr=1.5, dest_chat_id=None, is_auto=False):
+def broadcast_v413(signals, vol_thr=1.5, dest_chat_id=None, is_auto=False):
     target = dest_chat_id or TARGET_CHAT_ID
     if not target: return
     if not signals:
-        if not is_auto:
-            send_reply(target, f"📉 V4.12 VOL>{vol_thr}x - Tidak ada BO valid\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO/BOB"); 
+        if not is_auto: send_reply(target, f"📉 V4.13 VOL>{vol_thr}x - Tidak ada BO valid"); 
         return
     now=get_now_wib().strftime('%d %b %Y %H:%M:%S WIB')
     auto_tag = "⚡ REALTIME ALERT" if is_auto else "🚀"
-    header=f"{auto_tag} *V4.12 TOP {len(signals)} BO/BOB + ITICK REALTIME* 🔥\n{now}\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO EMA50/BOB EMA200\n{'='*50}\n\n"
+    header=f"{auto_tag} *V4.13 TOP {len(signals)} BO/BOB + ITICK* 🔥\n{now}\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO EMA50/BOB EMA200\n{'='*50}\n\n"
     msg=header; kb=[]
     for idx,it in enumerate(signals,1):
         rt_str = f" RT{it['realtime']:.0f}" if it.get('realtime',0)>0 else ""
@@ -548,10 +627,8 @@ def broadcast_v412(signals, vol_thr=1.5, dest_chat_id=None, is_auto=False):
         kb.append([{"text": f"{it['symbol']} {it['type']}", "callback_data": f"chart_{it['symbol']}"}])
         if len(msg)+len(line)>3500:
             send_reply(target, msg, rm={"inline_keyboard": kb}); msg=line; kb=[]
-        else:
-            msg+=line
-    if msg:
-        send_reply(target, msg, rm={"inline_keyboard": kb})
+        else: msg+=line
+    if msg: send_reply(target, msg, rm={"inline_keyboard": kb})
 
 def broadcast_vol_spike(signals, threshold=2.0, sort_by_rp=False, dest_chat_id=None):
     target = dest_chat_id or TARGET_CHAT_ID
@@ -567,10 +644,8 @@ def broadcast_vol_spike(signals, threshold=2.0, sort_by_rp=False, dest_chat_id=N
         kb.append([{"text": f"{it['symbol']} {it['vol_ratio']:.1f}x", "callback_data": f"chart_{it['symbol']}"}])
         if len(msg)+len(line)>3500:
             send_reply(target, msg, rm={"inline_keyboard": kb}); msg=line; kb=[]
-        else:
-            msg+=line
-    if msg:
-        send_reply(target, msg, rm={"inline_keyboard": kb})
+        else: msg+=line
+    if msg: send_reply(target, msg, rm={"inline_keyboard": kb})
 
 AUTO_ALERT_ENABLED=True
 AUTO_ALERT_INTERVAL=60
@@ -578,31 +653,25 @@ LAST_AUTO_ALERT_TIME=0
 
 def realtime_auto_alert_loop():
     global LAST_AUTO_ALERT_TIME, ALERTED_TODAY, ALERTED_DATE
-    print(f"⚡ REALTIME AUTO ALERT LOOP {AUTO_ALERT_INTERVAL} DETIK")
     while True:
         try:
-            if not AUTO_ALERT_ENABLED:
-                time.sleep(10); continue
+            if not AUTO_ALERT_ENABLED: time.sleep(10); continue
             now=get_now_wib()
             today=now.date()
             global ALERTED_DATE
             if ALERTED_DATE != today:
                 ALERTED_TODAY=set()
                 ALERTED_DATE=today
-            if now.weekday()>=5:
-                time.sleep(300); continue
+            if now.weekday()>=5: time.sleep(300); continue
             market_start=now.replace(hour=9, minute=0, second=0, microsecond=0)
             market_end=now.replace(hour=15, minute=30, second=0, microsecond=0)
-            if not (market_start <= now <= market_end):
-                time.sleep(300); continue
-            if time.time() - LAST_AUTO_ALERT_TIME < AUTO_ALERT_INTERVAL:
-                time.sleep(5); continue
-            print(f"⚡ [{now.strftime('%H:%M:%S')}] REALTIME SCAN")
-            signals = scan_v412_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=True)
+            if not (market_start <= now <= market_end): time.sleep(300); continue
+            if time.time() - LAST_AUTO_ALERT_TIME < AUTO_ALERT_INTERVAL: time.sleep(5); continue
+            signals = scan_v413_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=True)
             LAST_AUTO_ALERT_TIME=time.time()
             if signals:
                 for s in signals: ALERTED_TODAY.add(s['symbol'])
-                broadcast_v412(signals, vol_thr=1.5, dest_chat_id=TARGET_CHAT_ID, is_auto=True)
+                broadcast_v413(signals, vol_thr=1.5, dest_chat_id=TARGET_CHAT_ID, is_auto=True)
             time.sleep(AUTO_ALERT_INTERVAL)
         except Exception as e:
             print(f"REALTIME ALERT err {e}")
@@ -610,9 +679,7 @@ def realtime_auto_alert_loop():
 
 def telegram_bot_listener():
     offset=0
-    print("🤖 RAFANO V4.12 MULTITIMEFRAME FIX")
-    print(f"🔑 BOT: {'ADA' if TELEGRAM_BOT_TOKEN else 'KOSONG'} | ITICK: {'ON' if ITICK_ENABLED else 'OFF'}")
-    print(f"⚡ REALTIME AUTO ALERT: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL} detik")
+    print("🤖 RAFANO V4.13 CAPTION PRO")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     if AUTO_ALERT_ENABLED:
@@ -632,7 +699,7 @@ def telegram_bot_listener():
                     except: pass
                     if cdata.startswith("chart_"):
                         sym=cdata.split("_")[1]
-                        threading.Thread(target=process_chart_request,args=(chat_id,sym,"5m")).start()
+                        threading.Thread(target=process_chart_request,args=(chat_id,sym,"1d")).start()
                 elif "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip()
                     chat_id=update["message"]["chat"]["id"]
@@ -641,43 +708,42 @@ def telegram_bot_listener():
                     first=txt.split()[0].lower() if txt else ""
                     parts=txt.split()
                     if first in ["/start","/help","/menu"]:
-                        help_text="""🔥 *RAFANO V4.12 MULTITF FIX*
+                        help_text="""🔥 *RAFANO V4.13 CAPTION PRO*
 ⚡ Realtime 60 detik: Arjum 60 -> ITICK 30 -> BO
 
-📈 *CHART MULTITIMEFRAME FIX*
-/c KODE = Daily (default)
+📈 *CHART MULTITF + CAPTION PRO*
+/c KODE = Daily
 /c KODE 5 = 5 menit
 /c KODE 15 = 15 menit
-/c KODE 30 = 30 menit
 /c KODE 1h = 1 jam
 /c KODE 4h = 4 jam
-/c KODE 1d = Daily
-/c KODE 1w = Weekly
-Contoh: /c BMTR 5 , /c BBCA 15 , /c WIFI 1h
+Contoh: /c BUMI 5 , /c BBCA 15
+Caption: BUMI — Harga 206 (+7.29%)
+    ├  Buy Strength 95% (VERY STRONG)
+    ├  RSI 66.31
+    ├  Vol Spike 2.1x | Buy Vol 89%
+    └  Bandar 1W +1014B (ACCUM)
 
-🏦 /b KODE - Bandar
+🏦 /b KODE - Bandar 1W
 
 🚀 *SCAN REALTIME*
 /scanbo [vol] - Arjum 60 -> ITICK 30 -> BO/BOB
-/topbo [vol]
 
-🔥 *VOLUME*
-/scanvol /vol [thr] [limit]
+🔥 /scanvol /vol [thr] [limit]
 /volall [thr]
 
-🤖 *AUTO*
-/autoalert on/off/status/reset
+🤖 /autoalert on/off/status/reset
 /quota
 """
                         send_reply(chat_id, help_text)
                     elif first in ["/quota"]:
-                        send_reply(chat_id, f"QUOTA: {'HABIS 5m' if QUOTA_HIT else 'OK'}\nARJUM: {'ADA' if ARJUM_API_KEY else 'KOSONG'}\nITICK: {'ON' if ITICK_ENABLED else 'OFF'}\nAUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s\nAlerted: {len(ALERTED_TODAY)}")
+                        send_reply(chat_id, f"QUOTA: {'HABIS' if QUOTA_HIT else 'OK'}\nAUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s\nAlerted: {len(ALERTED_TODAY)}")
                     elif first in ["/autoalert","/auto"]:
                         if len(parts)>=2:
                             cmd=parts[1].lower()
                             if cmd=="on":
                                 globals()['AUTO_ALERT_ENABLED']=True
-                                send_reply(chat_id, f"⚡ REALTIME AUTO ON - {AUTO_ALERT_INTERVAL}s jam 09:00-15:30")
+                                send_reply(chat_id, f"⚡ REALTIME AUTO ON {AUTO_ALERT_INTERVAL}s")
                             elif cmd=="off":
                                 globals()['AUTO_ALERT_ENABLED']=False
                                 send_reply(chat_id, "AUTO OFF")
@@ -687,34 +753,34 @@ Contoh: /c BMTR 5 , /c BBCA 15 , /c WIFI 1h
                             elif cmd=="status":
                                 now=get_now_wib()
                                 last=time.strftime('%H:%M:%S', time.localtime(LAST_AUTO_ALERT_TIME)) if LAST_AUTO_ALERT_TIME else "Belum"
-                                send_reply(chat_id, f"⚡ AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'}\nInterval: {AUTO_ALERT_INTERVAL}s\nLast: {last}\nAlerted today: {len(ALERTED_TODAY)} - {list(ALERTED_TODAY)[:10]}\nJam: {now.strftime('%H:%M:%S WIB')}")
+                                send_reply(chat_id, f"AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'}\nInterval: {AUTO_ALERT_INTERVAL}s\nLast: {last}\nAlerted: {len(ALERTED_TODAY)} - {list(ALERTED_TODAY)[:10]}")
                         else:
                             send_reply(chat_id, f"AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s")
                     elif first in ["/c","/chart"]:
                         if len(parts)>=2:
                             sym=parts[1].upper()
-                            tf_input=parts[2] if len(parts)>=3 else "1d"  # FIX: default daily bukan 5m
+                            tf_input=parts[2] if len(parts)>=3 else "1d"
                             threading.Thread(target=process_chart_request,args=(chat_id,sym,tf_input)).start()
                         else:
-                            send_reply(chat_id, "Pakai: /c BMTR 5 (5 menit) atau /c BMTR (daily)\n/c KODE [5/15/30/1h/4h/1d/1w]")
+                            send_reply(chat_id, "Pakai: /c BUMI 5 atau /c BBCA\n/c KODE [5/15/30/1h/4h/1d/1w]")
                     elif first in ["/b","/broker","/bandar"]:
                         if len(parts)>=2:
                             sym=parts[1].upper()
                             threading.Thread(target=process_broker_request,args=(chat_id,sym)).start()
                         else:
-                            send_reply(chat_id, "Pakai: /b BBCA")
-                    elif first in ["/scanvol","/vol","/vspike","/volspike","/spike"]:
+                            send_reply(chat_id, "Pakai: /b BUMI")
+                    elif first in ["/scanvol","/vol"]:
                         try: thr=float(parts[1]) if len(parts)>=2 else 2.0; lim=int(parts[2]) if len(parts)>=3 else 60
                         except: thr=2.0; lim=60
-                        send_reply(chat_id, f"🔥 SCAN VOL >{thr}x ({lim}) ke {chat_id}...")
+                        send_reply(chat_id, f"🔥 SCAN VOL >{thr}x ({lim})...")
                         def run_vol(tg=chat_id, th=thr, l=lim):
                             sigs=scan_volume_spike(threshold=th, limit_candidates=l, sort_by_rp=False)
                             broadcast_vol_spike(sigs, threshold=th, sort_by_rp=False, dest_chat_id=tg)
                         threading.Thread(target=run_vol).start()
-                    elif first in ["/scanvolall","/volall","/vall","/scanallvol"]:
+                    elif first in ["/scanvolall","/volall"]:
                         try: thr=float(parts[1]) if len(parts)>=2 else 2.0
                         except: thr=2.0
-                        send_reply(chat_id, f"🔥🔥 SCAN VOL ALL 300 >{thr}x ke {chat_id}...")
+                        send_reply(chat_id, f"🔥🔥 SCAN VOL ALL 300 >{thr}x...")
                         def run_volall(tg=chat_id, th=thr):
                             sigs=scan_volume_spike(threshold=th, limit_candidates=300, sort_by_rp=True)
                             broadcast_vol_spike(sigs, threshold=th, sort_by_rp=True, dest_chat_id=tg)
@@ -725,18 +791,18 @@ Contoh: /c BMTR 5 , /c BBCA 15 , /c WIFI 1h
                             if len(parts)>=2: vol_thr=float(parts[1])
                             if len(parts)>=3: min_val=float(parts[2])
                         except: pass
-                        send_reply(chat_id, f"🚀 V4.12 SCAN Arjum {top_arjum} -> ITICK {top_final} VOL>{vol_thr}x ke {chat_id}...")
+                        send_reply(chat_id, f"🚀 V4.13 SCAN Arjum {top_arjum} -> ITICK {top_final} VOL>{vol_thr}x...")
                         def run_scan(tg=chat_id, vt=vol_thr, tf=top_final, ta=top_arjum, mv=min_val):
-                            sigs=scan_v412_final(top_arjum=ta, top_itick=tf, vol_thr=vt, min_value=mv, only_new=False)
-                            broadcast_v412(sigs, vol_thr=vt, dest_chat_id=tg, is_auto=False)
+                            sigs=scan_v413_final(top_arjum=ta, top_itick=tf, vol_thr=vt, min_value=mv, only_new=False)
+                            broadcast_v413(sigs, vol_thr=vt, dest_chat_id=tg, is_auto=False)
                         threading.Thread(target=run_scan).start()
         except Exception as e:
             print(f"Listener err {e}"); import traceback; traceback.print_exc(); time.sleep(3)
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.12 MULTITIMEFRAME FIX")
-    print("/c bmtr 5=5m, /c bmtr 15=15m, /c bmtr 1h=1h, /c bmtr=daily")
-    print("Chart tetap BMTR style hitam pro")
+    print("🔥 RAFANO V4.13 CAPTION PRO")
+    print("BUMI — Harga 206 (+7.29%) Buy Strength RSI Vol Bandar 1W")
+    print("Chart BMTR hitam pro tetap")
     print("==========================================")
     telegram_bot_listener()
