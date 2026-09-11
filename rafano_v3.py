@@ -117,7 +117,7 @@ def send_auto_telegram_alert(signal):
 💰 Price: Rp {realtime_price:.0f} ({chg:+.2f}%) {source_label}
 📊 Close: {close:.0f} | EMA50: {signal.get('ema50',0):.0f} | EMA200: {signal.get('ema200',0):.0f}
 📅 Last Candle: {signal.get('last_date','today')} (STRICT TODAY)
-🔥 VOL: {signal.get('vol_today',0):,.0f} vs Avg20 {signal.get('avg_vol_20',0):,.0f} = {signal.get('vol_ratio',0):.2f}x (≥1.5x ✅)
+🔥 VOL: {signal.get('vol_today',0):,.0f} vs Avg20 {signal.get('avg_vol_20',0):,.0f} = {signal.get('vol_ratio',0):.2f}x (≥1.2x ✅)
 
 🎯 *TRADING PLAN*
 Entry: {close:.0f}
@@ -179,7 +179,7 @@ def auto_scan_loop():
                     signals = scan_v3_full_fast(force_today=True, limit_candidates=total_liquid, signal_type_filter="BO_BOB")
                 except:
                     # Fallback 300 kalau get_liquid_candidates error
-                    signals = scan_v3_full_fast(force_today=True, limit_candidates=300, signal_type_filter="BO_BOB")
+                    signals = scan_v3_full_fast(force_today=True, limit_candidates=600, signal_type_filter="BO_BOB")
                 for sig in signals:
                     sym = sig['symbol']
                     stype = sig['type']
@@ -1216,7 +1216,7 @@ def send_photo_reply(cid,pp,cap="", caption=None):
 
 def scan_v3_full_fast(force_today=False, limit_candidates=60, signal_type_filter="BO_BOB"):
     today_date=get_now_wib().date()
-    print(f"[{get_now_wib()}] ⚡ FAST SCAN ULTRA STRICT TODAY+VOL1.5x limit={limit_candidates} - 600 saham")
+    print(f"[{get_now_wib()}] ⚡ FAST SCAN ULTRA STRICT TODAY+VOL1.2x limit={limit_candidates} - 600 saham")
     try:
         candidates = get_liquid_candidates()[:limit_candidates]
     except:
@@ -1242,7 +1242,7 @@ def scan_v3_full_fast(force_today=False, limit_candidates=60, signal_type_filter
 def scan_v3_full_ORIGINAL(force_today=False, limit_candidates=150):
     # Same as fast but sequential for debug
     today_date=get_now_wib().date()
-    print(f"[{get_now_wib()}] 🔍 SCAN RINGKAS ULTRA STRICT TODAY+VOL1.5x limit={limit_candidates} - 600 saham")
+    print(f"[{get_now_wib()}] 🔍 SCAN RINGKAS ULTRA STRICT TODAY+VOL1.2x limit={limit_candidates} - 600 saham")
     try:
         candidates = get_liquid_candidates()[:limit_candidates]
     except:
@@ -1373,7 +1373,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.8.0 CLEAN ULTRA STRICT - 600 SAHAM PAS NO FCA/WARRANT/SUSPEND/<50 - FIX BMTR 116<117.3 & ESIP VALID - TODAY ONLY+VOL1.5x Running...")
+    offset=0; print("🤖 V4.8.0 CLEAN ULTRA STRICT - 600 SAHAM PAS NO FCA/WARRANT/SUSPEND/<50 - FIX BMTR 116<117.3 & ESIP VALID VOL1.2x - TODAY ONLY+VOL1.2x Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1481,10 +1481,10 @@ Kalau BO50/BOB200 → Telegram otomatis!
                         def ms(tg=chat_id, sfil=sf):
                             global LAST_SIGNALS_CACHE
                             try:
-                                sigs=scan_v3_full(force_today=False, limit_candidates=300, signal_type_filter=sfil)
+                                sigs=scan_v3_full(force_today=False, limit_candidates=600, signal_type_filter=sfil)
                             except TypeError:
                                 # fallback kalau file lama belum ada param signal_type_filter
-                                sigs=scan_v3_full(force_today=False, limit_candidates=300)
+                                sigs=scan_v3_full(force_today=False, limit_candidates=600)
                             LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
                             broadcast_v3(sigs, filter_label=sfil)
                         threading.Thread(target=ms,args=(chat_id,)).start()
@@ -1553,7 +1553,7 @@ Kalau BO50/BOB200 → Telegram otomatis!
                         send_reply(chat_id, f"🔥🔥 *SCAN VOL ALL 300 SAHAM >{thr}x SORT BY Rp* (5-7 menit, yang duit gede di atas)...")
                         def volall_scan(tg=chat_id, th=thr):
                             # 300 saham, sort by Rp
-                            sigs=scan_volume_spike(threshold=th, limit_candidates=300, akum_only=False, sort_by_rp=True)
+                            sigs=scan_volume_spike(threshold=th, limit_candidates=600, akum_only=False, sort_by_rp=True)
                             broadcast_vol_spike(sigs, threshold=th, akum_only=False, sort_by_rp=True)
                         threading.Thread(target=volall_scan, args=(chat_id, thr)).start()
                     elif first in ["/scanvolallakum","/volallakum","/vallakum"]:
@@ -1566,7 +1566,7 @@ Kalau BO50/BOB200 → Telegram otomatis!
                         if thr>10: thr=10
                         send_reply(chat_id, f"🔥🔥 *SCAN VOL ALL 300 + AKUM REAL >{thr}x SORT BY Rp* (paling valid)...")
                         def volallakum_scan(tg=chat_id, th=thr):
-                            sigs=scan_volume_spike(threshold=th, limit_candidates=300, akum_only=True, sort_by_rp=True)
+                            sigs=scan_volume_spike(threshold=th, limit_candidates=600, akum_only=True, sort_by_rp=True)
                             broadcast_vol_spike(sigs, threshold=th, akum_only=True, sort_by_rp=True)
                         threading.Thread(target=volallakum_scan, args=(chat_id, thr)).start()
         except Exception as e:
@@ -1592,9 +1592,9 @@ def auto_screener_loop():
             # BROKER_CACHE tetap di memory kalau ada
             # BROKER_CACHE biarkan, nanti get_cached_broker(allow_expired=True) dipakai kalau quota habis
             print(f"[{get_now_wib()}] Broker cache kept: {len(BROKER_CACHE)} biar gak 429")
-            print(f"[{get_now_wib()}] 🔄 Clear ALL cache (screener+history+broker) -> Scan TODAY fresh 150 saham")
+            print(f"[{get_now_wib()}] 🔄 Clear ALL cache (screener+history+broker) -> Scan TODAY fresh 600 saham")
             
-            sigs=scan_v3_full(force_today=True, limit_candidates=300)
+            sigs=scan_v3_full(force_today=True, limit_candidates=600)
             LAST_SIGNALS_CACHE={s['symbol']:s for s in sigs}
             filt=filter_signals_with_cooldown(sigs)
             if filt: 
@@ -1610,7 +1610,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.8.0 CLEAN ULTRA STRICT - 600 SAHAM PAS NO FCA/WARRANT/SUSPEND/<50 - FIX BMTR 116<117.3 & ESIP VALID - TODAY ONLY+VOL1.5x")
+    print("🔥 RAFANO V4.8.1 600 FULL VOL1.2x - 600 SAHAM PAS NO FCA/WARRANT/SUSPEND/<50 - FIX BMTR 116<117.3 & ESIP VALID VOL1.2x - TODAY ONLY+VOL1.2x")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
@@ -1696,7 +1696,7 @@ def _check_strict_bo_today(sym, hd, today_date, signal_type_filter="BO_BOB"):
         if avg_vol_20 <= 0 or vol_today <= 0:
             return None
         vol_ratio = vol_today / avg_vol_20
-        if vol_ratio < 1.5:
+        if vol_ratio < 1.2:
             return None
         
         chg = (c/pc-1)*100 if pc>0 else 0
@@ -1779,7 +1779,7 @@ def _check_strict_bo_today(sym, hd, today_date, signal_type_filter="BO_BOB"):
         if avg_vol_20 <= 0 or vol_today <= 0:
             return None
         vol_ratio = vol_today / avg_vol_20
-        if vol_ratio < 1.5:
+        if vol_ratio < 1.2:
             return None
         
         if c < 50:
