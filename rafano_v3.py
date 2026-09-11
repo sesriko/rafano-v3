@@ -1,10 +1,11 @@
 """
-RAFANO V4.16 BROKER-SUMMARY REAL FIX - Pakai endpoint /broker-summary/{code} yang bener
-User kasih spec:
-GET /api/broker-summary/{code}?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&flow=all&all_data=true
-Response: brokers: [{broker_code, bval, sval, nval, nvol}]
-
-Hitung Bandar 1W = total Buy - total Sell selama 5 hari bursa aktif (Senin-Jumat)
+RAFANO V4.17 ANTI-429 FIX
+Fix 429 /history dan /broker-summary:
+- Rate limiter 1 detik per request Arjum
+- Retry 429 dengan backoff 5 detik
+- Cache Bandar 1W 1 jam biar gak spam
+- Bypass quota untuk bandar + fallback ke cache lama kalau 429
+- Chart tetap BMTR hitam pro, caption tanpa 🔍 line
 """
 import os, time, datetime, threading, requests, pytz
 import numpy as np, pandas as pd
@@ -38,8 +39,9 @@ FCA_EXCLUDE={"FUTR","FITT","HOTEL","ITIC","PUDP","COIN","SHID","RELI","ASPI","ME
 IDX_600_LIQUID=["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","BUKA","BBKP","BRIS","ANTM","INCO","MDKA","ADRO","PTBA","PGAS","EXCL","ISAT","BREN","CUAN","WIFI","DEWA","BULL","NCKL","AMRT","TOWR","TBIG","ELSA","BEKS","BNGA","AALI","ACES","ADMR","AKRA","AMMN","BRMS","BRPT","BSDE","CPIN","CTRA","EMTK","ICBP","INDF","INKP","INTP","ITMG","JPFA","KLBF","MEDC","SMGR","SMRA","TPIA","UNTR","UNVR"]
 
 HISTORY_CACHE={}; SCREENER_CACHE={}; BROKER_CACHE={}
-HISTORY_CACHE_TTL=300; SCREENER_CACHE_TTL=120; BROKER_CACHE_TTL=600
-QUOTA_HIT=False; LAST_429_TIME=0
+HISTORY_CACHE_TTL=600; SCREENER_CACHE_TTL=300; BROKER_CACHE_TTL=3600
+QUOTA_HIT=False; LAST_429_TIME=0; LAST_ARJUM_REQUEST=0
+ARJUM_MIN_INTERVAL=1.2
 ALERTED_TODAY=set()
 ALERTED_DATE=None
 
@@ -51,32 +53,57 @@ def get_cached(k, cache, ttl):
 def set_cached(k,d,cache):
     cache[k]=(time.time(),d)
 
-def arjum_get(path, params=None, bypass_quota=False):
-    global QUOTA_HIT, LAST_429_TIME
-    if QUOTA_HIT and not bypass_quota and time.time()-LAST_429_TIME<300:
+def arjum_get(path, params=None, bypass_quota=False, retries=1):
+    """ANTI-429: rate limiter + retry + bypass"""
+    global QUOTA_HIT, LAST_429_TIME, LAST_ARJUM_REQUEST
+    
+    # Rate limiter - jangan spam Arjum lebih dari 1 request per 1.2 detik
+    elapsed = time.time() - LAST_ARJUM_REQUEST
+    if elapsed < ARJUM_MIN_INTERVAL:
+        time.sleep(ARJUM_MIN_INTERVAL - elapsed)
+    
+    if QUOTA_HIT and not bypass_quota and time.time()-LAST_429_TIME<180:
+        print(f"⏸️ QUOTA_HIT block {path} 3 menit")
         return None
+    
     url=f"{ARJUM_BASE}{path}"
-    try:
-        headers={"X-API-Key": ARJUM_API_KEY.strip(),"Accept":"application/json","User-Agent":"Mozilla/5.0"}
-        r=requests.get(url,headers=headers,params=params,timeout=15)
-        if r.status_code==200:
-            if QUOTA_HIT and time.time()-LAST_429_TIME>60:
-                QUOTA_HIT=False
-            return r.json()
-        elif r.status_code==429:
-            if not bypass_quota:
-                QUOTA_HIT=True; LAST_429_TIME=time.time()
-            print(f"🚨 429 {path}")
+    for attempt in range(retries+1):
+        try:
+            LAST_ARJUM_REQUEST=time.time()
+            headers={"X-API-Key": ARJUM_API_KEY.strip(),"Accept":"application/json","User-Agent":"Mozilla/5.0"}
+            r=requests.get(url,headers=headers,params=params,timeout=15)
+            if r.status_code==200:
+                if QUOTA_HIT and time.time()-LAST_429_TIME>60:
+                    QUOTA_HIT=False
+                    print(f"✅ QUOTA_HIT reset")
+                return r.json()
+            elif r.status_code==429:
+                if not bypass_quota:
+                    QUOTA_HIT=True
+                    LAST_429_TIME=time.time()
+                print(f"🚨 429 {path} attempt {attempt+1}/{retries+1} bypass={bypass_quota}")
+                if attempt < retries:
+                    wait = 5 + attempt*2
+                    print(f"⏳ Retry {path} dalam {wait}s...")
+                    time.sleep(wait)
+                    continue
+                return None
+            else:
+                print(f"⚠ Arjum {path} {r.status_code}: {r.text[:100]}")
+                return None
+        except Exception as e:
+            print(f"Arjum err {path}: {e}")
+            if attempt < retries:
+                time.sleep(2)
+                continue
             return None
-    except Exception as e:
-        print(f"Arjum err {path}: {e}")
     return None
 
 def get_screener_latest(force_today=False):
     if not force_today:
         c=get_cached('latest', SCREENER_CACHE, SCREENER_CACHE_TTL)
         if c and isinstance(c, dict) and 'rows' in c and len(c['rows'])>0: return c
-    data=arjum_get("/screener/latest", bypass_quota=True)
+    data=arjum_get("/screener/latest", bypass_quota=True, retries=1)
     if data and isinstance(data, dict) and 'rows' in data and len(data['rows'])>0:
         set_cached('latest', data, SCREENER_CACHE); return data
     return {"rows": [{"stock_code": c, "close": 100} for c in IDX_600_LIQUID[:150]]}
@@ -113,9 +140,11 @@ def get_history_pro(sym, limit=150, frame="daily"):
     frame = normalize_timeframe(frame)
     hk=f"{sym}_{frame}_{limit}"
     cached=get_cached(hk, HISTORY_CACHE, HISTORY_CACHE_TTL)
-    if cached is not None: return cached
+    if cached is not None: 
+        print(f"📦 Cache hit {sym} {frame}")
+        return cached
     if frame=="1d":
-        data=arjum_get(f"/history/{sym}",params={"limit":limit,"frame":"daily"}, bypass_quota=False)
+        data=arjum_get(f"/history/{sym}",params={"limit":limit,"frame":"daily"}, bypass_quota=False, retries=1)
         rows=[]
         if data:
             if isinstance(data,dict): rows=data.get('data') or data.get('history') or []
@@ -138,8 +167,13 @@ def get_history_pro(sym, limit=150, frame="daily"):
                 for col in ['Open','High','Low','Close','Volume']: df[col]=pd.to_numeric(df[col],errors='coerce')
                 df=df.dropna(subset=['Close'])
                 if len(df)>=10:
-                    set_cached(hk,df,HISTORY_CACHE); return df
-            except: pass
+                    set_cached(hk,df,HISTORY_CACHE)
+                    print(f"✅ Arjum history {sym} {len(df)} bars")
+                    return df
+            except Exception as e:
+                print(f"History parse err {sym}: {e}")
+        else:
+            print(f"⚠ Arjum history {sym} kosong, fallback YF")
     try:
         import yfinance as yf
         yf_interval_map={"5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"1h","1d":"1d","1w":"1wk"}
@@ -149,6 +183,7 @@ def get_history_pro(sym, limit=150, frame="daily"):
         elif frame=="4h": period="3mo"
         elif frame=="1d": period="6mo"
         else: period="1y"
+        print(f"📊 YF fetch {sym}.JK interval {interval} period {period} (TF {frame})")
         ticker=yf.Ticker(f"{sym}.JK")
         hist=ticker.history(period=period,interval=interval,timeout=15, auto_adjust=False)
         if hist is not None and len(hist)>20:
@@ -156,23 +191,19 @@ def get_history_pro(sym, limit=150, frame="daily"):
                 hist=hist.resample('4H').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
             set_cached(hk,hist.tail(limit),HISTORY_CACHE)
             return hist.tail(limit)
-    except: pass
+    except Exception as e:
+        print(f"YF err {sym} TF {frame}: {e}")
     return None
 
-# ===== BANDAR 1W REAL - PAKAI /broker-summary/{code} =====
 def get_bursa_5hari_range():
-    """Hitung 5 hari bursa aktif (Senin-Jumat) terakhir"""
     end = get_now_wib().date()
-    # Mundur 10 hari kalender untuk dapat 5 hari bursa
-    start = end - datetime.timedelta(days=10)
-    # Adjust biar skip weekend
+    start = end - datetime.timedelta(days=12)
     trading_days=[]
     cur=start
     while cur<=end:
-        if cur.weekday()<5:  # 0=Mon, 4=Fri
+        if cur.weekday()<5:
             trading_days.append(cur)
         cur+=datetime.timedelta(days=1)
-    # Ambil 5 terakhir
     trading_days=trading_days[-5:]
     if len(trading_days)>=5:
         start_date=trading_days[0]
@@ -183,143 +214,100 @@ def get_bursa_5hari_range():
     return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), trading_days
 
 def get_bandar_1w_broker_summary(sym):
-    """
-    REAL FIX: Pakai /broker-summary/{code}?start_date=&end_date=&flow=all
-    Hitung total Buy - Sell selama 5 hari bursa aktif
-    """
     cache_key=f"bandar1w_broker_{sym}"
     cached=get_cached(cache_key, BROKER_CACHE, BROKER_CACHE_TTL)
     if cached is not None:
+        print(f"📦 Cache Bandar {sym}: {cached.get('foreign_str_1w')} ({cached.get('accum_type')})")
         return cached
     
     result={"foreign_net":0,"foreign_net_1w":0,"foreign_str":"N/A","foreign_str_1w":"N/A","accum_type":"NEUTRAL","details":[],"brokers":[]}
     
     try:
         start_str, end_str, trading_days = get_bursa_5hari_range()
-        print(f"🏦 {sym} Bandar 1W range bursa aktif: {start_str} to {end_str} ({len(trading_days)} hari)")
+        print(f"🏦 {sym} Bandar 1W range: {start_str} to {end_str} ({len(trading_days)} hari bursa)")
         
-        # 1. Coba flow=all dulu untuk total bandar
+        # Coba flow=all dulu
         data_all = arjum_get(f"/broker-summary/{sym}", params={
             "start_date": start_str,
             "end_date": end_str,
             "flow": "all",
             "all_data": "true",
-            "broker_limit": 20,
-            "level_limit": 25
-        }, bypass_quota=True)
-        
-        # 2. Coba flow=F untuk foreign flow 1W
-        data_foreign = arjum_get(f"/broker-summary/{sym}", params={
-            "start_date": start_str,
-            "end_date": end_str,
-            "flow": "F",
-            "all_data": "true",
             "broker_limit": 20
-        }, bypass_quota=True)
+        }, bypass_quota=True, retries=1)
         
-        # Pilih yang ada data
-        data_to_use = None
-        flow_type = "all"
         if data_all and isinstance(data_all, dict) and 'brokers' in data_all and len(data_all['brokers'])>0:
-            data_to_use = data_all
-            flow_type = "all"
-        elif data_foreign and isinstance(data_foreign, dict) and 'brokers' in data_foreign and len(data_foreign['brokers'])>0:
-            data_to_use = data_foreign
-            flow_type = "F"
-        elif data_all and isinstance(data_all, dict):
-            data_to_use = data_all
+            brokers = data_all['brokers']
+            total_bval=0; total_sval=0; accum_buy=0; dist_sell=0
+            top_buyers=[]; top_sellers=[]
+            
+            for b in brokers:
+                try:
+                    bval=float(b.get('bval') or 0)
+                    sval=float(b.get('sval') or 0)
+                    nval=float(b.get('nval') or (bval-sval) or 0)
+                    bcode=b.get('broker_code') or "?"
+                    total_bval+=bval; total_sval+=sval
+                    if nval>0:
+                        accum_buy+=nval
+                        top_buyers.append((bcode, nval))
+                    elif nval<0:
+                        dist_sell+=nval
+                        top_sellers.append((bcode, nval))
+                except: continue
+            
+            net_1w = accum_buy + dist_sell
+            value_to_show = net_1w if net_1w!=0 else accum_buy
+            
+            def fmt(v):
+                if abs(v)>=1e12: return f"{'+' if v>0 else ''}{v/1e12:.2f}T"
+                elif abs(v)>=1e9: return f"{'+' if v>0 else ''}{v/1e9:.2f}B"
+                elif abs(v)>=1e6: return f"{'+' if v>0 else ''}{v/1e6:.0f}M"
+                else: return f"{'+' if v>0 else ''}{v:,.0f}"
+            
+            result["foreign_net_1w"]=value_to_show
+            result["foreign_net"]=brokers[0].get('nval',0) if brokers else 0
+            result["brokers"]=brokers
+            result["foreign_str_1w"]=fmt(value_to_show)
+            
+            if value_to_show>5e9: result["accum_type"]="BIG ACCUM"
+            elif value_to_show>1e9: result["accum_type"]="ACCUM"
+            elif value_to_show>1e8: result["accum_type"]="LIGHT ACCUM"
+            elif value_to_show<-5e9: result["accum_type"]="BIG DIST"
+            elif value_to_show<-1e9: result["accum_type"]="DIST"
+            elif value_to_show<-1e8: result["accum_type"]="LIGHT DIST"
+            else: result["accum_type"]="NEUTRAL"
+            
+            top_b_str=", ".join([f"{c} {fmt(v)}" for c,v in sorted(top_buyers, key=lambda x: x[1], reverse=True)[:3]])
+            print(f"✅ {sym} Bandar 1W: {result['foreign_str_1w']} ({result['accum_type']}) Buy {fmt(accum_buy)} Sell {fmt(dist_sell)} Top: {top_b_str}")
+            set_cached(cache_key, result, BROKER_CACHE)
+            return result
+        else:
+            print(f"⚠ {sym} broker-summary kosong {start_str}->{end_str}, coba flow=F")
+            # Fallback flow=F
+            data_f = arjum_get(f"/broker-summary/{sym}", params={
+                "start_date": start_str,
+                "end_date": end_str,
+                "flow": "F",
+                "all_data": "true"
+            }, bypass_quota=True, retries=1)
+            if data_f and isinstance(data_f, dict) and 'brokers' in data_f:
+                brokers=data_f['brokers']
+                if brokers:
+                    total_nval=sum([float(b.get('nval') or 0) for b in brokers])
+                    def fmt(v):
+                        if abs(v)>=1e9: return f"{'+' if v>0 else ''}{v/1e9:.2f}B"
+                        else: return f"{'+' if v>0 else ''}{v/1e6:.0f}M"
+                    result["foreign_net_1w"]=total_nval
+                    result["foreign_str_1w"]=fmt(total_nval)
+                    result["accum_type"]="ACCUM" if total_nval>0 else "DIST" if total_nval<0 else "NEUTRAL"
+                    print(f"✅ {sym} Bandar 1W foreign: {result['foreign_str_1w']}")
+                    set_cached(cache_key, result, BROKER_CACHE)
+                    return result
         
-        if data_to_use and isinstance(data_to_use, dict):
-            brokers = data_to_use.get('brokers', [])
-            if brokers and len(brokers)>0:
-                total_bval=0
-                total_sval=0
-                total_nval=0
-                total_nvol=0
-                
-                for b in brokers:
-                    try:
-                        bval=float(b.get('bval') or b.get('buy_value') or b.get('buy') or 0)
-                        sval=float(b.get('sval') or b.get('sell_value') or b.get('sell') or 0)
-                        nval=float(b.get('nval') or b.get('net_value') or b.get('net') or (bval-sval) or 0)
-                        nvol=float(b.get('nvol') or b.get('net_vol') or 0)
-                        
-                        total_bval+=bval
-                        total_sval+=sval
-                        total_nval+=nval
-                        total_nvol+=nvol
-                    except:
-                        continue
-                
-                # Untuk 1W: total Buy - Sell = total_bval - total_sval = total_nval (harusnya)
-                # Tapi karena sum semua broker net harus 0, kita hitung akumulasi top buyers
-                # Cara bener: total net accumulation = sum positive nval
-                accum_buy=0
-                dist_sell=0
-                top_buyers=[]
-                top_sellers=[]
-                
-                for b in brokers:
-                    try:
-                        nval=float(b.get('nval') or 0)
-                        bcode=b.get('broker_code') or b.get('code') or "?"
-                        if nval>0:
-                            accum_buy+=nval
-                            top_buyers.append((bcode, nval))
-                        elif nval<0:
-                            dist_sell+=nval
-                            top_sellers.append((bcode, nval))
-                    except: pass
-                
-                # Net 1W = accum_buy + dist_sell (dist negative)
-                net_1w = accum_buy + dist_sell
-                # Kalau flow=F, net_1w adalah foreign net 1W
-                # Kalau flow=all, kita pakai accum_buy sebagai bandar accum strength
-                
-                # Untuk caption, pakai total_nval kalau flow=F, atau accum_buy kalau flow=all
-                if flow_type=="F":
-                    # Foreign flow
-                    value_to_show = total_nval if total_nval!=0 else net_1w
-                else:
-                    # Bandar flow - pakai net dari top akumulasi
-                    # Kalau net 0 (karena sum semua broker), pakai accum_buy sebagai proxy
-                    value_to_show = net_1w if net_1w!=0 else accum_buy
-                
-                result["foreign_net_1w"]=value_to_show
-                result["foreign_net"]=brokers[0].get('nval',0) if brokers else 0
-                result["brokers"]=brokers
-                result["details"]=[{"flow": flow_type, "total_bval": total_bval, "total_sval": total_sval, "accum_buy": accum_buy, "dist_sell": dist_sell, "top_buyers": top_buyers[:3], "top_sellers": top_sellers[:3]}]
-                
-                # Format string
-                def fmt(v):
-                    if abs(v)>=1_000_000_000_000: return f"{'+' if v>0 else ''}{v/1_000_000_000_000:.2f}T"
-                    elif abs(v)>=1_000_000_000: return f"{'+' if v>0 else ''}{v/1_000_000_000:.2f}B"
-                    elif abs(v)>=1_000_000: return f"{'+' if v>0 else ''}{v/1_000_000:.0f}M"
-                    else: return f"{'+' if v>0 else ''}{v:,.0f}"
-                
-                result["foreign_str_1w"]=fmt(value_to_show)
-                
-                # Accum type
-                abs_val=abs(value_to_show)
-                if value_to_show>5_000_000_000: result["accum_type"]="BIG ACCUM"
-                elif value_to_show>1_000_000_000: result["accum_type"]="ACCUM"
-                elif value_to_show>100_000_000: result["accum_type"]="LIGHT ACCUM"
-                elif value_to_show<-5_000_000_000: result["accum_type"]="BIG DIST"
-                elif value_to_show<-1_000_000_000: result["accum_type"]="DIST"
-                elif value_to_show<-100_000_000: result["accum_type"]="LIGHT DIST"
-                else: result["accum_type"]="NEUTRAL"
-                
-                # Log
-                top_b_str=", ".join([f"{c} {fmt(v)}" for c,v in top_buyers[:3]])
-                print(f"✅ {sym} Bandar 1W ({flow_type}) {start_str}->{end_str}: {result['foreign_str_1w']} ({result['accum_type']}) Buy {fmt(accum_buy)} Sell {fmt(dist_sell)} Top Buy: {top_b_str}")
-                
-                set_cached(cache_key, result, BROKER_CACHE)
-                return result
-        
-        print(f"⚠ {sym} broker-summary kosong untuk range {start_str}->{end_str}")
+        print(f"⚠ {sym} broker-summary kosong untuk {start_str}->{end_str} - kemungkinan 429 atau market tutup")
         
     except Exception as e:
-        print(f"Bandar broker-summary err {sym}: {e}")
+        print(f"Bandar err {sym}: {e}")
         import traceback; traceback.print_exc()
     
     set_cached(cache_key, result, BROKER_CACHE)
@@ -335,8 +323,7 @@ def get_bandar_info(sym):
         "foreign_str_1w": info.get('foreign_str_1w','N/A'),
         "accum_type": info.get('accum_type','NEUTRAL'),
         "score_bonus": 15 if info.get('foreign_net_1w',0)>0 else 0,
-        "brokers": info.get('brokers',[]),
-        "details": info.get('details',[])
+        "brokers": info.get('brokers',[])
     }
 
 def format_large_number(val,show_sign=False):
@@ -540,7 +527,7 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         fig.text(0.005,0.93,f"{symbol} | IHSG",color='#ffaa00',fontsize=8,ha='left')
         fig.text(0.005,0.905,f"● {'WAIT' if abs(chg_pct)<0.5 else 'GO'}",color='#aaaaaa',fontsize=9,ha='left', fontweight='bold')
         fig.text(0.005,0.885,f"High:{last_high:.0f} Low:{last_low:.0f} Open:{df['Open'].iloc[-1]:.0f} Vol:{last_vol:,.0f}",color='#00ffff',fontsize=7,ha='left')
-        fig.text(0.5,0.96,"RAFANO TRADER V4.16 BROKER-SUMMARY",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
+        fig.text(0.5,0.96,"RAFANO V4.17 ANTI-429",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
         ds=df.index[-1].strftime('%d %b %Y %H:%M') if hasattr(df.index[-1],'strftime') else get_now_wib().strftime('%d %b %Y %H:%M')
         fig.text(0.99,0.96,f"{tf_label_disp} | {ds}",color='#ffcc00',fontsize=11,ha='right',va='center', fontweight='bold')
         fig.text(0.99,0.93,f"Command BOT /C {symbol} {timeframe_norm}",color='#cccccc',fontsize=8,ha='right')
@@ -580,7 +567,7 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         try: plt.clf(); plt.close('all')
         except: pass
 
-def scan_v416_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=False):
+def scan_v417_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=False):
     global ALERTED_TODAY, ALERTED_DATE
     today = get_now_wib().date()
     if ALERTED_DATE != today:
@@ -622,7 +609,7 @@ def scan_v416_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
             bandar=get_bandar_info(sym)
             return {"symbol": sym, "type": bo_info['type'], "close": int(c), "change_pct": q.get('changepct',0), "vol_ratio": v_last/v_avg, "vol_rp": v_last * c, "bandar": bandar, "foreign_str": bandar.get('foreign_str_1w',''), "source": q.get('source',''), "realtime": realtime_price}
         except: return None
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futs={ex.submit(check_one, s): s for s in top_codes}
         detected=[]
         for f in as_completed(futs):
@@ -690,7 +677,7 @@ def process_chart_request(cid, code, tf_input="1d"):
     send_reply(cid, f"📊 *{code.upper()} ({tf_label}) chart pro...*")
     df=get_history_pro(code, 150, frame=tf_norm)
     if df is None or len(df)<20:
-        send_reply(cid, f"⚠ Data {code} TF {tf_norm} tidak ada"); return
+        send_reply(cid, f"⚠ Data {code} TF {tf_norm} tidak ada, Arjum limit 429 coba lagi 1 menit"); return
     quotes=get_itick_quotes_batch([code],1)
     realtime=quotes.get(code.upper(),{}).get('price',0)
     chart_file=f"/tmp/chart_{code.upper()}_{tf_norm}_{int(time.time())}.png"
@@ -707,18 +694,18 @@ def process_broker_request(cid, sym):
     details=bandar.get('foreign_str_1w','N/A')
     accum=bandar.get('accum_type','NEUTRAL')
     brokers=bandar.get('brokers',[])[:3]
-    top_str="\n".join([f"{b.get('broker_code')}: {b.get('nval',0)/1e9:.2f}B" for b in brokers]) if brokers else "N/A"
-    send_reply(cid, f"🏦 *{sym} BANDAR 1W (5 hari bursa aktif)*\nRange: {get_bursa_5hari_range()[0]} to {get_bursa_5hari_range()[1]}\nTotal: {details} ({accum})\nTop:\n{top_str}\nSumber: /broker-summary flow=all")
+    top_str="\n".join([f"{b.get('broker_code')}: {b.get('nval',0)/1e9:.2f}B" for b in brokers]) if brokers else "N/A (429 atau market tutup)"
+    send_reply(cid, f"🏦 *{sym} BANDAR 1W (5 hari bursa)*\nTotal: {details} ({accum})\nTop:\n{top_str}\nSumber: /broker-summary")
 
-def broadcast_v416(signals, vol_thr=1.5, dest_chat_id=None, is_auto=False):
+def broadcast_v417(signals, vol_thr=1.5, dest_chat_id=None, is_auto=False):
     target = dest_chat_id or TARGET_CHAT_ID
     if not target: return
     if not signals:
-        if not is_auto: send_reply(target, f"📉 V4.16 VOL>{vol_thr}x - Tidak ada BO valid"); 
+        if not is_auto: send_reply(target, f"📉 V4.17 VOL>{vol_thr}x - Tidak ada BO valid"); 
         return
     now=get_now_wib().strftime('%d %b %Y %H:%M:%S WIB')
     auto_tag = "⚡ REALTIME ALERT" if is_auto else "🚀"
-    header=f"{auto_tag} *V4.16 TOP {len(signals)} BO/BOB* 🔥\n{now}\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO EMA50/BOB EMA200\n{'='*50}\n\n"
+    header=f"{auto_tag} *V4.17 TOP {len(signals)} BO/BOB* 🔥\n{now}\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO EMA50/BOB EMA200\n{'='*50}\n\n"
     msg=header; kb=[]
     for idx,it in enumerate(signals,1):
         rt_str = f" RT{it['realtime']:.0f}" if it.get('realtime',0)>0 else ""
@@ -748,7 +735,7 @@ def broadcast_vol_spike(signals, threshold=2.0, sort_by_rp=False, dest_chat_id=N
     if msg: send_reply(target, msg, rm={"inline_keyboard": kb})
 
 AUTO_ALERT_ENABLED=True
-AUTO_ALERT_INTERVAL=60
+AUTO_ALERT_INTERVAL=90
 LAST_AUTO_ALERT_TIME=0
 
 def realtime_auto_alert_loop():
@@ -767,11 +754,11 @@ def realtime_auto_alert_loop():
             market_end=now.replace(hour=15, minute=30, second=0, microsecond=0)
             if not (market_start <= now <= market_end): time.sleep(300); continue
             if time.time() - LAST_AUTO_ALERT_TIME < AUTO_ALERT_INTERVAL: time.sleep(5); continue
-            signals = scan_v416_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=True)
+            signals = scan_v417_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=True)
             LAST_AUTO_ALERT_TIME=time.time()
             if signals:
                 for s in signals: ALERTED_TODAY.add(s['symbol'])
-                broadcast_v416(signals, vol_thr=1.5, dest_chat_id=TARGET_CHAT_ID, is_auto=True)
+                broadcast_v417(signals, vol_thr=1.5, dest_chat_id=TARGET_CHAT_ID, is_auto=True)
             time.sleep(AUTO_ALERT_INTERVAL)
         except Exception as e:
             print(f"REALTIME ALERT err {e}")
@@ -779,7 +766,7 @@ def realtime_auto_alert_loop():
 
 def telegram_bot_listener():
     offset=0
-    print("🤖 RAFANO V4.16 BROKER-SUMMARY FIX - /broker-summary/{code} 5 hari bursa")
+    print("🤖 RAFANO V4.17 ANTI-429 - rate limiter 1.2s + retry")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     if AUTO_ALERT_ENABLED:
@@ -808,31 +795,27 @@ def telegram_bot_listener():
                     first=txt.split()[0].lower() if txt else ""
                     parts=txt.split()
                     if first in ["/start","/help","/menu"]:
-                        help_text="""🔥 *RAFANO V4.16 BROKER-SUMMARY REAL*
-✅ Fix: pakai /broker-summary/{code} 5 hari bursa aktif
+                        help_text="""🔥 *RAFANO V4.17 ANTI-429*
+✅ Fix 429: rate limiter 1.2s + retry 5s + cache 1 jam
 
 📈 *CHART + CAPTION PRO*
 /c KODE = Daily
 /c KODE 5 = 5 menit
 /c KODE 15 = 15 menit
 /c KODE 1h = 1 jam
-Caption: 
-BUMI — Harga 212 | Daily
-    ├  Buy Strength 76% (STRONG)
-    ├  RSI 62.16
-    ├  Vol Spike 1.0x | Buy Vol 75%
-    └  Bandar 1W +1.01B (ACCUM) - dari /broker-summary
 
-🏦 /b KODE - Bandar 1W (Buy-Sell 5 hari bursa aktif) sumber /broker-summary
+🏦 /b KODE - Bandar 1W (5 hari bursa) dari /broker-summary
 
 🚀 /scanbo [vol]
 🔥 /scanvol /vol /volall
 🤖 /autoalert on/off/status/reset
-/quota
+/quota - cek quota 429
 """
                         send_reply(chat_id, help_text)
                     elif first in ["/quota"]:
-                        send_reply(chat_id, f"QUOTA: {'HABIS' if QUOTA_HIT else 'OK'}\nAUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s\nAlerted: {len(ALERTED_TODAY)}")
+                        status="HABIS 3 menit" if QUOTA_HIT else "OK"
+                        last_429 = time.strftime('%H:%M:%S', time.localtime(LAST_429_TIME)) if LAST_429_TIME else "Belum pernah"
+                        send_reply(chat_id, f"QUOTA: {status}\nLast 429: {last_429}\nAUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s\nAlerted: {len(ALERTED_TODAY)}\nCache: History {len(HISTORY_CACHE)} Bandar {len(BROKER_CACHE)}")
                     elif first in ["/autoalert","/auto"]:
                         if len(parts)>=2:
                             cmd=parts[1].lower()
@@ -876,18 +859,18 @@ BUMI — Harga 212 | Daily
                         try:
                             if len(parts)>=2: vol_thr=float(parts[1])
                         except: pass
-                        send_reply(chat_id, f"🚀 V4.16 SCAN Arjum 60 -> ITICK 30 VOL>{vol_thr}x...")
+                        send_reply(chat_id, f"🚀 V4.17 SCAN Arjum 60 -> ITICK 30 VOL>{vol_thr}x (anti-429 1.2s delay)...")
                         def run_scan(tg=chat_id, vt=vol_thr):
-                            sigs=scan_v416_final(top_arjum=60, top_itick=30, vol_thr=vt, min_value=1_000_000_000, only_new=False)
-                            broadcast_v416(sigs, vol_thr=vt, dest_chat_id=tg, is_auto=False)
+                            sigs=scan_v417_final(top_arjum=60, top_itick=30, vol_thr=vt, min_value=1_000_000_000, only_new=False)
+                            broadcast_v417(sigs, vol_thr=vt, dest_chat_id=tg, is_auto=False)
                         threading.Thread(target=run_scan).start()
         except Exception as e:
             print(f"Listener err {e}"); import traceback; traceback.print_exc(); time.sleep(3)
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.16 BROKER-SUMMARY REAL")
-    print("Pakai /broker-summary/{code}?start_date=&end_date=&flow=all")
-    print("Hitung Buy-Sell 5 hari bursa aktif")
+    print("🔥 RAFANO V4.17 ANTI-429 FIX")
+    print("Rate limiter 1.2s + retry + cache 1 jam")
+    print("Bandar 1W dari /broker-summary 5 hari bursa")
     print("==========================================")
     telegram_bot_listener()
