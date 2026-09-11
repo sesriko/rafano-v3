@@ -381,9 +381,9 @@ def filter_liquid_stocks(candidates, min_avg_value_rp=500_000_000, min_avg_vol=3
             continue
         # fast_mode: skip yfinance, cuma filter FCA list aja biar cepat dan gak 404
         if fast_mode:
-            # kasih score dummy berdasarkan urutan IDX_LIQUID_400 (yang depan lebih liquid)
+            # kasih score dummy berdasarkan urutan IDX_600_LIQUID (yang depan lebih liquid)
             try:
-                idx_pos = IDX_LIQUID_400.index(su)
+                idx_pos = IDX_600_LIQUID.index(su)
                 score_val = 1_000_000_000_000 - idx_pos*1_000_000_000
             except:
                 score_val = 500_000_000
@@ -462,6 +462,11 @@ def get_liquid_candidates():
 
 def get_all_bursa_candidates():
     return IDX_600_LIQUID
+
+# Backward compat alias
+IDX_LIQUID_400 = IDX_600_LIQUID
+IDX_ALL_BURSA = IDX_600_LIQUID
+IDX_400 = IDX_600_LIQUID
 
 
 
@@ -1061,7 +1066,7 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False, sort_
         cands=[(it.get('symbol') or it.get('code') or "").replace(".JK","").upper() for it in sd]
         cands=[c for c in cands if c]
     else:
-        cands=IDX_LIQUID_400
+        cands=IDX_600_LIQUID
     
     # dedup + filter FCA + no warrant
     seen=set(); uniq=[]
@@ -1073,7 +1078,7 @@ def scan_volume_spike(threshold=2.0, limit_candidates=60, akum_only=False, sort_
             seen.add(cu); uniq.append(cu)
     
     # gabung dengan liquid 400 untuk capai limit + no warrant
-    for c in IDX_LIQUID_400:
+    for c in IDX_600_LIQUID:
         if len(uniq)>=limit_candidates: break
         if "-W" in c: continue
         if c not in seen and c not in FCA_EXCLUDE:
@@ -1202,7 +1207,7 @@ def scan_v3_full(force_today=False, limit_candidates=60, signal_type_filter="BO_
             sym=it.get('symbol') or it.get('code')
             if sym: base_cands.append(sym.replace(".JK","").upper())
     
-    combined_raw = base_cands + IDX_LIQUID_400
+    combined_raw = base_cands + IDX_600_LIQUID
     # dedup awal + no warrant
     seen=set(); uniq_raw=[]
     for c in combined_raw:
@@ -1491,7 +1496,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.7.9 600 EXACT - 600 SAHAM PALING LIQUID NO FCA/WARRANT/SUSPEND/HARGA<50 - ISSI+IDX80 - STRICT TODAY+VOL1.5x Running...")
+    offset=0; print("🤖 V4.7.9b 600 EXACT FIX - 600 SAHAM PALING LIQUID NO FCA/WARRANT/SUSPEND/HARGA<50 - ISSI+IDX80 - STRICT TODAY+VOL1.5x Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1728,7 +1733,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.7.9 600 EXACT - 600 SAHAM PALING LIQUID NO FCA/WARRANT/SUSPEND/HARGA<50 - ISSI+IDX80 - STRICT TODAY+VOL1.5x")
+    print("🔥 RAFANO V4.7.9b 600 EXACT FIX - 600 SAHAM PALING LIQUID NO FCA/WARRANT/SUSPEND/HARGA<50 - ISSI+IDX80 - STRICT TODAY+VOL1.5x")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
