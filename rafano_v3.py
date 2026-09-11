@@ -1,20 +1,31 @@
 """
-RAFANO V4.8 BANDAR INFO EDITION
-Upgrade V4.7 -> V4.8:
-- Bandar (Foreign Buy + Broker Akum) jadi PENAMBAH SCORE, bukan filter wajib
-- Default: score +15 FB, +15 Akum, total max 130 (tapi cap 100)
-- Info tambahan di alert: [FB +2.5B AKUM 62%] / [FS -1B DIST]
-- Gak pernah 0 hasil gara-gara bandar
-
-Flow FINAL:
-ARJUM 60 -> ITICK 30 REALTIME -> VOL1.5x -> BO50/BOB200 -> VAL1B -> CP60% -> BANDAR INFO + SCORE -> TELEGRAM
+RAFANO V4.8.1 FIX - TELEGRAM NOT RESPONDING
+Fix 3 bug fatal V4.8:
+1. Broadcast ke chat yang request, bukan ke TARGET_CHAT_ID terus
+2. Bandar check di-disable default (bikin quota habis & scan 60 detik -> timeout). Enable pakai /scanbo bandar
+3. load_dotenv explicit path buat Colab + debug log getUpdates
+4. Tambah log biar tau bot dapet message atau enggak
 """
 
-import os, time, datetime, threading, requests, pytz, json
+import os, time, datetime, threading, requests, pytz, json, sys
 import numpy as np, pandas as pd
-from dotenv import load_dotenv
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-load_dotenv()
+
+# FIX #3: load_dotenv explicit path buat Colab
+try:
+    from dotenv import load_dotenv
+    # coba beberapa lokasi
+    for env_path in ['/content/rafano-v3/.env', '/content/.env', '.env', './.env']:
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=True)
+            print(f"✅ Loaded env from {env_path}")
+            break
+    else:
+        load_dotenv(override=True)
+        print("⚠️ .env not found in common paths, trying default load_dotenv")
+except:
+    print("⚠️ python-dotenv not installed")
 
 TIMEZONE_WIB = pytz.timezone('Asia/Jakarta')
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
@@ -25,12 +36,17 @@ ITICK_TOKEN = os.getenv("ITICK_TOKEN") or os.getenv("ITICK_API_KEY") or "7a470a8
 ITICK_BASE = "https://api.itick.org"
 ITICK_ENABLED = bool(ITICK_TOKEN)
 
+print(f"🔑 BOT_TOKEN: {'ADA ' + TELEGRAM_BOT_TOKEN[:15]+'...' if TELEGRAM_BOT_TOKEN else 'KOSONG ❌'}")
+print(f"💬 TARGET_CHAT_ID: {TARGET_CHAT_ID or 'KOSONG'}")
+print(f"📊 ARJUM_KEY: {'ADA' if ARJUM_API_KEY else 'KOSONG ❌'}")
+print(f"⚡ ITICK: {'ON' if ITICK_ENABLED else 'OFF'}")
+
 def get_now_wib(): return datetime.datetime.now(TIMEZONE_WIB)
 
 FCA_EXCLUDE = {"FUTR","FITT","HOTEL","ITIC","PUDP","COIN","SHID","RELI","ASPI","MEJA","MINA","ESTA","ASLI","VKTR","IMJS","GTSI","IRSX","ATAP","RONY","BCIC","DEFI","ROCK","YPAS","NIRO","BBHA","BKSW","NAGA","BEEF","BPTR","CBMF","CPRI","CRAB","DAAZ","DEAL","DGNS","DMND","DUCK","ELSA","ENRG","ENVY","ERAA","ESTI","ETWA","FIRE","FORU","GAMA","GOLL","HAIS","HATM","HITS","HOMI","IATA","INPS","IPOL","JGLE","KAYU","KBAG","KIOS","KPAL","KPAS","LCGP","LPLI","LPLR","MAGP","MAMI","MARI","SINI","SKYB","SMKM","SOCI","SONA","SOSS","SUGI","TALF","TDPM","TEBE","TOPS","TRAM","TRIL","TRIO","TRUS","UFOE","WIFI-W","WOWS","YELO","ZATA","ZONE","ZINC","TINS-W","BIPI-W","BULL-W","DEWA-W"}
 
-HISTORY_CACHE={}; SCREENER_CACHE={}; BROKER_CACHE={}
-HISTORY_CACHE_TTL=300; SCREENER_CACHE_TTL=120; BROKER_CACHE_TTL=300
+HISTORY_CACHE={}; SCREENER_CACHE={}
+HISTORY_CACHE_TTL=300; SCREENER_CACHE_TTL=120
 QUOTA_HIT=False; LAST_429_TIME=0
 
 def get_cached(k, cache, ttl):
@@ -45,14 +61,23 @@ def set_cached(k,d,cache):
 def arjum_get(path, params=None):
     global QUOTA_HIT, LAST_429_TIME
     import time as _time
-    if QUOTA_HIT and _time.time()-LAST_429_TIME<300: return None
+    if QUOTA_HIT and _time.time()-LAST_429_TIME<300: 
+        print(f"⏸ QUOTA HIT, skip {path}")
+        return None
     url=f"{ARJUM_BASE}{path}"
     try:
         headers={"X-API-Key": ARJUM_API_KEY.strip(),"Accept":"application/json","User-Agent":"Mozilla/5.0"}
-        r=requests.get(url,headers=headers,params=params,timeout=15)
+        r=requests.get(url,headers=headers,params=params,timeout=12)
         if r.status_code==200: return r.json()
         elif r.status_code==429:
-            QUOTA_HIT=True; LAST_429_TIME=_time.time(); return None
+            QUOTA_HIT=True; LAST_429_TIME=_time.time()
+            print(f"🚨 ARJUM 429 QUOTA HABIS di {path}")
+            return None
+        elif r.status_code==404:
+            # endpoint bandar gak ada, jangan dianggap quota habis
+            return None
+        else:
+            print(f"Arjum {path} status {r.status_code}")
     except Exception as e:
         print(f"Arjum err {path}: {e}")
     return None
@@ -103,106 +128,26 @@ def get_history_pro(sym, limit=120):
     except: pass
     return None
 
-def get_bandar_info(sym):
-    """
-    Bandar Info - BEST EFFORT dari Arjum
-    Coba beberapa endpoint Arjum yang ada:
-    1. /foreign/{sym} -> foreign flow
-    2. /broker/{sym} -> broker summary
-    Kalau gagal, return None (gak bikin fail)
-    """
-    cache_key=f"bandar_{sym}"
-    cached=get_cached(cache_key, BROKER_CACHE, BROKER_CACHE_TTL)
-    if cached is not None: return cached
-
-    foreign_net=0
-    akum_ratio=0
-    foreign_str="N/A"
-    bandar_str="N/A"
-    is_fb=False
-    is_akum=False
-
-    # Coba endpoint foreign
+def get_bandar_info_optional(sym, enabled=False):
+    """FIX #2: Bandar check dimatikan default, cuma jalan kalau enabled=True (/scanbo bandar)"""
+    if not enabled:
+        return {"foreign_net":0,"is_foreign_buy":False,"akum_ratio":0,"is_akum":False,"foreign_str":"N/A","bandar_str":"N/A","score_bonus":0}
+    # kalau enabled, baru hit Arjum
     try:
-        # Endpoint ini ada di beberapa versi Arjum
         fdata=arjum_get(f"/foreign/{sym}", params={"limit": 5, "frame": "daily"})
+        foreign_net=0
         if fdata:
-            # format bisa dict atau list
             rows=fdata.get('data') if isinstance(fdata, dict) else fdata
             if isinstance(rows, list) and len(rows)>0:
                 last=rows[0] if isinstance(rows[0], dict) else {}
-                # cari field foreign net
                 for k in ['foreign_net','net_foreign','foreign_flow','net_buy','net']:
                     if k in last:
-                        foreign_net=float(last[k] or 0)
-                        break
-                # kadang ada buy/sell terpisah
-                if foreign_net==0:
-                    buy=float(last.get('foreign_buy') or last.get('buy_foreign') or 0)
-                    sell=float(last.get('foreign_sell') or last.get('sell_foreign') or 0)
-                    if buy or sell:
-                        foreign_net=buy-sell
-            elif isinstance(rows, dict):
-                foreign_net=float(rows.get('foreign_net') or rows.get('net_foreign') or 0)
-
-        if foreign_net!=0:
-            is_fb = foreign_net > 0
-            if abs(foreign_net)>=1_000_000_000:
-                foreign_str=f"{'FB' if is_fb else 'FS'} {foreign_net/1_000_000_000:+.1f}B"
-            elif abs(foreign_net)>=1_000_000:
-                foreign_str=f"{'FB' if is_fb else 'FS'} {foreign_net/1_000_000:+.0f}M"
-            else:
-                foreign_str=f"{'FB' if is_fb else 'FS'} {foreign_net:+.0f}"
-        else:
-            # fallback dari screener kalau ada
-            screener=get_screener_latest()
-            rows=screener.get('rows',[]) if isinstance(screener,dict) else []
-            for r in rows:
-                code=(r.get('stock_code') or "").replace(".JK","").upper()
-                if code==sym:
-                    # kadang screener ada foreign flow
-                    fn=float(r.get('foreign_net') or r.get('net_foreign') or 0)
-                    if fn!=0:
-                        foreign_net=fn
-                        is_fb=fn>0
-                        foreign_str=f"{'FB' if is_fb else 'FS'} {fn/1_000_000_000:+.1f}B"
-                    break
-    except Exception as e:
-        print(f"bandar foreign err {sym}: {e}")
-
-    # Coba endpoint broker akum (simplified)
-    try:
-        bdata=arjum_get(f"/broker/{sym}", params={"frame":"daily","limit":10})
-        if bdata:
-            # Arjum broker summary format agak random, kita coba parse
-            # yang penting dapat akum ratio top 3 broker
-            rows=bdata.get('data') if isinstance(bdata, dict) else bdata
-            if isinstance(rows, list) and len(rows)>0:
-                # kalau ada field akum/dist
-                # kita coba hitung dari buy vs sell broker top
-                total_buy=0; total_sell=0
-                for br in rows[:5]:
-                    if isinstance(br, dict):
-                        total_buy+=float(br.get('buy') or br.get('buy_volume') or br.get('b') or 0)
-                        total_sell+=float(br.get('sell') or br.get('sell_volume') or br.get('s') or 0)
-                if total_buy+total_sell>0:
-                    akum_ratio=total_buy/(total_buy+total_sell)*100 if (total_buy+total_sell)>0 else 50
-                    is_akum=akum_ratio>55
-                    bandar_str=f"{'AKUM' if is_akum else 'DIST'} {akum_ratio:.0f}%"
-    except Exception as e:
-        print(f"bandar broker err {sym}: {e}")
-
-    result={
-        "foreign_net": foreign_net,
-        "is_foreign_buy": is_fb,
-        "akum_ratio": akum_ratio,
-        "is_akum": is_akum,
-        "foreign_str": foreign_str,
-        "bandar_str": bandar_str,
-        "score_bonus": (15 if is_fb else 0) + (15 if is_akum else 0)
-    }
-    set_cached(cache_key, result, BROKER_CACHE)
-    return result
+                        foreign_net=float(last[k] or 0); break
+        is_fb=foreign_net>0
+        foreign_str=f"{'FB' if is_fb else 'FS'} {foreign_net/1_000_000_000:+.1f}B" if foreign_net!=0 else "N/A"
+        return {"foreign_net":foreign_net,"is_foreign_buy":is_fb,"akum_ratio":0,"is_akum":False,"foreign_str":foreign_str,"bandar_str":"N/A","score_bonus":15 if is_fb else 0}
+    except:
+        return {"foreign_net":0,"is_foreign_buy":False,"akum_ratio":0,"is_akum":False,"foreign_str":"N/A","bandar_str":"N/A","score_bonus":0}
 
 def get_itick_quotes_batch(symbols, max_batch=15):
     if not ITICK_ENABLED or not symbols: return {}
@@ -260,29 +205,18 @@ def check_bo_ema50_bob200(sym, hd, realtime_price=None):
             pe200_2=float(ema200_s.iloc[-3]); pe200_3=float(ema200_s.iloc[-4])
             if stype=="BO EMA50":
                 if c2 > pe50_2 and c3 > pe50_3: return None
-                if c2 > pe50_2 and pc > pe50: return None
             if stype=="BOB EMA200":
                 if c2 > pe200_2 and c3 > pe200_3: return None
-                if c2 > pe200_2 and pc > pe200: return None
-        return {"type": stype, "ema50": ema50, "ema200": ema200, "pe50": pe50, "pe200": pe200}
+        return {"type": stype, "ema50": ema50, "ema200": ema200}
     except: return None
 
 def calculate_score_v48(item):
-    """
-    Scoring V4.8:
-    Base (70 poin):
-    - Vol 30, BO strength 20, Value 20 (total 70)
-    ClosePos 15, Type 15 = 30, jadi base max 100
-    Bandar bonus +30 (FB 15 + AKUM 15) = max 130 tapi cap 100
-    Tapi kita tampilkan base + bonus biar tau mana yang ada bandar
-    """
     score=0
     vol=item.get('vol_ratio',0)
     if vol>=3.0: score+=30
     elif vol>=2.5: score+=25
     elif vol>=2.0: score+=20
     elif vol>=1.5: score+=10
-    
     c=item.get('close',0); ema=item.get('ema50') if item.get('type')=='BO EMA50' else item.get('ema200',0)
     if ema>0:
         dist=(c-ema)/ema*100
@@ -290,36 +224,29 @@ def calculate_score_v48(item):
         elif dist>=3: score+=15
         elif dist>=1: score+=10
         else: score+=5
-    
     val=item.get('vol_rp',0)
     if val>=10_000_000_000: score+=20
     elif val>=5_000_000_000: score+=15
     elif val>=2_000_000_000: score+=10
     elif val>=1_000_000_000: score+=5
-    
     cp=item.get('close_pos',0)
     if cp>=0.8: score+=15
     elif cp>=0.7: score+=10
     elif cp>=0.6: score+=5
-    
     if item.get('type')=='BOB EMA200': score+=15
     else: score+=10
-    
-    base_score=min(score,100)
-    
-    # Bandar bonus
-    bandar_bonus=item.get('bandar_bonus',0)
-    total_score=min(base_score+bandar_bonus,100) # cap 100 biar rapi
-    
-    return base_score, bandar_bonus, total_score
+    base=min(score,100)
+    bonus=item.get('bandar_bonus',0)
+    total=min(base+bonus,100)
+    return base, bonus, total
 
-def scan_v48(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6):
-    print(f"[{get_now_wib()}] 🚀 V4.8 BANDAR INFO: ARJUM {top_gainer_arjum}->ITICK {top_itick} VOL>{vol_thr}x + BO + BANDAR SCORE")
+def scan_v48_fixed(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, bandar_enabled=False):
+    print(f"[{get_now_wib()}] 🚀 V4.8.1 FIX: ARJUM {top_gainer_arjum}->ITICK {top_itick} VOL>{vol_thr}x BANDAR={'ON' if bandar_enabled else 'OFF'}")
     
     screener = get_screener_latest(force_today=True)
     rows = screener.get('rows', []) if isinstance(screener, dict) else []
     if not rows:
-        print("❌ Arjum kosong"); return []
+        print("❌ Arjum screener kosong"); return []
     
     candidates_arjum=[]
     for r in rows:
@@ -335,14 +262,14 @@ def scan_v48(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
     final_detected=[]
     for slice_size in [top_gainer_arjum, 100, 150]:
         current_pool = candidates_arjum[:slice_size]
-        print(f"\n🔍 ARJUM TOP {slice_size}...")
+        print(f"🔍 ARJUM TOP {slice_size} -> {len(current_pool)} saham")
         
         all_quotes={}
         for i in range(0, len(current_pool), 15):
             batch=current_pool[i:i+15]
             q=get_itick_quotes_batch(batch,15)
             all_quotes.update(q)
-            time.sleep(0.2)
+            time.sleep(0.15)
         if not all_quotes:
             for r in rows:
                 code=(r.get('stock_code') or "").replace(".JK","").upper()
@@ -351,6 +278,7 @@ def scan_v48(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
         
         sorted_itick = sorted(all_quotes.items(), key=lambda x: x[1].get('changepct', -999), reverse=True)
         top_codes = [c for c,_ in sorted_itick[:top_itick]]
+        print(f"⚡ ITICK TOP {top_itick}: {top_codes[:10]}")
         
         def check_one(sym):
             try:
@@ -359,25 +287,19 @@ def scan_v48(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
                 q=all_quotes.get(sym, {})
                 realtime_price=q.get('price',0)
                 c = float(realtime_price if realtime_price>0 else hd['Close'].iloc[-1])
-                
                 v_last=float(hd['Volume'].iloc[-1]); v_avg=float(hd['Volume'].iloc[-21:-1].mean())
                 if v_avg==0 or v_last==0: return None
                 ratio=v_last/v_avg
                 if ratio < vol_thr: return None
                 vol_rp = v_last * c
                 if vol_rp < min_value: return None
-                
                 high_today = q.get('high') or float(hd['High'].iloc[-1])
                 low_today = q.get('low') or float(hd['Low'].iloc[-1])
                 close_pos = (c - low_today) / (high_today - low_today) if high_today!=low_today else 1.0
                 if close_pos < min_closepos: return None
-                
                 bo_info = check_bo_ema50_bob200(sym, hd, realtime_price)
                 if not bo_info: return None
-                
-                # BANDAR INFO - PENAMBAH SCORE
-                bandar = get_bandar_info(sym)
-                
+                bandar = get_bandar_info_optional(sym, enabled=bandar_enabled)
                 item={
                     "symbol": sym,
                     "type": bo_info['type'],
@@ -388,18 +310,14 @@ def scan_v48(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
                     "close_pos": close_pos,
                     "ema50": bo_info['ema50'],
                     "ema200": bo_info['ema200'],
-                    "bandar": bandar,
                     "bandar_bonus": bandar.get('score_bonus',0),
                     "foreign_str": bandar.get('foreign_str',''),
                     "bandar_str": bandar.get('bandar_str',''),
                     "is_fb": bandar.get('is_foreign_buy',False),
-                    "is_akum": bandar.get('is_akum',False),
                     "source": q.get('source','')
                 }
                 base, bonus, total = calculate_score_v48(item)
-                item['base_score']=base
-                item['bandar_bonus']=bonus
-                item['score']=total
+                item['base_score']=base; item['bandar_bonus']=bonus; item['score']=total
                 return item
             except Exception as e:
                 print(f"check err {sym}: {e}"); return None
@@ -411,9 +329,7 @@ def scan_v48(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
                 r=f.result()
                 if r:
                     batch_detected.append(r)
-                    fb_icon="🟩" if r['is_fb'] else "🟥" if r['foreign_str']!="N/A" else "⬜"
-                    ak_icon="📈" if r['is_akum'] else "📉" if r['bandar_str']!="N/A" else "⬜"
-                    print(f"🔥 {r['symbol']} {r['type']} SCORE {r['score']} (Base {r['base_score']}+Bandar {r['bandar_bonus']}) {r['foreign_str']} {r['bandar_str']} {fb_icon}{ak_icon}")
+                    print(f"🔥 {r['symbol']} {r['type']} S{r['score']} VOL {r['vol_ratio']:.1f}x")
         
         batch_detected.sort(key=lambda x: x['score'], reverse=True)
         final_detected=batch_detected
@@ -422,78 +338,173 @@ def scan_v48(top_gainer_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
     final_detected.sort(key=lambda x: x['score'], reverse=True)
     return final_detected
 
+# FIX #1: send_reply dengan logging + send ke chat yang request
 def send_reply(cid, txt, rm=None):
-    if not TELEGRAM_BOT_TOKEN: return
+    if not TELEGRAM_BOT_TOKEN:
+        print(f"❌ BOT_TOKEN kosong, gak bisa kirim ke {cid}")
+        return False
+    if not cid:
+        print(f"❌ chat_id kosong")
+        return False
     url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     pl={"chat_id":cid,"text":txt,"parse_mode":"Markdown"}
     if rm: pl["reply_markup"]=rm
-    try: requests.post(url,json=pl,timeout=15)
-    except: pass
+    try:
+        resp=requests.post(url,json=pl,timeout=15)
+        j=resp.json()
+        if not j.get('ok'):
+            print(f"❌ TG send failed to {cid}: {j}")
+            # coba tanpa markdown kalau error parse
+            pl.pop('parse_mode',None)
+            resp=requests.post(url,json=pl,timeout=15)
+            print(f"Retry without markdown: {resp.json()}")
+        else:
+            print(f"✅ Sent to {cid}: {txt[:60]}...")
+        return j.get('ok', False)
+    except Exception as e:
+        print(f"❌ send_reply exception to {cid}: {e}")
+        return False
 
-def broadcast_v48(signals, vol_thr=1.5):
+# FIX #1: broadcast ke chat yang request, bukan TARGET_CHAT_ID terus
+def broadcast_v48_fixed(signals, vol_thr=1.5, dest_chat_id=None):
+    target = dest_chat_id or TARGET_CHAT_ID
+    if not target:
+        print("❌ No dest_chat_id and no TARGET_CHAT_ID")
+        return
     if not signals:
-        send_reply(TARGET_CHAT_ID, f"📉 *V4.8 BANDAR INFO* | VOL>{vol_thr}x + BO + VAL1B + CP60%\nTidak ada BO valid hari ini.")
+        send_reply(target, f"📉 *V4.8.1* | VOL>{vol_thr}x + BO + VAL1B + CP60%\nTidak ada BO valid hari ini.")
         return
     now=get_now_wib().strftime('%d %b %Y %H:%M WIB')
-    header=f"*🚀 V4.8 TOP {len(signals)} BO + BANDAR INFO* 🔥\n{now}\nARJUM60->ITICK30 VOL>{vol_thr}x BO+VAL1B+CP60%+BANDAR\n{'='*40}\n\n"
+    header=f"*🚀 V4.8.1 TOP {len(signals)} BO* 🔥\n{now}\nARJUM60->ITICK30 VOL>{vol_thr}x BO+VAL1B+CP60%\n{'='*35}\n\n"
     msg=header; kb=[]
     for idx,it in enumerate(signals,1):
-        base=it.get('base_score',0); bonus=it.get('bandar_bonus',0); tot=it.get('score',0)
-        if tot>=85: emoji="🟢"
-        elif tot>=70: emoji="🟡"
-        elif tot>=55: emoji="⚪"
-        else: emoji="🔵"
-        
+        tot=it.get('score',0)
+        emoji="🟢" if tot>=85 else "🟡" if tot>=70 else "⚪" if tot>=55 else "🔵"
         fb_str=it.get('foreign_str','')
-        bd_str=it.get('bandar_str','')
-        bandar_line=""
-        if fb_str!="N/A" or bd_str!="N/A":
-            bandar_line=f"   Bandar: {fb_str} {bd_str} (+{bonus})\n"
-        
-        line=f"{idx}. {emoji} *{it['symbol']}* {it['type']} | SCORE {tot} (Base {base}+Bandar {bonus})\n   {it['close']} ({it['change_pct']:+.1f}%) Vol {it['vol_ratio']:.1f}x Rp {format_large_number(it['vol_rp'])} CP {it['close_pos']*100:.0f}%\n{bandar_line}\n"
-        kb.append([{"text": f"{it['symbol']} S{tot} {it['foreign_str']}", "callback_data": f"chart_{it['symbol']}_1d"}])
+        line=f"{idx}. {emoji} *{it['symbol']}* {it['type']} | S{tot}\n   {it['close']} ({it['change_pct']:+.1f}%) Vol {it['vol_ratio']:.1f}x Rp {format_large_number(it['vol_rp'])} CP {it['close_pos']*100:.0f}% {fb_str}\n\n"
+        kb.append([{"text": f"{it['symbol']} S{tot}", "callback_data": f"chart_{it['symbol']}_1d"}])
         if len(msg)+len(line)>3500:
-            send_reply(TARGET_CHAT_ID, msg, rm={"inline_keyboard": kb}); msg=line; kb=[]
+            send_reply(target, msg, rm={"inline_keyboard": kb}); msg=line; kb=[]
         else:
             msg+=line
     if msg:
-        send_reply(TARGET_CHAT_ID, msg, rm={"inline_keyboard": kb})
+        send_reply(target, msg, rm={"inline_keyboard": kb})
 
 def telegram_bot_listener():
     offset=0
-    print("🤖 RAFANO V4.8 BANDAR INFO - Listening...")
-    try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
-    except: pass
+    print("🤖 RAFANO V4.8.1 FIX - Listening...")
+    print(f"🤖 Bot akan reply ke chat yang request, bukan cuma ke TARGET_CHAT_ID")
+    print(f"🤖 Bandar check OFF default, pakai /scanbo bandar untuk ON")
+    
+    # FIX: delete webhook dengan log
+    try:
+        url_del=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+        r=requests.get(url_del,timeout=10)
+        print(f"deleteWebhook: {r.json()}")
+    except Exception as e:
+        print(f"deleteWebhook err: {e}")
+
     while True:
         try:
             url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
             res=requests.get(url,timeout=25)
-            if res.status_code!=200: time.sleep(3); continue
+            if res.status_code!=200:
+                print(f"getUpdates status {res.status_code}: {res.text[:200]}")
+                time.sleep(3); continue
             data=res.json()
-            for update in data.get("result",[]):
+            if not data.get('ok'):
+                print(f"getUpdates not ok: {data}")
+                time.sleep(3); continue
+            
+            results=data.get("result",[])
+            if len(results)>0:
+                print(f"📥 Got {len(results)} updates, offset={offset}")
+            
+            for update in results:
                 offset=update["update_id"]+1
+                print(f"🔔 Update {update['update_id']}: {list(update.keys())}")
+                
+                # handle callback_query (tombol chart)
+                if "callback_query" in update:
+                    cq=update["callback_query"]
+                    chat_id=cq["message"]["chat"]["id"] if "message" in cq else cq["from"]["id"]
+                    data_cq=cq.get("data","")
+                    print(f"Callback {data_cq} from {chat_id}")
+                    send_reply(chat_id, f"📊 Chart {data_cq} - fitur chart coming soon")
+                    # answer callback
+                    try:
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cq["id"]}, timeout=5)
+                    except: pass
+                    continue
+
                 if "message" in update and "text" in update["message"]:
-                    txt=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=txt.split()[0].lower() if txt else ""
+                    msg_obj=update["message"]
+                    txt=msg_obj.get("text","").strip()
+                    chat_id=msg_obj["chat"]["id"]
+                    chat_type=msg_obj["chat"].get("type","private")
+                    from_user=msg_obj["from"].get("username") or msg_obj["from"].get("first_name")
+                    
+                    print(f"💬 Message from {from_user} ({chat_id}/{chat_type}): {txt}")
+                    
+                    first=txt.split()[0].lower() if txt else ""
+                    lower_txt=txt.lower()
+                    
                     if first in ["/start","/help","/menu"]:
-                        send_reply(chat_id, "🔥 *RAFANO V4.8 BANDAR INFO*\nBandar jadi score + info, bukan filter wajib\n\n/scanbo - Scan final + bandar info\n/scanbo 2 - Vol>2x\n/scanbo 2 2000000000 - Vol2x Val2B\n/quota")
+                        send_reply(chat_id, "🔥 *RAFANO V4.8.1 FIX*\nBug telegram fixed!\n\n/scanbo - Scan BO (20 detik)\n/scanbo bandar - Scan + bandar info (40 detik)\n/scanbo 2 - Vol>2x\n/quota - Cek quota")
+                    
                     elif first.startswith("/"):
-                        parts=txt.split(); vol_thr=1.5; top_final=30; top_arjum=60; min_val=1_000_000_000
-                        try:
-                            if len(parts)>=2: vol_thr=float(parts[1])
-                            if len(parts)>=3: min_val=float(parts[2])
-                        except: pass
-                        if vol_thr>=10: top_final=int(vol_thr); vol_thr=1.5
-                        send_reply(chat_id, f"🚀 *V4.8 SCAN BO + BANDAR INFO*\nARJUM{top_arjum}->ITICK{top_final} VOL>{vol_thr}x VAL>{format_large_number(min_val)}\n~20 detik (include bandar check)...")
-                        def run_scan(tg=chat_id, vt=vol_thr, tf=top_final, ta=top_arjum, mv=min_val):
-                            sigs=scan_v48(top_gainer_arjum=ta, top_itick=tf, vol_thr=vt, min_value=mv, min_closepos=0.6)
-                            broadcast_v48(sigs, vol_thr=vt)
-                        threading.Thread(target=run_scan, args=(chat_id, vol_thr, top_final, top_arjum, min_val)).start()
+                        # parse: /scanbo bandar, /scanbo 2, /scanbo 2 bandar, /scanbo 2 2000000000
+                        parts=txt.split()
+                        vol_thr=1.5; top_final=30; top_arjum=60; min_val=1_000_000_000
+                        bandar_on=False
+                        
+                        for p in parts[1:]:
+                            pl=p.lower()
+                            if pl in ["bandar","fb","bandarmology"]:
+                                bandar_on=True
+                            else:
+                                try:
+                                    val=float(p)
+                                    if val < 10: # dianggap vol threshold
+                                        vol_thr=val
+                                    elif val >= 1_000_000: # dianggap min value
+                                        min_val=val
+                                    elif val >= 10:
+                                        top_final=int(val)
+                                except:
+                                    pass
+                        
+                        # kalau /scanbo 30 -> top_final 30, bukan vol 30
+                        if vol_thr>=10:
+                            top_final=int(vol_thr); vol_thr=1.5
+                        
+                        bandar_txt=" + BANDAR" if bandar_on else ""
+                        send_reply(chat_id, f"🚀 *V4.8.1 SCAN{bandar_txt}*\nARJUM{top_arjum}->ITICK{top_final} VOL>{vol_thr}x VAL>{format_large_number(min_val)}\n~{40 if bandar_on else 20} detik... Ke {chat_id}")
+                        
+                        def run_scan(tg=chat_id, vt=vol_thr, tf=top_final, ta=top_arjum, mv=min_val, bandar=bandar_on):
+                            try:
+                                sigs=scan_v48_fixed(top_gainer_arjum=ta, top_itick=tf, vol_thr=vt, min_value=mv, min_closepos=0.6, bandar_enabled=bandar)
+                                broadcast_v48_fixed(sigs, vol_thr=vt, dest_chat_id=tg)
+                            except Exception as e:
+                                print(f"run_scan err: {e}")
+                                send_reply(tg, f"❌ Error scan: {e}")
+                        
+                        threading.Thread(target=run_scan, args=(chat_id, vol_thr, top_final, top_arjum, min_val, bandar_on)).start()
+                    
+                    else:
+                        # bukan command, ignore atau reply help
+                        if chat_type=="private":
+                            send_reply(chat_id, "Kirim /scanbo untuk scan BO")
+                else:
+                    print(f"Update tanpa message text: {update}")
+
         except Exception as e:
-            print(f"Listener err {e}"); time.sleep(3)
+            print(f"Listener err: {e}")
+            import traceback; traceback.print_exc()
+            time.sleep(3)
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.8 BANDAR INFO EDITION")
-    print("BANDAR = SCORE + INFO, BUKAN FILTER WAJIB")
+    print("🔥 RAFANO V4.8.1 FIX - TELEGRAM BUG FIX")
     print("==========================================")
     telegram_bot_listener()
