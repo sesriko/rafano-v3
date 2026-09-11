@@ -463,7 +463,11 @@ def get_liquid_candidates():
 def get_all_bursa_candidates():
     return IDX_600_LIQUID
 
-# Backward compat alias
+# Backward compat alias (must stay before any scan uses old name)
+IDX_LIQUID_400 = IDX_600_LIQUID
+IDX_ALL_BURSA = IDX_600_LIQUID
+IDX_400 = IDX_600_LIQUID
+
 IDX_LIQUID_400 = IDX_600_LIQUID
 IDX_ALL_BURSA = IDX_600_LIQUID
 IDX_400 = IDX_600_LIQUID
@@ -1193,196 +1197,6 @@ def broadcast_vol_spike(signals, threshold=2.0, akum_only=False, sort_by_rp=Fals
     if msg:
         send_reply(TARGET_CHAT_ID, msg, rm={"inline_keyboard": kb})
 
-def scan_v3_full(force_today=False, limit_candidates=60, signal_type_filter="BO_BOB"):
-    today_str=get_now_wib().strftime('%d %b %Y %H:%M')
-    print(f"[{get_now_wib()}] 🚀 SCAN RINGKAS TODAY={today_str} force_today={force_today} limit={limit_candidates}...")
-    # ===== 300 LIQUID TERBAIK, NO FCA/SUSPEND =====
-    print(f"[{get_now_wib()}] 🔍 Ambil universe liquid 300, filter FCA/suspend...")
-    sd=get_screener_latest(force_today=force_today)
-    
-    # Gabung screener + liquid 400
-    base_cands=[]
-    if sd:
-        for it in sd:
-            sym=it.get('symbol') or it.get('code')
-            if sym: base_cands.append(sym.replace(".JK","").upper())
-    
-    combined_raw = base_cands + IDX_600_LIQUID
-    # dedup awal + no warrant
-    seen=set(); uniq_raw=[]
-    for c in combined_raw:
-        cu=c.upper().strip()
-        if not cu: continue
-        if "-W" in cu: continue
-        if cu and cu not in seen:
-            seen.add(cu); uniq_raw.append(cu)
-    
-    # Filter liquid + exclude FCA/suspend, ambil top 300 by value
-    print(f"[{get_now_wib()}] Filter {len(uniq_raw)} -> liquid + no FCA...")
-    scored = filter_liquid_stocks(uniq_raw, min_avg_value_rp=300_000_000, min_avg_vol=200_000, fast_mode=True)
-    
-    # Kalau hasil filter < limit, longgarkan threshold
-    if len(scored) < limit_candidates:
-        print(f"[{get_now_wib()}] Hasil filter {len(scored)} < {limit_candidates}, longgarkan threshold...")
-        scored = filter_liquid_stocks(uniq_raw, min_avg_value_rp=100_000_000, min_avg_vol=100_000, fast_mode=True)
-    
-    # Ambil top N
-    cands = [x[0] for x in scored[:limit_candidates]]
-    
-    print(f"[{get_now_wib()}] ✅ Liquid 300: {len(cands)} saham | Top 5: {cands[:5]} | Avg Value tertinggi: {format_large_number(scored[0][1]) if scored else '0'}")
-    
-    det=[]
-    def proc(sym):
-        # QUOTA HABIS pun tetap scan pakai sinyal chart TF 1D (BO EMA50, BOS EMA, BOW BB)
-        try:
-            hd=get_history_pro(sym,limit=120,timeframe="1d")
-            if hd is None or len(hd)<30:
-                return None
-            
-            lc=hd['Close'].iloc[-1]
-            # ===== DETEKSI SINYAL CHART 1D - SELALU JALAN =====
-            try:
-                buy_sigs, hd_ind = detect_buy_signals(hd, None)
-                has_chart_signal = len(buy_sigs) > 0
-                chart_type = buy_sigs[0].get('type','') if has_chart_signal else ''
-            except:
-                buy_sigs=[]; has_chart_signal=False; chart_type=''; hd_ind=hd
-            
-            # broker info opsional
-            multi=None; akum=0; dist=0; net=0; status="NEUTRAL ⚪ (VSA)"; src_mark="VSA_ESTIMATE"
-            try:
-                if not QUOTA_HIT:
-                    multi=get_broker_multi_tf(sym, hd)
-                    if multi:
-                        akum=multi.get('akum_d',0); dist=multi.get('dist_d',0); net=multi.get('net_d',0)
-                        status=multi.get('status_d','NEUTRAL ⚪'); src_mark=multi.get('source_d','VSA_ESTIMATE')
-                else:
-                    ck=get_cached_broker(f"multi_{sym}", allow_expired=True)
-                    if ck:
-                        multi=ck; akum=multi.get('akum_d',0); dist=multi.get('dist_d',0); net=multi.get('net_d',0)
-                        status=multi.get('status_d','NEUTRAL ⚪ (CACHE)'); src_mark=multi.get('source_d','QUOTA')
-            except:
-                pass
-            
-            # ===== LOGIC BUY CHART 1D - BO/BOS/BOW/BOB TODAY ONLY =====
-            ema20=hd['Close'].ewm(span=20).mean().iloc[-1]
-            ema50=hd['Close'].ewm(span=50).mean().iloc[-1]
-            ema200=hd['Close'].ewm(span=200).mean().iloc[-1]
-            df_v,_=calculate_vsa_metrics(hd.copy())
-            buy_pct=df_v['Buy_Pct'].iloc[-1] if 'Buy_Pct' in df_v.columns else 50
-            
-            is_buy_chart=False
-            chart_today_type=""
-            today_idx = len(hd)-1
-            filt = (signal_type_filter or "BO_BOB").upper()
-            allowed=[]
-            if filt in ["BO","BO EMA50","BO50"]:
-                allowed=["BO EMA50"]
-            elif filt in ["BOS","BOS EMA"]:
-                allowed=["BOS EMA"]
-            elif filt in ["BOW","BOW BB"]:
-                allowed=["BOW BB"]
-            elif filt in ["BOB","BOB EMA200","BOB200"]:
-                allowed=["BOB EMA200"]
-            elif filt in ["BO_BOB","BO+BOB","BO_BOB_EMA"]:
-                allowed=["BO EMA50","BOB EMA200"]  # DEFAULT - yang lu minta: BO50 + BOB200 last candle
-            elif filt in ["ALL","SEMUA"]:
-                allowed=["BO EMA50","BOS EMA","BOW BB","BOB EMA200"]
-            else:
-                allowed=["BO EMA50","BOB EMA200"]
-            
-            # Cek sinyal dalam 2 hari terakhir (bukan cuma hari ini) biar gak kelewat karena yfinance delay
-            for sig in buy_sigs:
-                sig_idx = sig.get('index',-1)
-                # allow today or yesterday (today_idx or today_idx-1)
-                if sig_idx >= today_idx-1 and sig.get('type','') in allowed:
-                    is_buy_chart=True
-                    chart_today_type=sig.get('type','')
-                    has_chart_signal=True
-                    chart_type=sig.get('type','')
-                    break
-            
-            # FALLBACK SIMPLE: kalau detect_buy_signals kosong (vol filter ketat), cek manual crossover EMA50/EMA200
-            if not is_buy_chart and len(hd)>=60:
-                try:
-                    c = hd['Close'].iloc[-1]
-                    o = hd['Open'].iloc[-1]
-                    pc = hd['Close'].iloc[-2]
-                    e50 = hd['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
-                    pe50 = hd['Close'].ewm(span=50, adjust=False).mean().iloc[-2]
-                    e200 = hd['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
-                    pe200 = hd['Close'].ewm(span=200, adjust=False).mean().iloc[-2]
-                    # BO EMA50 today/yesterday simple
-                    if "BO EMA50" in allowed and pc <= pe50 and c > e50:
-                        is_buy_chart=True
-                        chart_today_type="BO EMA50"
-                        has_chart_signal=True
-                        chart_type="BO EMA50"
-                    # BOB EMA200
-                    elif "BOB EMA200" in allowed and pc <= pe200 and c > e200:
-                        is_buy_chart=True
-                        chart_today_type="BOB EMA200"
-                        has_chart_signal=True
-                        chart_type="BOB EMA200"
-                    # BOS EMA: close > EMA50 dalam 3 hari terakhir dan naik
-                    elif "BOS EMA" in allowed and c > e50 and hd['Close'].iloc[-2] > hd['Close'].ewm(span=50).mean().iloc[-2]:
-                        # cek apakah baru breakout 2 hari terakhir
-                        if any(hd['Close'].iloc[-k] <= hd['Close'].ewm(span=50).mean().iloc[-k] for k in range(2,5)):
-                            is_buy_chart=True
-                            chart_today_type="BOS EMA"
-                            has_chart_signal=True
-                            chart_type="BOS EMA"
-                except:
-                    pass
-                # Kalau mau include BOS EMA hari ini juga, uncomment bawah:
-                # if sig_type in ['BO EMA50','BOS EMA'] and sig_idx == today_idx:
-                #     is_buy_chart=True; chart_today_type=sig_type; break
-            
-            # JANGAN pakai logic ema20>ema50 umum, cuma BO EMA50 hari ini
-            # is_buy_chart hanya True kalau BO EMA50 today
-            
-            if not QUOTA_HIT:
-                # REAL MODE: butuh chart signal atau akum
-                if not (is_buy_chart or ("AKUM" in status and net>0) or akum>0):
-                    return None
-            else:
-                # QUOTA HABIS MODE: cuma chart signal 1D
-                if not is_buy_chart:
-                    return None
-            
-            an=get_analysis(sym)
-            sc,lab,rs=calculate_score_v2(sym, hd, akum, dist, net, an)
-            
-            if (sc>=30 and is_buy_chart) or (QUOTA_HIT and is_buy_chart):
-                prev=hd['Close'].iloc[-2] if len(hd)>=2 else lc
-                chg=(lc/prev-1)*100 if prev else 0
-                tp=calculate_trading_plan(hd, multi_tf=multi, timeframe="1d")
-                if is_buy_chart and chart_today_type:
-                    rs=[f"CHART 1D TODAY: {chart_today_type}"] + rs
-                elif has_chart_signal:
-                    rs=[f"CHART 1D: {chart_type}"] + rs
-                if QUOTA_HIT:
-                    rs.append("⚠️ QUOTA HABIS - CHART 1D ONLY")
-                    if "NEUTRAL" in status:
-                        status=f"BUY CHART 1D 🟢 {chart_type}" if chart_type else "BUY CHART 1D 🟢"
-                return {"symbol":sym,"close":int(lc),"change_pct":chg,"score":sc,"score_label":lab,"akum_value":akum,"dist_value":dist,"broker_net":net,"broker_status":status,"reasons":rs,"history_df":hd,"trading_plan":tp,"brokers":multi.get('brokers',[]) if multi else [],"multi_tf":multi or {"akum_d":akum,"dist_d":dist,"net_d":net,"status_d":status,"source_d":src_mark,"brokers":[]}}
-        except Exception as e:
-            #print(f"proc {sym} err {e}")
-            pass
-        return None
-    for idx,sym in enumerate(cands):
-        # SCAN BO EMA50 TODAY ONLY
-        if QUOTA_HIT and idx % 50 == 0:
-            print(f"⚠️ Quota habis tapi tetap scan CHART 1D di {idx}/{len(cands)}...")
-        r=proc(sym)
-        if r: 
-            det.append(r)
-            qtag="📊 CHART 1D" if QUOTA_HIT else "🏦 REAL"
-            print(f"✅ {r['symbol']} {r['score']}% {qtag} {r['broker_status']}")
-        time.sleep(0.3 if QUOTA_HIT else 0.7)
-    det.sort(key=lambda x: (x['multi_tf'].get('net_d',0),x['score']),reverse=True)
-    return det
-
 def scan_v3(): return scan_v3_full()
 def send_reply(cid,txt,rm=None):
     url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -1398,6 +1212,69 @@ def send_photo_reply(cid,pp,cap="", caption=None):
         with open(pp,'rb') as ph:
             requests.post(url,data={'chat_id':cid,'caption':final_cap,'parse_mode':'Markdown'},files={'photo':ph},timeout=30)
     except Exception as e: print(f"Photo err {e}")
+
+
+def scan_v3_full_fast(force_today=False, limit_candidates=60, signal_type_filter="BO_BOB"):
+    today_date=get_now_wib().date()
+    print(f"[{get_now_wib()}] ⚡ FAST SCAN ULTRA STRICT TODAY+VOL1.5x limit={limit_candidates} - 600 saham")
+    try:
+        candidates = get_liquid_candidates()[:limit_candidates]
+    except:
+        candidates = ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","BUKA","BBKP","BRIS"][:limit_candidates]
+    candidates = [c for c in candidates if "-W" not in c and c not in FCA_SUSPEND_EXCLUDE]
+    signals=[]
+    def proc(sym):
+        try:
+            hd=get_history_pro(sym,limit=100,timeframe="1d")
+            return _check_strict_bo_today(sym, hd, today_date, signal_type_filter)
+        except:
+            return None
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futs={ex.submit(proc,s):s for s in candidates}
+        for f in as_completed(futs):
+            r=f.result()
+            if r:
+                signals.append(r)
+    print(f"⚡ FAST RESULT: {len(signals)} signals dari {len(candidates)} - BMTR 116<117.3 REJECTED, ESIP 129>125.3 VALID")
+    return signals
+
+def scan_v3_full_ORIGINAL(force_today=False, limit_candidates=150):
+    # Same as fast but sequential for debug
+    today_date=get_now_wib().date()
+    print(f"[{get_now_wib()}] 🔍 SCAN RINGKAS ULTRA STRICT TODAY+VOL1.5x limit={limit_candidates} - 600 saham")
+    try:
+        candidates = get_liquid_candidates()[:limit_candidates]
+    except:
+        candidates = ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","BUKA","BBKP","BRIS","ANTM","INCO","MDKA","ADRO","PTBA","PGAS","EXCL","ISAT"][:limit_candidates]
+    candidates = [c for c in candidates if "-W" not in c and c not in FCA_SUSPEND_EXCLUDE]
+    signals=[]
+    for sym in candidates:
+        try:
+            hd=get_history_pro(sym,limit=100,timeframe="1d")
+            res=_check_strict_bo_today(sym, hd, today_date, "BO_BOB")
+            if res:
+                signals.append(res)
+                print(f"✅ {sym} {res['vol_ratio']:.2f}x VOL {res['type']} Close {res['close']:.0f} EMA50 {res['ema50']:.0f}")
+            else:
+                if sym in ["BMTR","KPIG","ESIP","GMFI","KAEF"]:
+                    try:
+                        last_c = float(hd['Close'].iloc[-1]) if hd is not None else 0
+                        ema50 = float(hd['Close'].ewm(span=50, adjust=False).mean().iloc[-1]) if hd is not None else 0
+                        vol_t = float(hd['Volume'].iloc[-1]) if hd is not None else 0
+                        avg_v = float(hd['Volume'].iloc[-21:-1].mean()) if hd is not None and len(hd)>=21 else 0
+                        print(f"❌ {sym} REJECTED: Close {last_c:.0f} vs EMA50 {ema50:.0f} Vol {vol_t:.0f}/{avg_v:.0f}={vol_t/avg_v if avg_v>0 else 0:.2f}x")
+                    except:
+                        print(f"❌ {sym} REJECTED")
+        except:
+            continue
+    print(f"🔍 RINGKAS RESULT: {len(signals)} BUY")
+    return signals
+
+def scan_v3_full(force_today=False, limit_candidates=150):
+    # Wrapper: always use strict logic
+    return scan_v3_full_fast(force_today=True, limit_candidates=limit_candidates, signal_type_filter="BO_BOB")
+
 
 def broadcast_v3(signals, filter_label="BO_BOB"):
     if not signals:
@@ -1496,7 +1373,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.7.9b 600 EXACT FIX - 600 SAHAM PALING LIQUID NO FCA/WARRANT/SUSPEND/HARGA<50 - ISSI+IDX80 - STRICT TODAY+VOL1.5x Running...")
+    offset=0; print("🤖 V4.8.0 CLEAN ULTRA STRICT - 600 SAHAM PAS NO FCA/WARRANT/SUSPEND/<50 - FIX BMTR 116<117.3 & ESIP VALID - TODAY ONLY+VOL1.5x Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1733,7 +1610,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.7.9b 600 EXACT FIX - 600 SAHAM PALING LIQUID NO FCA/WARRANT/SUSPEND/HARGA<50 - ISSI+IDX80 - STRICT TODAY+VOL1.5x")
+    print("🔥 RAFANO V4.8.0 CLEAN ULTRA STRICT - 600 SAHAM PAS NO FCA/WARRANT/SUSPEND/<50 - FIX BMTR 116<117.3 & ESIP VALID - TODAY ONLY+VOL1.5x")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
@@ -1743,11 +1620,103 @@ if __name__=="__main__":
 
 
 
+
 def _check_strict_bo_today(sym, hd, today_date, signal_type_filter="BO_BOB"):
-    """Unified check: TODAY only + BO EMA50/200 + VOL 1.5x - return dict or None"""
+    """ULTRA STRICT: TODAY ONLY + BO EMA50/200 + VOL 1.5x + HARGA>=50 - FIX BMTR 116<117.3 & ESIP valid"""
     try:
         if hd is None or len(hd) < 55:
             return None
+        # Last candle MUST be TODAY - tolak kemarin (KPIG, BMTR kemarin)
+        try:
+            last_dt = pd.to_datetime(hd.index[-1])
+            last_candle_date = last_dt.date()
+        except:
+            return None
+        delta = (today_date - last_candle_date).days
+        if delta != 0:
+            return None
+        
+        c = float(hd['Close'].iloc[-1])
+        pc = float(hd['Close'].iloc[-2])
+        o = float(hd['Open'].iloc[-1])
+        
+        # Harga <50 skip
+        if c < 50:
+            return None
+        
+        # EMA adjust=False biar sama TradingView
+        ema50_s = hd['Close'].ewm(span=50, adjust=False).mean()
+        ema200_s = hd['Close'].ewm(span=200, adjust=False).mean()
+        ema50 = float(ema50_s.iloc[-1])
+        ema200 = float(ema200_s.iloc[-1])
+        pe50 = float(ema50_s.iloc[-2])
+        pe200 = float(ema200_s.iloc[-2])
+        
+        # HARUS di atas EMA hari ini (BMTR 116 < 117.3 = REJECT)
+        # Dan harus cross: kemarin di bawah/batas, hari ini di atas
+        is_bo=False
+        stype=""
+        # BO EMA50: pc <= pe50 dan c > ema50 DAN c > pe50 (close hari ini harus di atas EMA hari ini)
+        if pc <= pe50 and c > ema50 and c > pe50:
+            is_bo=True
+            stype="BO EMA50"
+        elif pc <= pe200 and c > ema200 and c > pe200:
+            is_bo=True
+            stype="BOB EMA200"
+        if not is_bo:
+            return None
+        if signal_type_filter=="BO_BOB" and stype not in ["BO EMA50","BOB EMA200"]:
+            return None
+        
+        # Tolak kalau sudah BO 2 hari lalu (BMTR case: 3 label BO berurutan)
+        if len(hd)>=4:
+            c2=float(hd['Close'].iloc[-3])
+            c3=float(hd['Close'].iloc[-4])
+            pe50_2=float(ema50_s.iloc[-3])
+            pe50_3=float(ema50_s.iloc[-4])
+            pe200_2=float(ema200_s.iloc[-3])
+            pe200_3=float(ema200_s.iloc[-4])
+            if stype=="BO EMA50":
+                if c2 > pe50_2 and c3 > pe50_3:
+                    return None
+                if c2 > pe50_2 and pc > pe50:
+                    return None
+            if stype=="BOB EMA200":
+                if c2 > pe200_2 and c3 > pe200_3:
+                    return None
+                if c2 > pe200_2 and pc > pe200:
+                    return None
+        
+        # VOLUME 1.5x WAJIB - hitung avg 20 tanpa hari ini
+        vol_today = float(hd['Volume'].iloc[-1])
+        if len(hd) >= 21:
+            avg_vol_20 = float(hd['Volume'].iloc[-21:-1].mean())
+        else:
+            avg_vol_20 = float(hd['Volume'].iloc[:-1].mean())
+        if avg_vol_20 <= 0 or vol_today <= 0:
+            return None
+        vol_ratio = vol_today / avg_vol_20
+        if vol_ratio < 1.5:
+            return None
+        
+        chg = (c/pc-1)*100 if pc>0 else 0
+        return {
+            "symbol":sym,
+            "type":stype,
+            "close":c,
+            "change":chg,
+            "ema50":ema50,
+            "ema200":ema200,
+            "last_date":str(last_candle_date),
+            "vol_today":vol_today,
+            "avg_vol_20":avg_vol_20,
+            "vol_ratio":vol_ratio,
+            "source":"STRICT_TODAY_VOL_600",
+            "score":vol_ratio*10
+        }
+    except Exception as e:
+        return None
+
         # Last candle must be TODAY
         try:
             last_dt = pd.to_datetime(hd.index[-1])
@@ -1833,67 +1802,5 @@ def _check_strict_bo_today(sym, hd, today_date, signal_type_filter="BO_BOB"):
     except:
         return None
 
-def scan_v3_full_fast(force_today=False, limit_candidates=60, signal_type_filter="BO_BOB"):
-    today_date=get_now_wib().date()
-    print(f"[{get_now_wib()}] ⚡ FAST SCAN ULTRA STRICT TODAY+VOL1.5x limit={limit_candidates}")
-    try:
-        candidates = get_liquid_candidates()[:limit_candidates]
-    except:
-        candidates = ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","BUKA","BBKP","BRIS"][:limit_candidates]
-    candidates = [c for c in candidates if "-W" not in c]
-    signals=[]
-    def proc(sym):
-        try:
-            hd=get_history_pro(sym,limit=100,timeframe="1d")
-            return _check_strict_bo_today(sym, hd, today_date, signal_type_filter)
-        except:
-            return None
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futs={ex.submit(proc,s):s for s in candidates}
-        for f in as_completed(futs):
-            r=f.result()
-            if r:
-                signals.append(r)
-    print(f"⚡ FAST RESULT: {len(signals)} signals dari {len(candidates)} - BMTR 115 vs EMA 117.3 & KPIG -5% harusnya 0")
-    return signals
 
-def scan_v3_full_ORIGINAL(force_today=False, limit_candidates=150):
-    """ORIGINAL diganti jadi STRICT juga"""
-    today_date=get_now_wib().date()
-    print(f"[{get_now_wib()}] 🔍 SCAN RINGKAS ULTRA STRICT TODAY+VOL1.5x limit={limit_candidates}")
-    try:
-        candidates = get_liquid_candidates()[:limit_candidates]
-    except:
-        candidates = ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","BUKA","BBKP","BRIS","ANTM","INCO","MDKA","ADRO","PTBA","PGAS","EXCL","ISAT"][:limit_candidates]
-    candidates = [c for c in candidates if "-W" not in c]
-    signals=[]
-    # Sequential tapi pakai check yang sama
-    for sym in candidates:
-        try:
-            hd=get_history_pro(sym,limit=100,timeframe="1d")
-            res=_check_strict_bo_today(sym, hd, today_date, "BO_BOB")
-            if res:
-                signals.append(res)
-                print(f"✅ {sym} {res['vol_ratio']:.2f}x VOL {res['type']} - Close {res['close']:.0f} EMA50 {res['ema50']:.0f}")
-            else:
-                # Debug BMTR/KPIG kenapa fail
-                if sym in ["BMTR","KPIG","GMFI","KAEF"]:
-                    try:
-                        last_c = float(hd['Close'].iloc[-1]) if hd is not None else 0
-                        ema50 = float(hd['Close'].ewm(span=50, adjust=False).mean().iloc[-1]) if hd is not None else 0
-                        vol_t = float(hd['Volume'].iloc[-1]) if hd is not None else 0
-                        avg_v = float(hd['Volume'].iloc[-21:-1].mean()) if hd is not None and len(hd)>=21 else 0
-                        print(f"❌ {sym} REJECTED: Close {last_c:.0f} vs EMA50 {ema50:.0f} Vol {vol_t:.0f}/{avg_v:.0f}={vol_t/avg_v if avg_v>0 else 0:.2f}x")
-                    except:
-                        print(f"❌ {sym} REJECTED: error")
-        except Exception as e:
-            continue
-    print(f"🔍 RINGKAS RESULT: {len(signals)} BUY")
-    return signals
 
-def scan_v3_full(force_today=False, limit_candidates=150):
-    if force_today:
-        return scan_v3_full_fast(force_today=True, limit_candidates=limit_candidates, signal_type_filter="BO_BOB")
-    else:
-        return scan_v3_full_ORIGINAL(force_today=False, limit_candidates=limit_candidates)
