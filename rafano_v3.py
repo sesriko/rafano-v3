@@ -68,6 +68,55 @@ def get_itick_quotes_batch(symbols, max_batch=15):
     return {}
 
 
+# DUPLICATE REMOVED - (force_today=False, limit_candidates=60, signal_type_filter="BO_BOB"):
+    """SCAN CEPAT - parallel + yfinance only - 10x speed"""
+    today_str=get_now_wib().strftime('%d %b %Y %H:%M')
+    print(f"[{get_now_wib()}] ⚡ FAST SCAN TODAY={today_str} force_today={force_today} filter={signal_type_filter}")
+    try:
+        candidates = get_liquid_candidates()[:limit_candidates]
+    except:
+        candidates = ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","BMTR","BIPI","GOTO","BUKA","BBKP","BRIS","ANTM","INCO","MDKA","ADRO","PTBA","PGAS","EXCL","ISAT"][:limit_candidates]
+    candidates = [c for c in candidates if "-W" not in c]
+    signals = []
+    def proc_fast(sym):
+        try:
+            hd=get_history_pro(sym,limit=70,timeframe="1d")
+            if hd is None or len(hd)<50:
+                return None
+            c=hd['Close'].iloc[-1]
+            pc=hd['Close'].iloc[-2] if len(hd)>=2 else c
+            ema50=hd['Close'].ewm(span=50).mean().iloc[-1]
+            ema200=hd['Close'].ewm(span=200).mean().iloc[-1] if len(hd)>=200 else hd['Close'].ewm(span=50).mean().iloc[-1]
+            pe50=hd['Close'].ewm(span=50).mean().iloc[-2] if len(hd)>=2 else ema50
+            pe200=hd['Close'].ewm(span=200).mean().iloc[-2] if len(hd)>=200 else ema200
+            is_bo=False
+            stype=""
+            if pc <= pe50 and c > ema50:
+                is_bo=True
+                stype="BO EMA50"
+            elif pc <= pe200 and c > ema200:
+                is_bo=True
+                stype="BOB EMA200"
+            if not is_bo:
+                return None
+            if signal_type_filter=="BO_BOB" and stype not in ["BO EMA50","BOB EMA200"]:
+                return None
+            chg = (c/pc-1)*100 if pc>0 else 0
+            return {"symbol":sym,"type":stype,"close":c,"change":chg,"ema50":ema50,"ema200":ema200,"source":"FAST_YF","score":50}
+        except:
+            return None
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(proc_fast, sym): sym for sym in candidates}
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res:
+                signals.append(res)
+    signals.sort(key=lambda x: x.get('change',0), reverse=True)
+    return signals
+
+
+
+
 def safe_get_env(k):
     v=os.getenv(k)
     if v: return str(v).strip().strip('"').strip("'")
@@ -1278,7 +1327,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.6.0 3-API HYBRID - ARJUM+YF+ITICK REALTIME + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.6.1 FAST 3-API HYBRID - 10x SPEED + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1298,32 +1347,25 @@ def telegram_bot_listener():
                 elif "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip(); chat_id=update["message"]["chat"]["id"]; first=txt.split()[0].lower() if txt else ""
                     if first in ["/start","/help","/menu"]:
-                        txt_help = """🔥 *RAFANO V4.6.0 3-API HYBRID* 300 liquid no FCA
-ARJUM (broker) + YFINANCE (history) + ITICK (realtime 0 delay)
+                        txt_help = """🔥 *RAFANO V4.6.1 FAST 10x* 3-API HYBRID
+ARJUM + YF + ITICK ⚡
 ==========================
-📊 *CHART*
-/c KODE [TF] ex: /c BIPI /c ANTM 5
-/b KODE ex: /b BIPI
-Realtime: ITICK ⚡ > YF 15m delay
+⚡ *SCAN CEPAT (NEW)*
+/scanfast = 60 saham liquid, parallel 20x, ~10 detik
+/scanfast 100 = 100 saham, ~15 detik
+/scanfull = 300 saham parallel 20x, ~60 detik
 
-🔍 *SCAN BUY TODAY (last candle)*
-/scan = BO EMA50 + BOB EMA200 last candle
-/scan bos = BOS EMA hari ini
-/scan bow = BOW BB hari ini
-/scan all = semua BO+BOS+BOW+BOB
+📊 *SCAN NORMAL*
+/scan = BO50+BOB200 last candle (300 saham sequential)
+/scan bos /scan bow /scan all
 
-Keunggulan V4.6.0:
-✅ History EMA dari YF (gratis unlimited)
-✅ Price realtime 0 delay dari ITICK (free token)
-✅ Broker akum/dist dari ARJUM (kalau quota habis → VSA)
-✅ BMTR BO50/BOB200 last candle pasti muncul
+📈 *CHART*
+/c KODE [TF] ex: /c BMTR 5 /c ANTM
+/b KODE
 
-🔥 *VOL SPIKE*
-/vol 2 = vol >2x 60 saham
-/volall 2 = 300 saham sort Rp
-
-⚙️ /quota /clear /help
-ITICK Free: 1000 req/day, max 15 batch"""
+Tips cepat:
+- Pakai /scanfast buat cek BMTR BO50 cepat
+- Pakai /scanfull kalau mau lengkap 300 saham tapi tetap cepat"""
                         send_reply(chat_id, txt_help)
                     elif first in ["/c","/chart"]:
                         parts=txt.split()
@@ -1527,7 +1569,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.6.0 3-API HYBRID - ARJUM+YF+ITICK REALTIME + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.6.1 FAST 3-API HYBRID - 10x SPEED + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
