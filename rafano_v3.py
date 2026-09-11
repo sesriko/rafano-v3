@@ -1467,7 +1467,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.7.5 BO+VOL1.5x BREAKOUT - ALL LIQUID BO+VOL1.5x STRICT + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.7.6 STRICT TODAY REAL - ALL LIQUID BO+VOL1.5x FIX BMTR/KPIG + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1704,8 +1704,18 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.7.5 BO+VOL1.5x BREAKOUT - ALL LIQUID BO+VOL1.5x STRICT + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.7.6 STRICT TODAY REAL - ALL LIQUID BO+VOL1.5x FIX BMTR/KPIG + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
     telegram_bot_listener()
+
+
+def scan_v3_full(force_today=False, limit_candidates=150):
+    """WRAPPER STRICT - panggil fast scan biar konsisten TODAY+VOL1.5x"""
+    if force_today:
+        # Jika force_today, pakai strict fast logic (sama dengan auto alert)
+        return scan_v3_full_fast(force_today=True, limit_candidates=limit_candidates, signal_type_filter="BO_BOB")
+    else:
+        return scan_v3_full_ORIGINAL(force_today=False, limit_candidates=limit_candidates)
+
