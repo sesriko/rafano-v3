@@ -70,7 +70,7 @@ def get_itick_quotes_batch(symbols, max_batch=15):
 
 # ===== AUTO NOTIFY V4.7.1 - BO EMA50/BOB EMA200 REALTIME - FIXED =====
 AUTO_NOTIFY_ENABLED = os.getenv("AUTO_NOTIFY", "true").lower() == "true"
-AUTO_NOTIFY_INTERVAL = int(os.getenv("AUTO_INTERVAL_SEC", "60"))
+AUTO_NOTIFY_INTERVAL = int(os.getenv("AUTO_INTERVAL_SEC", "180"))
 AUTO_NOTIFY_EMA_FILTER = ["BO EMA50", "BOB EMA200"]
 AUTO_NOTIFIED_TODAY = set()
 AUTO_LAST_RESET_DATE = None
@@ -116,6 +116,8 @@ def send_auto_telegram_alert(signal):
 📈 *{sym}* - *{stype}*
 💰 Price: Rp {realtime_price:.0f} ({chg:+.2f}%) {source_label}
 📊 Close: {close:.0f} | EMA50: {signal.get('ema50',0):.0f} | EMA200: {signal.get('ema200',0):.0f}
+📅 Last Candle: {signal.get('last_date','today')} (STRICT TODAY)
+🔥 VOL: {signal.get('vol_today',0):,.0f} vs Avg20 {signal.get('avg_vol_20',0):,.0f} = {signal.get('vol_ratio',0):.2f}x (≥1.5x ✅)
 
 🎯 *TRADING PLAN*
 Entry: {close:.0f}
@@ -167,9 +169,17 @@ def auto_scan_loop():
             if not is_market_hours_wib():
                 time.sleep(300)
                 continue
-            print(f"🔍 AUTO SCAN checking {get_now_wib().strftime('%H:%M:%S')} - {len(AUTO_NOTIFIED_TODAY)} already notified")
+            print(f"🔍 AUTO SCAN ALL LIQUID checking {get_now_wib().strftime('%H:%M:%S')} - {len(AUTO_NOTIFIED_TODAY)} already notified - est ~60s")
             try:
-                signals = scan_v3_full_fast(force_today=True, limit_candidates=100, signal_type_filter="BO_BOB")
+                # ALL LIQUID - ambil universe liquid full (tanpa limit)
+                try:
+                    all_liquid = get_liquid_candidates()
+                    total_liquid = len(all_liquid)
+                    print(f"🌊 AUTO SCAN ALL LIQUID: {total_liquid} saham")
+                    signals = scan_v3_full_fast(force_today=True, limit_candidates=total_liquid, signal_type_filter="BO_BOB")
+                except:
+                    # Fallback 300 kalau get_liquid_candidates error
+                    signals = scan_v3_full_fast(force_today=True, limit_candidates=300, signal_type_filter="BO_BOB")
                 for sig in signals:
                     sym = sig['symbol']
                     stype = sig['type']
@@ -1457,7 +1467,7 @@ def process_chart_request(cid,code,tf="1d",cache=None):
 LAST_SIGNALS_CACHE={}
 def telegram_bot_listener():
     global LAST_SIGNALS_CACHE,QUOTA_HIT,LAST_429_TIME
-    offset=0; print("🤖 V4.7.1 AUTO NOTIFY FIXED - BO50/BOB200 REALTIME + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
+    offset=0; print("🤖 V4.7.5 BO+VOL1.5x BREAKOUT - ALL LIQUID BO+VOL1.5x STRICT + 300 LIQUID NO FCA + QUOTA CHART 1D Running...")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     while True:
@@ -1480,7 +1490,7 @@ def telegram_bot_listener():
                         txt_help = """🔥 *RAFANO V4.7.1 AUTO NOTIFY* BO50/BOB200
 ==========================
 🤖 AUTO (TANPA SCAN MANUAL)
-Bot monitor 100 saham tiap 60s jam 09:00-16:00 WIB
+Bot monitor SEMUA LIQUID (~400-500 saham) tiap 180s jam 09:00-16:00 WIB
 Kalau BO50/BOB200 → Telegram otomatis!
 
 /autostatus /autoon /autooff
@@ -1694,7 +1704,7 @@ def auto_screener_loop():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.7.1 AUTO NOTIFY FIXED - BO50/BOB200 REALTIME + 300 LIQUID NO FCA + QUOTA CHART 1D")
+    print("🔥 RAFANO V4.7.5 BO+VOL1.5x BREAKOUT - ALL LIQUID BO+VOL1.5x STRICT + 300 LIQUID NO FCA + QUOTA CHART 1D")
     print("==========================================")
     print("Commands: /scanvol 2, /volspike, /scan, /c <kode>")
     threading.Thread(target=auto_screener_loop,daemon=True).start()
