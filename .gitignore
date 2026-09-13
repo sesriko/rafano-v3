@@ -6,3 +6,4 @@ chart_*.png
 arjum_*.json
 cooldown.json
 .DS_Store
+credentials.json
