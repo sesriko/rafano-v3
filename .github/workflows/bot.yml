@@ -1,12 +1,9 @@
 
-name: RAFANO V5 + BANDAR DB
+name: RAFANO V5 600 BANDAR DB
 on:
   schedule:
-    - cron: '0 11 * * 1-5' # 18:00 WIB Senin-Jumat
+    - cron: '0 11 * * 1-5'
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: ['rafano_v5_bandar.py']
 
 jobs:
   build:
@@ -19,12 +16,12 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install yfinance pandas requests -q
-      - run: python rafano_v5_bandar.py
+      - run: python rafano_v5_600.py
         env:
           ARJUM_API_KEY: ${{ secrets.ARJUM_API_KEY }}
       - run: |
           git config user.name "rafano-bot"
           git config user.email "bot@rafano.id"
           git add rafano.db
-          git diff --staged --quiet || git commit -m "DB update OHLCV+BANDAR $(date +%Y-%m-%d) - $(sqlite3 rafano.db 'SELECT COUNT(*) FROM ohlcv') rows"
+          git diff --staged --quiet || git commit -m "DB 600 $(date +%Y-%m-%d) $(sqlite3 rafano.db 'SELECT COUNT(*) FROM ohlcv') rows"
           git push
