@@ -7,20 +7,28 @@ on:
   schedule:
     - cron: '0 11 * * 1-5'
 
+permissions:
+  contents: write
+
 jobs:
   update-db:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
       - name: Install deps
         run: pip install yfinance pandas -q
+
       - name: Update DB
         run: |
           python rafano_v5_full.py
           ls -lh rafano.db
+          echo "DB SIZE: $(du -h rafano.db)"
+
       - name: Commit DB
         run: |
           git config user.name 'rafano-bot'
