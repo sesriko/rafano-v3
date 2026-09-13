@@ -1,58 +1,43 @@
-name: RAFANO V4.18 Bot
+name: RAFANO V5 DB
 
 on:
-  workflow_dispatch:  # biar bisa di-run manual klik tombol
+  workflow_dispatch:
   schedule:
-    - cron: '30 9 * * 1-5'  # Auto tiap Senin-Jumat 16:30 WIB (09:30 UTC) setelah market tutup
+    - cron: '0 11 * * 1-5'
 
 jobs:
-  run-bot:
+  update-db:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          pip install -r requirements.txt
-          pip install gspread oauth2client
+          pip install -r requirements.txt -q || true
+          pip install yfinance pandas gspread oauth2client python-dotenv -q
 
-      - name: Create .env from Secrets
+      - name: Update DB (OHLCV + Broksum)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
+          ARJUM_API_KEY: ${{ secrets.ARJUM_API_KEY }}
+          ITICK_TOKEN: ${{ secrets.ITICK_TOKEN }}
         run: |
-          echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> .env
-          echo "TARGET_CHAT_ID=${{ secrets.TARGET_CHAT_ID }}" >> .env
-          echo "ARJUM_API_KEY=${{ secrets.ARJUM_API_KEY }}" >> .env
-          echo "ITICK_TOKEN=${{ secrets.ITICK_TOKEN }}" >> .env
-          echo "GSHEET_NAME=rafano-broksum" >> .env
-          echo "GSHEET_CREDENTIALS=credentials.json" >> .env
+          python rafano_v5_full.py
+          ls -lh rafano.db
 
-      - name: Create credentials.json from Secret
-        run: |
-          echo '${{ secrets.GSHEET_CREDENTIALS_JSON }}' > credentials.json
-
-      - name: Check files
-        run: |
-          ls -lh
-          cat .env | sed 's/TOKEN=.*/TOKEN=***/' | sed 's/KEY=.*/KEY=***/'
-
-      - name: Save top 20 saham to GSheet (anti-429)
-        run: |
-          python -c "
-          from rafano_v3 import process_save_gsheet_request
-          process_save_gsheet_request(None, None)
-          print('✅ Save GSheet selesai')
-          "
-
-      - name: Commit updated cache (optional)
+      - name: Push DB to GitHub
         run: |
           git config user.name 'rafano-bot'
           git config user.email 'bot@rafano.com'
-          git add -A || true
-          git diff --staged --quiet || git commit -m 'Auto update GSheet cache $(date)' || true
-          git push || true
+          git add rafano.db rafano_v5_full.py .github/workflows/bot.yml
+          git diff --staged --quiet || git commit -m "V5 DB update $(date +%Y-%m-%d) - $(du -h rafano.db | cut -f1)"
+          git push origin main
+
+# 9. Cek file bot.yml jadi
+!cat .github/workflows/bot.yml
+!ls -lh .github/workflows/
