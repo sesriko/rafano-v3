@@ -7,25 +7,37 @@ on:
     paths:
       - 'rafano_v5_600.py'
 
+permissions:
+  contents: write
+
 jobs:
   update-db:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - run: pip install yfinance pandas requests lxml
-      - env:
+
+      - name: Update OHLCV 200 + Broksum 5D
+        env:
           ARJUM_API_KEY: ${{ secrets.ARJUM_API_KEY }}
         run: |
           python rafano_v5_600.py
           ls -lh rafano.db
-          sqlite3 rafano.db "SELECT COUNT(DISTINCT symbol) as saham, COUNT(*) as rows FROM ohlcv;"
-      - run: |
+          sqlite3 rafano.db "SELECT COUNT(DISTINCT symbol) as saham, COUNT(*) as rows FROM ohlcv; SELECT COUNT(*) as broksum FROM bandar_daily;"
+
+      - name: Commit DB
+        run: |
           git config user.name "rafano-bot"
           git config user.email "bot@rafano.id"
-          git add rafano.db
+          git add -f rafano.db
           git commit -m "auto update 200 candle + 5D - $(date '+%Y-%m-%d %H:%M')" || echo "no changes"
-          git push
+          git push origin main
