@@ -1,0 +1,31 @@
+name: RAFANO UPDATE 200 + 5D
+on:
+  schedule:
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:
+  push:
+    paths:
+      - 'rafano_v5_600.py'
+
+jobs:
+  update-db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install yfinance pandas requests lxml
+      - env:
+          ARJUM_API_KEY: ${{ secrets.ARJUM_API_KEY }}
+        run: |
+          python rafano_v5_600.py
+          ls -lh rafano.db
+          sqlite3 rafano.db "SELECT COUNT(DISTINCT symbol) as saham, COUNT(*) as rows FROM ohlcv;"
+      - run: |
+          git config user.name "rafano-bot"
+          git config user.email "bot@rafano.id"
+          git add rafano.db
+          git commit -m "auto update 200 candle + 5D - $(date '+%Y-%m-%d %H:%M')" || echo "no changes"
+          git push
