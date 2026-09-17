@@ -1,29 +1,20 @@
-
-name: RAFANO V5 600 BANDAR DB
+name: rafano-bot
 on:
-  push:
-    branches: [main]
-  schedule:
-    - cron: '0 11 * * 1-5'
   workflow_dispatch:
-
 jobs:
-  build:
+  bot:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install yfinance pandas requests -q
-      - run: python rafano_v5_600.py
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Run
         env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
           ARJUM_API_KEY: ${{ secrets.ARJUM_API_KEY }}
-      - run: |
-          git config user.name "rafano-bot"
-          git config user.email "bot@rafano.id"
-          git add rafano.db
-          git diff --staged --quiet || git commit -m "DB 600 $(date +%Y-%m-%d) $(sqlite3 rafano.db 'SELECT COUNT(DISTINCT symbol) FROM ohlcv') saham"
-          git push
+          ITICK_TOKEN: ${{ secrets.ITICK_TOKEN }}
+        run: python rafano_v417_anti429.py
