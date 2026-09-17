@@ -1,1 +1,7 @@
-yfinance\npandas\nrequests\nlxml\n
+yfinance
+pandas
+numpy
+requests
+python-dotenv
+pytz
+matplotlib

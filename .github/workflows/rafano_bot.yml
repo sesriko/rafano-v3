@@ -1,0 +1,23 @@
+name: RAFANO V4.17 ANTI-429 BOT
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 1-5'
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Run Bot 6 jam
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
+          ARJUM_API_KEY: ${{ secrets.ARJUM_API_KEY }}
+          ITICK_TOKEN: ${{ secrets.ITICK_TOKEN }}
+        run: python rafano_v417_anti429.py
