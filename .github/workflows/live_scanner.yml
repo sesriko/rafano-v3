@@ -1,49 +1,29 @@
 name: RAFANO LIVE SCANNER 5MENIT
 on:
   schedule:
-    - cron: '*/5 2-8 * * 1-5' # 02:00-08:00 UTC = 09:00-15:00 WIB Senin-Jumat
+    - cron: '*/5 2-8 * * 1-5'
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   live-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-
       - run: pip install yfinance pandas requests matplotlib mplfinance pytz lxml -q
-
-      - name: Download DB + Scanner
-        run: |
-          wget -q https://raw.githubusercontent.com/sesriko/rafano-v3/main/rafano.db -O rafano.db || echo "no db"
-          ls -lh rafano.db || echo "db not found"
-
-      - name: Scan BIG ACCUM + BO MA20
+      - name: Scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ARJUM_API_KEY: ${{ secrets.ARJUM_API_KEY }}
         run: |
-          python -c "
-import rafano_scanner_v417 as scanner
-top10 = scanner.scan_top10()
-print(f'Found {len(top10)}')
-for c in top10[:3]:
-    scanner.plot_v417(c)
-          "
-
-      - name: Upload Charts
-        uses: actions/upload-artifact@v4
+          wget -q https://raw.githubusercontent.com/sesriko/rafano-v3/main/rafano.db -O rafano.db || echo "no db"
+          python rafano_scanner_v417.py
+      - uses: actions/upload-artifact@v4
         with:
-          name: charts-v417-${{ github.run_id }}
+          name: charts-v417
           path: charts_v417/
           retention-days: 7

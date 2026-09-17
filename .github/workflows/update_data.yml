@@ -3,42 +3,27 @@ on:
   schedule:
     - cron: '0 9 * * 1-5'
   workflow_dispatch:
-  push:
-    paths:
-      - 'rafano_v5_600.py'
-
 permissions:
   contents: write
-
 jobs:
   update-db:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-          persist-credentials: true
-
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-
-      - run: pip install yfinance pandas requests lxml
-
-      - name: Update OHLCV 200 + Broksum 5D
-        env:
+      - run: pip install yfinance pandas requests lxml pytz -q
+      - env:
           ARJUM_API_KEY: ${{ secrets.ARJUM_API_KEY }}
         run: |
           python rafano_v5_600.py
-          ls -lh rafano.db
-
-      - name: Commit DB
-        run: |
+          sqlite3 rafano.db "SELECT COUNT(DISTINCT symbol) FROM ohlcv;"
+      - run: |
           git config user.name "rafano-bot"
           git config user.email "bot@rafano.id"
-          git pull origin main --rebase || echo "no pull"
+          git pull origin main --rebase || true
           git add -f rafano.db
-          git commit -m "auto update 200 + 5D $(date '+%Y-%m-%d %H:%M')" || echo "no changes"
+          git commit -m "auto update $(date)" || echo "no changes"
           git push origin main
