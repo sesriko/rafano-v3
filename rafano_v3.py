@@ -6,6 +6,11 @@ RAFANO V4.18 FULL - ANTI-429 + VOL 2x SCANNER
 - Scanner ITICK realtime vs DB YF (lonjakan 2x)
 - Fix race condition rate limiter pakai Lock + Session
 """
+import os, time, datetime, threading, requests, pytz, sqlite3
+import numpy as np, pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.gridspec as gridspec
 from dotenv import load_dotenv
