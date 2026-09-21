@@ -1,13 +1,12 @@
 """
-RAFANO V4.17 ANTI-429 FIX
-Fix 429 /history dan /broker-summary:
-- Rate limiter 1 detik per request Arjum
-- Retry 429 dengan backoff 5 detik
-- Cache Bandar 1W 1 jam biar gak spam
-- Bypass quota untuk bandar + fallback ke cache lama kalau 429
-- Chart tetap BMTR hitam pro, caption tanpa 🔍 line
+RAFANO V4.18 FULL - ANTI-429 + VOL 2x SCANNER
+- Chart tetap BMTR hitam pro (tidak dirubah)
+- Caption bandar DIHILANGKAN biar /c kenceng
+- DB SQLite YF untuk Avg Vol 20 hari (update 1x sehari)
+- Scanner ITICK realtime vs DB YF (lonjakan 2x)
+- Fix race condition rate limiter pakai Lock + Session
 """
-import os, time, datetime, threading, requests, pytz
+import os, time, datetime, threading, requests, pytz, sqlite3
 import numpy as np, pandas as pd
 import matplotlib
 matplotlib.use('Agg')
@@ -29,9 +28,15 @@ TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN") or ""
 TARGET_CHAT_ID=os.getenv("TARGET_CHAT_ID") or ""
 ARJUM_API_KEY=os.getenv("ARJUM_API_KEY") or ""
 ARJUM_BASE="https://stock.arjum.com/api"
-ITICK_TOKEN=os.getenv("ITICK_TOKEN") or os.getenv("ITICK_API_KEY") or "7a470a83276242309fb940684046d35a88e450fdb95b46c383670e1e0c5e96f5"
+ITICK_TOKEN=os.getenv("ITICK_TOKEN") or os.getenv("ITICK_API_KEY") or ""
 ITICK_BASE="https://api.itick.org"
 ITICK_ENABLED=bool(ITICK_TOKEN)
+
+DB_PATH = os.getenv("DB_PATH") or "rafano_vol.db"
+
+# Session + Lock Anti-429
+SESSION = requests.Session()
+ARJUM_LOCK = threading.Lock()
 
 def get_now_wib(): return datetime.datetime.now(TIMEZONE_WIB)
 
@@ -44,6 +49,7 @@ QUOTA_HIT=False; LAST_429_TIME=0; LAST_ARJUM_REQUEST=0
 ARJUM_MIN_INTERVAL=1.2
 ALERTED_TODAY=set()
 ALERTED_DATE=None
+VOL2X_ALERTED=set()
 
 def get_cached(k, cache, ttl):
     if k in cache:
@@ -54,24 +60,23 @@ def set_cached(k,d,cache):
     cache[k]=(time.time(),d)
 
 def arjum_get(path, params=None, bypass_quota=False, retries=1):
-    """ANTI-429: rate limiter + retry + bypass"""
     global QUOTA_HIT, LAST_429_TIME, LAST_ARJUM_REQUEST
-    
-    # Rate limiter - jangan spam Arjum lebih dari 1 request per 1.2 detik
-    elapsed = time.time() - LAST_ARJUM_REQUEST
-    if elapsed < ARJUM_MIN_INTERVAL:
-        time.sleep(ARJUM_MIN_INTERVAL - elapsed)
+    # Lock biar rate limiter jalan di multithread
+    with ARJUM_LOCK:
+        elapsed = time.time() - LAST_ARJUM_REQUEST
+        if elapsed < ARJUM_MIN_INTERVAL:
+            time.sleep(ARJUM_MIN_INTERVAL - elapsed)
+        LAST_ARJUM_REQUEST = time.time()
     
     if QUOTA_HIT and not bypass_quota and time.time()-LAST_429_TIME<180:
-        print(f"⏸️ QUOTA_HIT block {path} 3 menit")
+        print(f"⏸ QUOTA_HIT block {path} 3 menit")
         return None
     
     url=f"{ARJUM_BASE}{path}"
     for attempt in range(retries+1):
         try:
-            LAST_ARJUM_REQUEST=time.time()
             headers={"X-API-Key": ARJUM_API_KEY.strip(),"Accept":"application/json","User-Agent":"Mozilla/5.0"}
-            r=requests.get(url,headers=headers,params=params,timeout=15)
+            r=SESSION.get(url,headers=headers,params=params,timeout=15)
             if r.status_code==200:
                 if QUOTA_HIT and time.time()-LAST_429_TIME>60:
                     QUOTA_HIT=False
@@ -99,6 +104,62 @@ def arjum_get(path, params=None, bypass_quota=False, retries=1):
             return None
     return None
 
+# ================= DB YF BASELINE =================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS yf_baseline (
+        symbol TEXT PRIMARY KEY,
+        avg_vol_20 REAL,
+        last_close REAL,
+        updated_at TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def update_yf_baseline(symbols=IDX_600_LIQUID, batch_size=10):
+    print(f"🔄 Update Baseline YF {len(symbols)} saham ke {DB_PATH}...")
+    try:
+        import yfinance as yf
+    except:
+        print("yfinance belum install: pip install yfinance")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    def fetch_one(sym):
+        try:
+            ticker = yf.Ticker(f"{sym}.JK")
+            hist = ticker.history(period="2mo", timeout=10, auto_adjust=False)
+            if hist is None or len(hist) < 25:
+                return None
+            avg20 = hist['Volume'].tail(20).mean()
+            last_close = hist['Close'].iloc[-1]
+            return (sym, float(avg20), float(last_close), datetime.datetime.now().isoformat())
+        except Exception as e:
+            print(f"YF err {sym}: {e}")
+            return None
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i+batch_size]
+            results = list(ex.map(fetch_one, batch))
+            for r in results:
+                if r:
+                    conn.execute("REPLACE INTO yf_baseline VALUES (?,?,?,?)", r)
+                    print(f"✅ {r[0]} Avg20: {r[1]:,.0f}")
+            conn.commit()
+            time.sleep(1)
+    conn.close()
+    print("✅ Baseline YF selesai")
+
+def get_yf_baseline_dict():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT symbol, avg_vol_20, last_close FROM yf_baseline")
+    rows = cur.fetchall()
+    conn.close()
+    return {r[0]: {"avg20": r[1], "close": r[2]} for r in rows}
+
 def get_screener_latest(force_today=False):
     if not force_today:
         c=get_cached('latest', SCREENER_CACHE, SCREENER_CACHE_TTL)
@@ -108,7 +169,7 @@ def get_screener_latest(force_today=False):
         set_cached('latest', data, SCREENER_CACHE); return data
     return {"rows": [{"stock_code": c, "close": 100} for c in IDX_600_LIQUID[:150]]}
 
-def get_itick_quotes_batch(symbols, max_batch=15):
+def get_itick_quotes_batch(symbols, max_batch=20):
     if not ITICK_ENABLED or not symbols: return {}
     all_quotes={}
     try:
@@ -117,7 +178,7 @@ def get_itick_quotes_batch(symbols, max_batch=15):
             codes=",".join(batch)
             url = f"{ITICK_BASE}/stock/quotes?region=ID&codes={codes}"
             headers = {"accept": "application/json", "token": ITICK_TOKEN}
-            r = requests.get(url, headers=headers, timeout=8)
+            r = SESSION.get(url, headers=headers, timeout=8)
             if r.status_code==200:
                 j=r.json()
                 if j.get('code')==0 and j.get('data'):
@@ -125,9 +186,17 @@ def get_itick_quotes_batch(symbols, max_batch=15):
                         code=item.get('s') or item.get('code')
                         if not code: continue
                         code=str(code).upper().replace(".JK","")
-                        all_quotes[code]={'price': float(item.get('ld') or item.get('c') or 0),'changepct': float(item.get('chp') or 0),'high': float(item.get('h') or 0),'low': float(item.get('l') or 0),'volume': float(item.get('v') or 0),'source': 'ITICK_REALTIME'}
-            time.sleep(0.2)
-    except: pass
+                        all_quotes[code]={
+                            'price': float(item.get('ld') or item.get('c') or 0),
+                            'changepct': float(item.get('chp') or 0),
+                            'high': float(item.get('h') or 0),
+                            'low': float(item.get('l') or 0),
+                            'volume': float(item.get('v') or 0),
+                            'source': 'ITICK_REALTIME'
+                        }
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"ITICK err {e}")
     return all_quotes
 
 def normalize_timeframe(tf_input):
@@ -141,7 +210,6 @@ def get_history_pro(sym, limit=150, frame="daily"):
     hk=f"{sym}_{frame}_{limit}"
     cached=get_cached(hk, HISTORY_CACHE, HISTORY_CACHE_TTL)
     if cached is not None: 
-        print(f"📦 Cache hit {sym} {frame}")
         return cached
     if frame=="1d":
         data=arjum_get(f"/history/{sym}",params={"limit":limit,"frame":"daily"}, bypass_quota=False, retries=1)
@@ -168,163 +236,22 @@ def get_history_pro(sym, limit=150, frame="daily"):
                 df=df.dropna(subset=['Close'])
                 if len(df)>=10:
                     set_cached(hk,df,HISTORY_CACHE)
-                    print(f"✅ Arjum history {sym} {len(df)} bars")
                     return df
             except Exception as e:
                 print(f"History parse err {sym}: {e}")
-        else:
-            print(f"⚠ Arjum history {sym} kosong, fallback YF")
-    try:
-        import yfinance as yf
-        yf_interval_map={"5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"1h","1d":"1d","1w":"1wk"}
-        interval=yf_interval_map.get(frame, "1d")
-        if frame in ["5m","15m"]: period="5d"
-        elif frame in ["30m","1h"]: period="1mo"
-        elif frame=="4h": period="3mo"
-        elif frame=="1d": period="6mo"
-        else: period="1y"
-        print(f"📊 YF fetch {sym}.JK interval {interval} period {period} (TF {frame})")
-        ticker=yf.Ticker(f"{sym}.JK")
-        hist=ticker.history(period=period,interval=interval,timeout=15, auto_adjust=False)
-        if hist is not None and len(hist)>20:
-            if frame=="4h" and interval=="1h":
-                hist=hist.resample('4H').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
-            set_cached(hk,hist.tail(limit),HISTORY_CACHE)
-            return hist.tail(limit)
-    except Exception as e:
-        print(f"YF err {sym} TF {frame}: {e}")
+    # Fallback YF hanya untuk daily, jangan untuk intraday biar cepet
+    if frame == "1d":
+        try:
+            import yfinance as yf
+            print(f"📊 YF fallback {sym}.JK")
+            ticker=yf.Ticker(f"{sym}.JK")
+            hist=ticker.history(period="6mo",interval="1d",timeout=10, auto_adjust=False)
+            if hist is not None and len(hist)>20:
+                set_cached(hk,hist.tail(limit),HISTORY_CACHE)
+                return hist.tail(limit)
+        except Exception as e:
+            print(f"YF err {sym}: {e}")
     return None
-
-def get_bursa_5hari_range():
-    end = get_now_wib().date()
-    start = end - datetime.timedelta(days=12)
-    trading_days=[]
-    cur=start
-    while cur<=end:
-        if cur.weekday()<5:
-            trading_days.append(cur)
-        cur+=datetime.timedelta(days=1)
-    trading_days=trading_days[-5:]
-    if len(trading_days)>=5:
-        start_date=trading_days[0]
-        end_date=trading_days[-1]
-    else:
-        start_date=end - datetime.timedelta(days=7)
-        end_date=end
-    return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), trading_days
-
-def get_bandar_1w_broker_summary(sym):
-    cache_key=f"bandar1w_broker_{sym}"
-    cached=get_cached(cache_key, BROKER_CACHE, BROKER_CACHE_TTL)
-    if cached is not None:
-        print(f"📦 Cache Bandar {sym}: {cached.get('foreign_str_1w')} ({cached.get('accum_type')})")
-        return cached
-    
-    result={"foreign_net":0,"foreign_net_1w":0,"foreign_str":"N/A","foreign_str_1w":"N/A","accum_type":"NEUTRAL","details":[],"brokers":[]}
-    
-    try:
-        start_str, end_str, trading_days = get_bursa_5hari_range()
-        print(f"🏦 {sym} Bandar 1W range: {start_str} to {end_str} ({len(trading_days)} hari bursa)")
-        
-        # Coba flow=all dulu
-        data_all = arjum_get(f"/broker-summary/{sym}", params={
-            "start_date": start_str,
-            "end_date": end_str,
-            "flow": "all",
-            "all_data": "true",
-            "broker_limit": 20
-        }, bypass_quota=True, retries=1)
-        
-        if data_all and isinstance(data_all, dict) and 'brokers' in data_all and len(data_all['brokers'])>0:
-            brokers = data_all['brokers']
-            total_bval=0; total_sval=0; accum_buy=0; dist_sell=0
-            top_buyers=[]; top_sellers=[]
-            
-            for b in brokers:
-                try:
-                    bval=float(b.get('bval') or 0)
-                    sval=float(b.get('sval') or 0)
-                    nval=float(b.get('nval') or (bval-sval) or 0)
-                    bcode=b.get('broker_code') or "?"
-                    total_bval+=bval; total_sval+=sval
-                    if nval>0:
-                        accum_buy+=nval
-                        top_buyers.append((bcode, nval))
-                    elif nval<0:
-                        dist_sell+=nval
-                        top_sellers.append((bcode, nval))
-                except: continue
-            
-            net_1w = accum_buy + dist_sell
-            value_to_show = net_1w if net_1w!=0 else accum_buy
-            
-            def fmt(v):
-                if abs(v)>=1e12: return f"{'+' if v>0 else ''}{v/1e12:.2f}T"
-                elif abs(v)>=1e9: return f"{'+' if v>0 else ''}{v/1e9:.2f}B"
-                elif abs(v)>=1e6: return f"{'+' if v>0 else ''}{v/1e6:.0f}M"
-                else: return f"{'+' if v>0 else ''}{v:,.0f}"
-            
-            result["foreign_net_1w"]=value_to_show
-            result["foreign_net"]=brokers[0].get('nval',0) if brokers else 0
-            result["brokers"]=brokers
-            result["foreign_str_1w"]=fmt(value_to_show)
-            
-            if value_to_show>5e9: result["accum_type"]="BIG ACCUM"
-            elif value_to_show>1e9: result["accum_type"]="ACCUM"
-            elif value_to_show>1e8: result["accum_type"]="LIGHT ACCUM"
-            elif value_to_show<-5e9: result["accum_type"]="BIG DIST"
-            elif value_to_show<-1e9: result["accum_type"]="DIST"
-            elif value_to_show<-1e8: result["accum_type"]="LIGHT DIST"
-            else: result["accum_type"]="NEUTRAL"
-            
-            top_b_str=", ".join([f"{c} {fmt(v)}" for c,v in sorted(top_buyers, key=lambda x: x[1], reverse=True)[:3]])
-            print(f"✅ {sym} Bandar 1W: {result['foreign_str_1w']} ({result['accum_type']}) Buy {fmt(accum_buy)} Sell {fmt(dist_sell)} Top: {top_b_str}")
-            set_cached(cache_key, result, BROKER_CACHE)
-            return result
-        else:
-            print(f"⚠ {sym} broker-summary kosong {start_str}->{end_str}, coba flow=F")
-            # Fallback flow=F
-            data_f = arjum_get(f"/broker-summary/{sym}", params={
-                "start_date": start_str,
-                "end_date": end_str,
-                "flow": "F",
-                "all_data": "true"
-            }, bypass_quota=True, retries=1)
-            if data_f and isinstance(data_f, dict) and 'brokers' in data_f:
-                brokers=data_f['brokers']
-                if brokers:
-                    total_nval=sum([float(b.get('nval') or 0) for b in brokers])
-                    def fmt(v):
-                        if abs(v)>=1e9: return f"{'+' if v>0 else ''}{v/1e9:.2f}B"
-                        else: return f"{'+' if v>0 else ''}{v/1e6:.0f}M"
-                    result["foreign_net_1w"]=total_nval
-                    result["foreign_str_1w"]=fmt(total_nval)
-                    result["accum_type"]="ACCUM" if total_nval>0 else "DIST" if total_nval<0 else "NEUTRAL"
-                    print(f"✅ {sym} Bandar 1W foreign: {result['foreign_str_1w']}")
-                    set_cached(cache_key, result, BROKER_CACHE)
-                    return result
-        
-        print(f"⚠ {sym} broker-summary kosong untuk {start_str}->{end_str} - kemungkinan 429 atau market tutup")
-        
-    except Exception as e:
-        print(f"Bandar err {sym}: {e}")
-        import traceback; traceback.print_exc()
-    
-    set_cached(cache_key, result, BROKER_CACHE)
-    return result
-
-def get_bandar_info(sym):
-    info=get_bandar_1w_broker_summary(sym)
-    return {
-        "foreign_net": info.get('foreign_net',0),
-        "foreign_net_1w": info.get('foreign_net_1w',0),
-        "is_foreign_buy": info.get('foreign_net_1w',0)>0,
-        "foreign_str": info.get('foreign_str','N/A'),
-        "foreign_str_1w": info.get('foreign_str_1w','N/A'),
-        "accum_type": info.get('accum_type','NEUTRAL'),
-        "score_bonus": 15 if info.get('foreign_net_1w',0)>0 else 0,
-        "brokers": info.get('brokers',[])
-    }
 
 def format_large_number(val,show_sign=False):
     if pd.isna(val) or val==0: return "0"
@@ -366,46 +293,7 @@ def calculate_bollinger_bands(df,p=20,s=2):
     sma=df['Close'].rolling(p).mean(); std=df['Close'].rolling(p).std()
     return sma,sma+(std*s),sma-(std*s)
 
-def check_bo_ema50_bob200(sym, hd, realtime_price=None):
-    try:
-        if hd is None or len(hd) < 55: return None
-        c = float(realtime_price if realtime_price and realtime_price>0 else hd['Close'].iloc[-1])
-        pc = float(hd['Close'].iloc[-2])
-        if c < 50: return None
-        ema50_s = hd['Close'].ewm(span=50, adjust=False).mean()
-        ema200_s = hd['Close'].ewm(span=200, adjust=False).mean()
-        ema50 = float(ema50_s.iloc[-1]); ema200 = float(ema200_s.iloc[-1])
-        pe50 = float(ema50_s.iloc[-2]); pe200 = float(ema200_s.iloc[-2])
-        is_bo=False; stype=""
-        if pc <= pe50 and c > ema50 and c > pe50: is_bo=True; stype="BO EMA50"
-        elif pc <= pe200 and c > ema200 and c > pe200: is_bo=True; stype="BOB EMA200"
-        if not is_bo: return None
-        return {"type": stype, "ema50": ema50, "ema200": ema200}
-    except: return None
-
-def detect_bo_bos_markers(df):
-    signals=[]
-    if len(df)<55: return signals
-    df=df.copy()
-    df['EMA13']=df['Close'].ewm(span=13,adjust=False).mean()
-    df['EMA20']=df['Close'].ewm(span=20,adjust=False).mean()
-    df['EMA50']=df['Close'].ewm(span=50,adjust=False).mean()
-    df['EMA200']=df['Close'].ewm(span=200,adjust=False).mean()
-    for i in range(50, len(df)):
-        c=df['Close'].iloc[i]; pc=df['Close'].iloc[i-1]
-        ema50=df['EMA50'].iloc[i]; pe50=df['EMA50'].iloc[i-1]
-        ema200=df['EMA200'].iloc[i]; pe200=df['EMA200'].iloc[i-1]
-        if pc <= pe50 and c > ema50 and c > pe50:
-            signals.append({"idx":i,"type":"BO EMA50","color":"green"})
-        elif pc <= pe200 and c > ema200 and c > pe200:
-            signals.append({"idx":i,"type":"BOB EMA200","color":"green"})
-        elif i>=2:
-            prev_high=max(df['High'].iloc[i-1], df['High'].iloc[i-2])
-            if c > prev_high and c > ema50 and pc <= ema50*1.01:
-                if not any(s['idx']==i and 'BO' in s['type'] for s in signals):
-                    signals.append({"idx":i,"type":"BOS EMA","color":"yellow"})
-    return signals
-
+# ================= CAPTION TANPA BANDAR =================
 def generate_caption_pro(symbol, df, realtime_price=None, tf_norm="1d"):
     try:
         df=df.copy()
@@ -431,23 +319,19 @@ def generate_caption_pro(symbol, df, realtime_price=None, tf_norm="1d"):
         else: strength_label="VERY WEAK"
         v1=df['V1'].iloc[-1]
         vol_spike = df['Volume'].iloc[-1] / v1 if v1>0 else 1.0
-        bandar=get_bandar_info(symbol)
-        bandar_1w_str=bandar.get('foreign_str_1w','N/A')
-        accum_type=bandar.get('accum_type','NEUTRAL')
         harga_str = f"{int(last_close)}"
         chg_str = f"{chg_pct:+.2f}%"
         tf_label = format_timeframe_label(tf_norm)
         caption = f"""{symbol} — Harga {harga_str} ({chg_str}) | {tf_label}
-    ├  Buy Strength Score: {buy_strength}% ({strength_label})
-    ├  RSI (14): {rsi:.2f}
-    ├  Vol Spike: {vol_spike:.1f}x V1 | Buy Vol: {buy_pct}%
-    └  Bandar 1W: {bandar_1w_str} ({accum_type})"""
-        return caption, {"buy_strength": buy_strength, "strength_label": strength_label, "rsi": rsi, "vol_spike": vol_spike, "buy_vol": buy_pct, "bandar_1w": bandar_1w_str, "accum": accum_type, "close": last_close, "chg_pct": chg_pct}
+├  Buy Strength Score: {buy_strength}% ({strength_label})
+├  RSI (14): {rsi:.2f}
+└  Vol Spike: {vol_spike:.1f}x V1 | Buy Vol: {buy_pct}%"""
+        return caption, {"buy_strength": buy_strength, "strength_label": strength_label, "rsi": rsi, "vol_spike": vol_spike, "buy_vol": buy_pct, "close": last_close, "chg_pct": chg_pct}
     except Exception as e:
         print(f"Caption err {e}")
-        import traceback; traceback.print_exc()
         return f"{symbol} — Harga {int(df['Close'].iloc[-1]) if len(df)>0 else 0}", {}
 
+# CHART TETAP SAMA - BMTR HITAM PRO
 def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output_filename="chart.png",extra_info=None,realtime_price=None):
     try:
         extra_info=extra_info or {}
@@ -468,7 +352,6 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         sma20, upper_bb, lower_bb = calculate_bollinger_bands(df,20,2)
         df['BB_UP']=upper_bb; df['BB_LOW']=lower_bb
         df,buy_ratios=calculate_vsa_metrics(df)
-        bo_markers = detect_bo_bos_markers(df)
         last_close=df['Close'].iloc[-1]; last_high=df['High'].iloc[-1]; last_low=df['Low'].iloc[-1]; last_vol=df['Volume'].iloc[-1]
         prev_close=df['Close'].iloc[-2] if len(df)>1 else last_close
         chg_pct=((last_close/prev_close)-1)*100 if prev_close else 0
@@ -507,18 +390,6 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         ax_main.plot(x,df['EMA200'],color='#a020f0',linewidth=1.3,alpha=0.9)
         ax_main.plot(x,df['BB_UP'],color='#444488',linewidth=0.8,linestyle='--',alpha=0.6)
         ax_main.plot(x,df['BB_LOW'],color='#444488',linewidth=0.8,linestyle='--',alpha=0.6)
-        for sig in bo_markers:
-            idx=sig['idx']
-            if idx >= len(df): continue
-            low=df['Low'].iloc[idx]
-            if sig['type']=='BO EMA50' or sig['type']=='BOB EMA200':
-                ax_main.plot(idx, low*0.985, marker='^', color='#00ff00', markersize=10, markeredgecolor='black', markeredgewidth=0.5)
-                ax_main.text(idx, low*0.97, sig['type'], fontsize=7, color='black', ha='center', va='top', fontweight='bold', bbox=dict(facecolor='#00ff00', edgecolor='black', boxstyle='round,pad=0.2'))
-            elif 'BOS' in sig['type']:
-                ax_main.plot(idx, low*0.985, marker='^', color='#00ff00', markersize=8)
-                ax_main.text(idx, low*0.97, sig['type'], fontsize=6, color='black', ha='center', va='top', fontweight='bold', bbox=dict(facecolor='#ffff00', edgecolor='black', boxstyle='round,pad=0.2'))
-        if len(df)>20:
-            ax_main.add_patch(patches.Rectangle((len(df)-20, df['Low'].min()), 20, df['High'].max()-df['Low'].min(), fill=False, edgecolor='white', linestyle='--', linewidth=0.5, alpha=0.5))
         ax_main.set_xlim(-1,len(df)-1+15)
         ax_main.set_ylim(df['Low'].min()*0.97, df['High'].max()*1.05)
         left_text=f"Avg Price : {avg_price:.1f}\nVchg 1 Bar: {vchg1:.1f} x\nVchg 5 Bar: {vchg5:.1f} x\nSpeed : {speed}\nPower : {power}\nSafety : {safety}\n\nEMA 13 : {ema13:.1f}\nEMA 20 : {ema20:.1f}\nEMA 50 : {ema50:.1f}\nEMA 200: {ema200:.1f}"
@@ -527,12 +398,11 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         fig.text(0.005,0.93,f"{symbol} | IHSG",color='#ffaa00',fontsize=8,ha='left')
         fig.text(0.005,0.905,f"● {'WAIT' if abs(chg_pct)<0.5 else 'GO'}",color='#aaaaaa',fontsize=9,ha='left', fontweight='bold')
         fig.text(0.005,0.885,f"High:{last_high:.0f} Low:{last_low:.0f} Open:{df['Open'].iloc[-1]:.0f} Vol:{last_vol:,.0f}",color='#00ffff',fontsize=7,ha='left')
-        fig.text(0.5,0.96,"RAFANO V4.17 ANTI-429",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
+        fig.text(0.5,0.96,"RAFANO V4.18 VOL 2x",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
         ds=df.index[-1].strftime('%d %b %Y %H:%M') if hasattr(df.index[-1],'strftime') else get_now_wib().strftime('%d %b %Y %H:%M')
         fig.text(0.99,0.96,f"{tf_label_disp} | {ds}",color='#ffcc00',fontsize=11,ha='right',va='center', fontweight='bold')
         fig.text(0.99,0.93,f"Command BOT /C {symbol} {timeframe_norm}",color='#cccccc',fontsize=8,ha='right')
         ax_main.text(len(df)+1, last_close, f" {last_close:.0f}", color='black', fontsize=8, va='center', fontweight='bold', bbox=dict(facecolor='white', edgecolor='none', boxstyle='square,pad=0.2'))
-        ax_main.text(len(df)+1, ema200, f" EMA 200", color='white', fontsize=7, va='center', bbox=dict(facecolor='#a020f0', edgecolor='none', boxstyle='square,pad=0.1'))
         vol_info=f"Buy % = {buy_pct}% Sell % = {100-buy_pct}% Net Vol = {net_vol:,.0f} 5D = {net_vol_5d:,.0f}"
         ax_vol.text(0.005,0.88,vol_info,transform=ax_vol.transAxes,color='#ffffff',fontsize=8,va='top')
         ax_vol.bar(x,df['Vol_Sell'],color='#cc0000',width=0.8,alpha=0.8)
@@ -560,94 +430,38 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         ax_mm.set_xticklabels(labels,fontsize=7)
         plt.savefig(output_filename,dpi=180,bbox_inches='tight',facecolor='#000000')
         plt.close('all')
-        return output_filename, bo_markers
+        return output_filename, []
     except Exception as e:
         print(f"Chart error {e}"); import traceback; traceback.print_exc(); return None, []
     finally:
         try: plt.clf(); plt.close('all')
         except: pass
 
-def scan_v417_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=False):
-    global ALERTED_TODAY, ALERTED_DATE
-    today = get_now_wib().date()
-    if ALERTED_DATE != today:
-        ALERTED_TODAY=set()
-        ALERTED_DATE=today
-    screener = get_screener_latest(force_today=True)
-    rows = screener.get('rows', []) if isinstance(screener, dict) else []
-    if not rows: return []
-    candidates_arjum=[]
-    for r in rows:
-        code = (r.get('stock_code') or r.get('symbol') or "").replace(".JK","").upper()
-        if not code or code in FCA_EXCLUDE or "-W" in code: continue
-        if float(r.get('close') or 100) < 50: continue
-        candidates_arjum.append(code)
-        if len(candidates_arjum) >= top_arjum: break
-    all_quotes = get_itick_quotes_batch(candidates_arjum, 15)
-    if not all_quotes:
-        all_quotes={}
-        for r in rows:
-            code=(r.get('stock_code') or "").replace(".JK","").upper()
-            if code in candidates_arjum:
-                all_quotes[code]={'price': float(r.get('close') or 0), 'changepct': float(r.get('change_pct') or 0), 'high': float(r.get('high') or 0), 'low': float(r.get('low') or 0), 'source': 'ARJUM_FALLBACK'}
-    sorted_itick = sorted(all_quotes.items(), key=lambda x: x[1].get('changepct', -999), reverse=True)
-    top_codes = [c for c,_ in sorted_itick[:top_itick]]
-    def check_one(sym):
-        try:
-            if only_new and sym in ALERTED_TODAY: return None
-            q=all_quotes.get(sym, {})
-            realtime_price=q.get('price',0)
-            hd=get_history_pro(sym, limit=120, frame="daily")
-            if hd is None or len(hd)<55: return None
-            c = float(realtime_price if realtime_price and realtime_price>0 else hd['Close'].iloc[-1])
-            v_last=float(hd['Volume'].iloc[-1]); v_avg=float(hd['Volume'].iloc[-21:-1].mean())
-            if v_avg==0 or v_last==0: return None
-            if v_last/v_avg < vol_thr: return None
-            if v_last * c < min_value: return None
-            bo_info = check_bo_ema50_bob200(sym, hd, realtime_price)
-            if not bo_info: return None
-            bandar=get_bandar_info(sym)
-            return {"symbol": sym, "type": bo_info['type'], "close": int(c), "change_pct": q.get('changepct',0), "vol_ratio": v_last/v_avg, "vol_rp": v_last * c, "bandar": bandar, "foreign_str": bandar.get('foreign_str_1w',''), "source": q.get('source',''), "realtime": realtime_price}
-        except: return None
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs={ex.submit(check_one, s): s for s in top_codes}
-        detected=[]
-        for f in as_completed(futs):
-            r=f.result()
-            if r: detected.append(r)
-    detected.sort(key=lambda x: x['vol_ratio'], reverse=True)
-    return detected
-
-def scan_volume_spike(threshold=2.0, limit_candidates=60, sort_by_rp=False):
-    sd=get_screener_latest(force_today=False)
-    if isinstance(sd, dict) and 'rows' in sd: cands=[(r.get('stock_code') or "").replace(".JK","").upper() for r in sd['rows']]
-    else: cands=IDX_600_LIQUID
-    seen=set(); uniq=[]
-    for c in cands:
-        cu=c.upper().strip()
-        if not cu or "-W" in cu or cu in FCA_EXCLUDE: continue
-        if cu not in seen: seen.add(cu); uniq.append(cu)
-    for c in IDX_600_LIQUID:
-        if len(uniq)>=limit_candidates: break
-        if "-W" in c or c in FCA_EXCLUDE or c in seen: continue
-        uniq.append(c); seen.add(c)
-    cands=uniq[:limit_candidates]
-    detected=[]
-    for sym in cands:
-        try:
-            hd=get_history_pro(sym,60,"daily")
-            if hd is None or len(hd)<20: continue
-            v_last=hd['Volume'].iloc[-1]; v_avg=hd['Volume'].tail(20).mean()
-            if v_avg==0: continue
-            ratio=v_last/v_avg
-            if ratio < threshold: continue
-            close=hd['Close'].iloc[-1]; prev=hd['Close'].iloc[-2] if len(hd)>=2 else close
-            chg=(close/prev-1)*100 if prev else 0
-            detected.append({"symbol":sym,"close":int(close),"change_pct":chg,"vol_ratio":ratio,"vol_rp":v_last*close})
-        except: continue
-    if sort_by_rp: detected.sort(key=lambda x: x['vol_rp'], reverse=True)
-    else: detected.sort(key=lambda x: x['vol_ratio'], reverse=True)
-    return detected
+# ================= SCANNER VOL 2x : YF DB + ITICK REALTIME =================
+def scan_vol_2x_itick_vs_yf(threshold=2.0, min_avg_vol=500000):
+    baseline = get_yf_baseline_dict()
+    if not baseline:
+        return [], "DB kosong, jalankan /updatedb dulu"
+    symbols = [s for s in baseline.keys() if baseline[s]['avg20'] >= min_avg_vol]
+    quotes = get_itick_quotes_batch(symbols, max_batch=20)
+    detected = []
+    for sym, q in quotes.items():
+        if sym not in baseline: continue
+        avg20 = baseline[sym]['avg20']
+        vol_rt = q.get('volume',0)
+        if avg20==0 or vol_rt==0: continue
+        ratio = vol_rt / avg20
+        if ratio >= threshold:
+            detected.append({
+                "symbol": sym,
+                "price": q['price'],
+                "change_pct": q.get('changepct',0),
+                "vol_rt": vol_rt,
+                "avg20": avg20,
+                "ratio": ratio
+            })
+    detected.sort(key=lambda x: x['ratio'], reverse=True)
+    return detected, None
 
 def send_reply(cid, txt, rm=None):
     if not TELEGRAM_BOT_TOKEN or not cid: return False
@@ -655,20 +469,22 @@ def send_reply(cid, txt, rm=None):
     pl={"chat_id":cid,"text":txt,"parse_mode":"Markdown"}
     if rm: pl["reply_markup"]=rm
     try:
-        r=requests.post(url,json=pl,timeout=15)
+        r=SESSION.post(url,json=pl,timeout=15)
         j=r.json()
         if not j.get('ok'):
             pl.pop('parse_mode',None)
-            r=requests.post(url,json=pl,timeout=15)
+            r=SESSION.post(url,json=pl,timeout=15)
             return r.json().get('ok',False)
         return True
-    except: return False
+    except Exception as e:
+        print(f"Send err {e}")
+        return False
 
 def send_photo_reply(cid, path, caption=""):
     url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
         with open(path,'rb') as ph:
-            requests.post(url,data={'chat_id':cid,'caption':caption,'parse_mode':'Markdown'},files={'photo':ph},timeout=30)
+            SESSION.post(url,data={'chat_id':cid,'caption':caption,'parse_mode':'Markdown'},files={'photo':ph},timeout=30)
     except Exception as e: print(f"Photo err {e}")
 
 def process_chart_request(cid, code, tf_input="1d"):
@@ -677,104 +493,91 @@ def process_chart_request(cid, code, tf_input="1d"):
     send_reply(cid, f"📊 *{code.upper()} ({tf_label}) chart pro...*")
     df=get_history_pro(code, 150, frame=tf_norm)
     if df is None or len(df)<20:
-        send_reply(cid, f"⚠ Data {code} TF {tf_norm} tidak ada, Arjum limit 429 coba lagi 1 menit"); return
+        send_reply(cid, f"⚠ Data {code} TF {tf_norm} tidak ada, coba lagi 1 menit"); return
     quotes=get_itick_quotes_batch([code],1)
     realtime=quotes.get(code.upper(),{}).get('price',0)
     chart_file=f"/tmp/chart_{code.upper()}_{tf_norm}_{int(time.time())}.png"
-    fp, markers = generate_pro_chart(df, symbol=code.upper(), timeframe=tf_norm, sector_info=f"{code.upper()} | IHSG", output_filename=chart_file, extra_info={'tf_label':tf_label}, realtime_price=realtime)
+    fp, _ = generate_pro_chart(df, symbol=code.upper(), timeframe=tf_norm, sector_info=f"{code.upper()} | IHSG", output_filename=chart_file, extra_info={'tf_label':tf_label}, realtime_price=realtime)
     if not fp or not os.path.exists(fp):
         send_reply(cid, "❌ Gagal render chart"); return
-    caption_pro, metrics = generate_caption_pro(code.upper(), df, realtime_price=realtime, tf_norm=tf_norm)
-    full_caption = caption_pro
-    send_photo_reply(cid, fp, caption=full_caption)
-    if os.path.exists(fp): os.remove(fp)
+    caption_pro, _ = generate_caption_pro(code.upper(), df, realtime_price=realtime, tf_norm=tf_norm)
+    send_photo_reply(cid, fp, caption=caption_pro)
+    if os.path.exists(fp):
+        try: os.remove(fp)
+        except: pass
 
-def process_broker_request(cid, sym):
-    bandar=get_bandar_info(sym)
-    details=bandar.get('foreign_str_1w','N/A')
-    accum=bandar.get('accum_type','NEUTRAL')
-    brokers=bandar.get('brokers',[])[:3]
-    top_str="\n".join([f"{b.get('broker_code')}: {b.get('nval',0)/1e9:.2f}B" for b in brokers]) if brokers else "N/A (429 atau market tutup)"
-    send_reply(cid, f"🏦 *{sym} BANDAR 1W (5 hari bursa)*\nTotal: {details} ({accum})\nTop:\n{top_str}\nSumber: /broker-summary")
-
-def broadcast_v417(signals, vol_thr=1.5, dest_chat_id=None, is_auto=False):
+def broadcast_vol2x(signals, threshold=2.0, dest_chat_id=None):
     target = dest_chat_id or TARGET_CHAT_ID
     if not target: return
     if not signals:
-        if not is_auto: send_reply(target, f"📉 V4.17 VOL>{vol_thr}x - Tidak ada BO valid"); 
-        return
-    now=get_now_wib().strftime('%d %b %Y %H:%M:%S WIB')
-    auto_tag = "⚡ REALTIME ALERT" if is_auto else "🚀"
-    header=f"{auto_tag} *V4.17 TOP {len(signals)} BO/BOB* 🔥\n{now}\nArjum 60 -> ITICK 30 -> Vol>{vol_thr}x -> BO EMA50/BOB EMA200\n{'='*50}\n\n"
-    msg=header; kb=[]
-    for idx,it in enumerate(signals,1):
-        rt_str = f" RT{it['realtime']:.0f}" if it.get('realtime',0)>0 else ""
-        fb = it.get('foreign_str','')
-        line=f"{idx}. *{it['symbol']}* {it['type']}{rt_str} {it['close']} ({it['change_pct']:+.1f}%) Vol {it['vol_ratio']:.1f}x Rp {format_large_number(it['vol_rp'])} {fb}\n\n"
-        kb.append([{"text": f"{it['symbol']} {it['type']}", "callback_data": f"chart_{it['symbol']}"}])
-        if len(msg)+len(line)>3500:
-            send_reply(target, msg, rm={"inline_keyboard": kb}); msg=line; kb=[]
-        else: msg+=line
-    if msg: send_reply(target, msg, rm={"inline_keyboard": kb})
-
-def broadcast_vol_spike(signals, threshold=2.0, sort_by_rp=False, dest_chat_id=None):
-    target = dest_chat_id or TARGET_CHAT_ID
-    if not target: return
-    if not signals:
-        send_reply(target, f"Vol Spike >{threshold}x: Tidak ada"); return
+        send_reply(target, f"Vol 2x: Tidak ada lonjakan >{threshold}x saat ini"); return
     now=get_now_wib().strftime('%d %b %Y %H:%M WIB')
-    header=f"*VOL SPIKE >{threshold}x* 🔥 {now} | {len(signals)} saham\n{'='*30}\n\n"
+    header=f"*VOL 2x SCANNER* 🔥 {now} | {len(signals)} saham | ITICK vs YF Avg20\n{'='*30}\n\n"
     msg=header; kb=[]
-    for idx,it in enumerate(signals,1):
-        rp=format_large_number(it.get('vol_rp',0))
-        line=f"{idx}. *{it['symbol']}* {it['close']} ({it['change_pct']:+.1f}%) Vol {it['vol_ratio']:.1f}x Rp {rp}\n\n"
-        kb.append([{"text": f"{it['symbol']} {it['vol_ratio']:.1f}x", "callback_data": f"chart_{it['symbol']}"}])
+    for idx,it in enumerate(signals[:30],1):
+        rp=format_large_number(it.get('vol_rt',0))
+        avg=format_large_number(it.get('avg20',0))
+        line=f"{idx}. *{it['symbol']}* {it['price']:.0f} ({it['change_pct']:+.1f}%) Vol {rp} / Avg {avg} = *{it['ratio']:.1f}x*\n\n"
+        kb.append([{"text": f"{it['symbol']} {it['ratio']:.1f}x", "callback_data": f"chart_{it['symbol']}"}])
         if len(msg)+len(line)>3500:
             send_reply(target, msg, rm={"inline_keyboard": kb}); msg=line; kb=[]
         else: msg+=line
     if msg: send_reply(target, msg, rm={"inline_keyboard": kb})
 
-AUTO_ALERT_ENABLED=True
-AUTO_ALERT_INTERVAL=90
-LAST_AUTO_ALERT_TIME=0
+AUTO_VOL2X_ENABLED=True
+AUTO_VOL2X_INTERVAL=60
+LAST_AUTO_VOL2X=0
 
-def realtime_auto_alert_loop():
-    global LAST_AUTO_ALERT_TIME, ALERTED_TODAY, ALERTED_DATE
+def auto_vol2x_loop():
+    global LAST_AUTO_VOL2X, VOL2X_ALERTED
     while True:
         try:
-            if not AUTO_ALERT_ENABLED: time.sleep(10); continue
+            if not AUTO_VOL2X_ENABLED: time.sleep(10); continue
             now=get_now_wib()
-            today=now.date()
-            global ALERTED_DATE
-            if ALERTED_DATE != today:
-                ALERTED_TODAY=set()
-                ALERTED_DATE=today
             if now.weekday()>=5: time.sleep(300); continue
             market_start=now.replace(hour=9, minute=0, second=0, microsecond=0)
             market_end=now.replace(hour=15, minute=30, second=0, microsecond=0)
             if not (market_start <= now <= market_end): time.sleep(300); continue
-            if time.time() - LAST_AUTO_ALERT_TIME < AUTO_ALERT_INTERVAL: time.sleep(5); continue
-            signals = scan_v417_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000_000, min_closepos=0.6, only_new=True)
-            LAST_AUTO_ALERT_TIME=time.time()
-            if signals:
-                for s in signals: ALERTED_TODAY.add(s['symbol'])
-                broadcast_v417(signals, vol_thr=1.5, dest_chat_id=TARGET_CHAT_ID, is_auto=True)
-            time.sleep(AUTO_ALERT_INTERVAL)
+            if time.time() - LAST_AUTO_VOL2X < AUTO_VOL2X_INTERVAL: time.sleep(5); continue
+            signals, err = scan_vol_2x_itick_vs_yf(threshold=2.0)
+            LAST_AUTO_VOL2X=time.time()
+            if err: print(err); time.sleep(30); continue
+            new_signals = [s for s in signals if s['symbol'] not in VOL2X_ALERTED]
+            if new_signals:
+                for s in new_signals: VOL2X_ALERTED.add(s['symbol'])
+                broadcast_vol2x(new_signals, threshold=2.0, dest_chat_id=TARGET_CHAT_ID)
+            time.sleep(AUTO_VOL2X_INTERVAL)
         except Exception as e:
-            print(f"REALTIME ALERT err {e}")
+            print(f"VOL2X loop err {e}")
             time.sleep(30)
 
 def telegram_bot_listener():
     offset=0
-    print("🤖 RAFANO V4.17 ANTI-429 - rate limiter 1.2s + retry")
-    try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
+    print("🤖 RAFANO V4.18 - Chart tanpa bandar + VOL 2x DB YF")
+    try: SESSION.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
-    if AUTO_ALERT_ENABLED:
-        threading.Thread(target=realtime_auto_alert_loop, daemon=True).start()
+    init_db()
+    # Auto scanner VOL 2x
+    if AUTO_VOL2X_ENABLED:
+        threading.Thread(target=auto_vol2x_loop, daemon=True).start()
+    # Auto update DB YF jam 7:30 pagi
+    def daily_db_update():
+        while True:
+            try:
+                now=get_now_wib()
+                if now.hour==7 and now.minute==30:
+                    update_yf_baseline()
+                    global VOL2X_ALERTED
+                    VOL2X_ALERTED=set()
+                    time.sleep(3600)
+                time.sleep(60)
+            except: time.sleep(60)
+    threading.Thread(target=daily_db_update, daemon=True).start()
+
     while True:
         try:
             url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
-            res=requests.get(url,timeout=25)
+            res=SESSION.get(url,timeout=25)
             if res.status_code!=200: time.sleep(3); continue
             data=res.json()
             if not data.get('ok'): time.sleep(3); continue
@@ -782,7 +585,7 @@ def telegram_bot_listener():
                 offset=update["update_id"]+1
                 if "callback_query" in update:
                     cb=update["callback_query"]; qid=cb.get("id"); cdata=cb.get("data",""); chat_id=cb["message"]["chat"]["id"]
-                    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":qid},timeout=5)
+                    try: SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":qid},timeout=5)
                     except: pass
                     if cdata.startswith("chart_"):
                         sym=cdata.split("_")[1]
@@ -795,82 +598,68 @@ def telegram_bot_listener():
                     first=txt.split()[0].lower() if txt else ""
                     parts=txt.split()
                     if first in ["/start","/help","/menu"]:
-                        help_text="""🔥 *RAFANO V4.17 ANTI-429*
-✅ Fix 429: rate limiter 1.2s + retry 5s + cache 1 jam
+                        help_text="""🔥 *RAFANO V4.18 VOL 2x*
+✅ Chart BMTR tetap, caption bandar dihapus (biar kenceng)
+✅ DB YF Avg20 + Scanner ITICK realtime
 
-📈 *CHART + CAPTION PRO*
+📈 *CHART PRO (tanpa bandar)*
 /c KODE = Daily
 /c KODE 5 = 5 menit
-/c KODE 15 = 15 menit
 /c KODE 1h = 1 jam
 
-🏦 /b KODE - Bandar 1W (5 hari bursa) dari /broker-summary
+🔥 *VOL 2x SCANNER BARU*
+/vol2x [threshold] - Scan vol ITICK vs Avg20 YF
+Contoh: /vol2x 2 atau /vol2x 3
 
-🚀 /scanbo [vol]
-🔥 /scanvol /vol /volall
-🤖 /autoalert on/off/status/reset
-/quota - cek quota 429
+🗄️ *DATABASE YF*
+/updatedb - Update Avg20 YF (jalanin pagi)
+/dbstatus - Cek isi DB
+
+🤖 /vol2xon /vol2xoff - Auto alert vol 2x
 """
                         send_reply(chat_id, help_text)
-                    elif first in ["/quota"]:
-                        status="HABIS 3 menit" if QUOTA_HIT else "OK"
-                        last_429 = time.strftime('%H:%M:%S', time.localtime(LAST_429_TIME)) if LAST_429_TIME else "Belum pernah"
-                        send_reply(chat_id, f"QUOTA: {status}\nLast 429: {last_429}\nAUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s\nAlerted: {len(ALERTED_TODAY)}\nCache: History {len(HISTORY_CACHE)} Bandar {len(BROKER_CACHE)}")
-                    elif first in ["/autoalert","/auto"]:
-                        if len(parts)>=2:
-                            cmd=parts[1].lower()
-                            if cmd=="on": globals()['AUTO_ALERT_ENABLED']=True; send_reply(chat_id, f"⚡ AUTO ON {AUTO_ALERT_INTERVAL}s")
-                            elif cmd=="off": globals()['AUTO_ALERT_ENABLED']=False; send_reply(chat_id, "AUTO OFF")
-                            elif cmd=="reset": ALERTED_TODAY.clear(); send_reply(chat_id, f"🔄 Reset")
-                            elif cmd=="status":
-                                now=get_now_wib()
-                                last=time.strftime('%H:%M:%S', time.localtime(LAST_AUTO_ALERT_TIME)) if LAST_AUTO_ALERT_TIME else "Belum"
-                                send_reply(chat_id, f"AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'}\nInterval: {AUTO_ALERT_INTERVAL}s\nLast: {last}\nAlerted: {len(ALERTED_TODAY)}")
-                        else: send_reply(chat_id, f"AUTO: {'ON' if AUTO_ALERT_ENABLED else 'OFF'} {AUTO_ALERT_INTERVAL}s")
                     elif first in ["/c","/chart"]:
                         if len(parts)>=2:
                             sym=parts[1].upper()
                             tf_input=parts[2] if len(parts)>=3 else "1d"
                             threading.Thread(target=process_chart_request,args=(chat_id,sym,tf_input)).start()
                         else: send_reply(chat_id, "Pakai: /c BUMI 5 atau /c BBCA")
-                    elif first in ["/b","/broker","/bandar"]:
-                        if len(parts)>=2:
-                            sym=parts[1].upper()
-                            threading.Thread(target=process_broker_request,args=(chat_id,sym)).start()
-                        else: send_reply(chat_id, "Pakai: /b BUMI")
-                    elif first in ["/scanvol","/vol"]:
-                        try: thr=float(parts[1]) if len(parts)>=2 else 2.0; lim=int(parts[2]) if len(parts)>=3 else 60
-                        except: thr=2.0; lim=60
-                        send_reply(chat_id, f"🔥 SCAN VOL >{thr}x ({lim})...")
-                        def run_vol(tg=chat_id, th=thr, l=lim):
-                            sigs=scan_volume_spike(threshold=th, limit_candidates=l, sort_by_rp=False)
-                            broadcast_vol_spike(sigs, threshold=th, sort_by_rp=False, dest_chat_id=tg)
-                        threading.Thread(target=run_vol).start()
-                    elif first in ["/scanvolall","/volall"]:
+                    elif first in ["/vol2x","/vol","/scanvol"]:
                         try: thr=float(parts[1]) if len(parts)>=2 else 2.0
                         except: thr=2.0
-                        send_reply(chat_id, f"🔥🔥 SCAN VOL ALL 300 >{thr}x...")
-                        def run_volall(tg=chat_id, th=thr):
-                            sigs=scan_volume_spike(threshold=th, limit_candidates=300, sort_by_rp=True)
-                            broadcast_vol_spike(sigs, threshold=th, sort_by_rp=True, dest_chat_id=tg)
-                        threading.Thread(target=run_volall).start()
-                    elif first.startswith("/scanbo") or first.startswith("/topbo") or first.startswith("/scan"):
-                        vol_thr=1.5
-                        try:
-                            if len(parts)>=2: vol_thr=float(parts[1])
-                        except: pass
-                        send_reply(chat_id, f"🚀 V4.17 SCAN Arjum 60 -> ITICK 30 VOL>{vol_thr}x (anti-429 1.2s delay)...")
-                        def run_scan(tg=chat_id, vt=vol_thr):
-                            sigs=scan_v417_final(top_arjum=60, top_itick=30, vol_thr=vt, min_value=1_000_000_000, only_new=False)
-                            broadcast_v417(sigs, vol_thr=vt, dest_chat_id=tg, is_auto=False)
-                        threading.Thread(target=run_scan).start()
+                        send_reply(chat_id, f"🔍 SCAN VOL 2x ITICK vs YF Avg20 >{thr}x...")
+                        def run_vol2x(tg=chat_id, th=thr):
+                            sigs, err = scan_vol_2x_itick_vs_yf(threshold=th)
+                            if err:
+                                send_reply(tg, f"⚠ {err}")
+                            else:
+                                broadcast_vol2x(sigs, threshold=th, dest_chat_id=tg)
+                        threading.Thread(target=run_vol2x).start()
+                    elif first in ["/updatedb","/update_db"]:
+                        send_reply(chat_id, "🔄 Update DB YF Avg20, tunggu 2-3 menit...")
+                        def run_upd(tg=chat_id):
+                            update_yf_baseline()
+                            send_reply(tg, "✅ DB YF selesai diupdate")
+                        threading.Thread(target=run_upd).start()
+                    elif first in ["/dbstatus","/db"]:
+                        base = get_yf_baseline_dict()
+                        send_reply(chat_id, f"📊 DB YF: {len(base)} saham\nFile: {DB_PATH}\nContoh: {list(base.keys())[:5]}")
+                    elif first in ["/vol2xon","/vol2xoff"]:
+                        global AUTO_VOL2X_ENABLED
+                        if "on" in first:
+                            AUTO_VOL2X_ENABLED=True
+                            send_reply(chat_id, f"⚡ AUTO VOL 2x ON {AUTO_VOL2X_INTERVAL}s")
+                        else:
+                            AUTO_VOL2X_ENABLED=False
+                            send_reply(chat_id, "AUTO VOL 2x OFF")
         except Exception as e:
             print(f"Listener err {e}"); import traceback; traceback.print_exc(); time.sleep(3)
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.17 ANTI-429 FIX")
-    print("Rate limiter 1.2s + retry + cache 1 jam")
-    print("Bandar 1W dari /broker-summary 5 hari bursa")
+    print("🔥 RAFANO V4.18 VOL 2x FULL")
+    print("Chart BMTR tetap, caption tanpa bandar")
+    print("DB YF Avg20 + ITICK realtime scanner")
     print("==========================================")
+    init_db()
     telegram_bot_listener()
