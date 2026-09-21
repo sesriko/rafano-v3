@@ -1,40 +1,24 @@
 """
-RAFANO V4.18 COLAB - Baca dari Colab Secrets
-Secrets yang harus ada di Colab:
-- TELEGRAM_BOT_TOKEN
-- TARGET_CHAT_ID
-- ITICK_TOKEN
-- ARJUM_API_KEY
+RAFANO V4.18 - FINAL SINGLE FILE
+- Chart BMTR hitam pro TETAP (tidak dirubah)
+- Caption bandar DIHAPUS biar /c kenceng 2-4 detik
+- DB SQLite YF Avg20 + Scanner ITICK realtime VOL 2x
+- Auto baca dari Colab Secrets + .env
+- Fix Anti-429 Lock + Session
+File: rafano_v3.py
 """
-import os, sys
-
-# ===== COLAB SECRETS LOADER =====
+import os
 try:
     from google.colab import userdata
     IS_COLAB = True
-    print("✅ Running di Colab, load secrets dari userdata...")
-    for key in ["TELEGRAM_BOT_TOKEN","TARGET_CHAT_ID","ITICK_TOKEN","ITICK_API_KEY","ARJUM_API_KEY","DB_PATH"]:
+    for k in ["TELEGRAM_BOT_TOKEN","TARGET_CHAT_ID","ARJUM_API_KEY","ITICK_TOKEN","ITICK_API_KEY","DB_PATH"]:
         try:
-            val = userdata.get(key)
-            if val:
-                os.environ[key] = val
-                print(f"  Loaded secret: {key}")
-        except Exception as e:
-            pass
-    # Default DB di Drive biar gak hilang
-    if not os.getenv("DB_PATH"):
-        # coba cek drive
-        if os.path.exists("/content/drive"):
-            os.environ["DB_PATH"] = "/content/drive/MyDrive/rafano_vol.db"
-            print(f"  DB_PATH -> {os.environ['DB_PATH']} (Drive)")
-        else:
-            os.environ["DB_PATH"] = "/content/rafano_vol.db"
-            print(f"  DB_PATH -> {os.environ['DB_PATH']} (local)")
+            v=userdata.get(k)
+            if v: os.environ[k]=v
+        except: pass
 except:
     IS_COLAB = False
-    print("Running local, pakai .env")
 
-# ===== IMPORT SETELAH ENV DI-SET =====
 import time, datetime, threading, requests, pytz, sqlite3
 import numpy as np, pandas as pd
 import matplotlib
@@ -45,7 +29,12 @@ import matplotlib.gridspec as gridspec
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 
-load_dotenv(override=True)
+for p in ['/content/rafano-v3/.env','./.env','.env','/content/.env']:
+    if os.path.exists(p):
+        load_dotenv(p, override=True)
+        break
+else:
+    load_dotenv()
 
 TIMEZONE_WIB=pytz.timezone('Asia/Jakarta')
 TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN") or ""
@@ -55,7 +44,7 @@ ARJUM_BASE="https://stock.arjum.com/api"
 ITICK_TOKEN=os.getenv("ITICK_TOKEN") or os.getenv("ITICK_API_KEY") or ""
 ITICK_BASE="https://api.itick.org"
 ITICK_ENABLED=bool(ITICK_TOKEN)
-DB_PATH = os.getenv("DB_PATH") or "/content/rafano_vol.db"
+DB_PATH = os.getenv("DB_PATH") or ("/content/drive/MyDrive/rafano_vol.db" if os.path.exists("/content/drive") else "rafano_vol.db")
 
 SESSION = requests.Session()
 ARJUM_LOCK = threading.Lock()
@@ -108,14 +97,12 @@ def arjum_get(path, params=None, bypass_quota=False, retries=1):
             return None
     return None
 
-# ===== DB YF =====
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS yf_baseline (symbol TEXT PRIMARY KEY, avg_vol_20 REAL, last_close REAL, updated_at TEXT)")
     conn.commit(); conn.close()
-    print(f"✅ DB ready: {DB_PATH}")
 
 def update_yf_baseline(symbols=IDX_600_LIQUID, batch_size=10):
     print(f"🔄 Update Baseline YF {len(symbols)} saham ke {DB_PATH}...")
@@ -152,14 +139,6 @@ def get_yf_baseline_dict():
     except: rows=[]
     conn.close()
     return {r[0]: {"avg20": r[1], "close": r[2]} for r in rows}
-
-def get_screener_latest():
-    c=get_cached('latest', SCREENER_CACHE, SCREENER_CACHE_TTL)
-    if c: return c
-    data=arjum_get("/screener/latest", bypass_quota=True, retries=1)
-    if data and isinstance(data, dict) and 'rows' in data and len(data['rows'])>0:
-        set_cached('latest', data, SCREENER_CACHE); return data
-    return {"rows": [{"stock_code": c, "close": 100} for c in IDX_600_LIQUID[:150]]}
 
 def get_itick_quotes_batch(symbols, max_batch=20):
     if not ITICK_ENABLED or not symbols: return {}
@@ -352,7 +331,7 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",output_filename="chart.pn
         left_text=f"Avg Price : {avg_price:.1f}\nVchg 1 Bar: {vchg1:.1f} x\nVchg 5 Bar: {vchg5:.1f} x\nSpeed : {speed}\nPower : {power}\nSafety : {safety}\n\nEMA 13 : {ema13:.1f}\nEMA 20 : {ema20:.1f}\nEMA 50 : {ema50:.1f}\nEMA 200: {ema200:.1f}"
         ax_main.text(0.005,0.98,left_text,transform=ax_main.transAxes,va='top',ha='left',fontsize=7,family='monospace',color='#e0e0e0',bbox=dict(facecolor='black',alpha=0.7,edgecolor='#333333'))
         fig.text(0.005,0.96,f"{symbol} : {last_close:.0f} ({chg_pct:+.2f}%)",color='#ffff00',fontsize=14,fontweight='bold',ha='left',va='center', family='monospace')
-        fig.text(0.5,0.96,"RAFANO V4.18 COLAB",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
+        fig.text(0.5,0.96,"RAFANO V4.18",color='white',fontsize=16,fontweight='bold',ha='center',va='center')
         ds=df.index[-1].strftime('%d %b %Y %H:%M') if hasattr(df.index[-1],'strftime') else get_now_wib().strftime('%d %b %Y %H:%M')
         fig.text(0.99,0.96,f"{tf_label_disp} | {ds}",color='#ffcc00',fontsize=11,ha='right',va='center', fontweight='bold')
         vol_info=f"Buy % = {buy_pct}% Sell % = {100-buy_pct}% Net Vol = {net_vol:,.0f} 5D = {net_vol_5d:,.0f}"
@@ -462,7 +441,7 @@ def broadcast_vol2x(signals, threshold=2.0, dest_chat_id=None):
 
 def telegram_bot_listener():
     offset=0
-    print("🤖 RAFANO V4.18 COLAB - Secrets OK")
+    print("🤖 RAFANO V4.18 - Secrets OK, Chart tanpa bandar + VOL2x")
     try: SESSION.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
     init_db()
@@ -489,11 +468,12 @@ def telegram_bot_listener():
                     first=txt.split()[0].lower() if txt else ""
                     parts=txt.split()
                     if first in ["/start","/help","/menu"]:
-                        help_text="""🔥 *RAFANO V4.18 COLAB*
-✅ Baca dari Colab Secrets
+                        help_text="""🔥 *RAFANO V4.18 FINAL*
+✅ Chart BMTR tetap, tanpa bandar (kenceng)
+✅ DB YF + ITICK VOL 2x
 
-📈 /c KODE = chart (tanpa bandar, kenceng)
-🔥 /vol2x 2 = scan vol ITICK vs YF Avg20
+📈 /c KODE = chart
+🔥 /vol2x 2 = scan vol ITICK vs Avg20 YF
 🗄️ /updatedb = update DB YF
 /dbstatus = cek DB
 """
@@ -526,10 +506,10 @@ def telegram_bot_listener():
 
 if __name__=="__main__":
     print("==========================================")
-    print("🔥 RAFANO V4.18 COLAB SECRETS")
+    print("🔥 RAFANO V4.18 FINAL SINGLE FILE")
     print(f"DB: {DB_PATH}")
-    print(f"ITICK: {'OK' if ITICK_ENABLED else 'MISSING'}")
-    print(f"TELEGRAM: {'OK' if TELEGRAM_BOT_TOKEN else 'MISSING'}")
+    print(f"COLAB: {IS_COLAB}")
+    print("Chart tanpa bandar + VOL 2x YF+ITICK")
     print("==========================================")
     init_db()
     telegram_bot_listener()
