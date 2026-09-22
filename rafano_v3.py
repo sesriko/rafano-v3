@@ -1,4 +1,4 @@
-"""RAFANO V4.30 FINAL INFORMATIF - 785 + CLICK + PRO CHART"""
+"""RAFANO V4.30 FINAL INFORMATIF - 785 + CLICK + PRO CHART - FIXED FOR GITHUB"""
 import os, time, datetime, threading, requests, pytz, re
 import numpy as np, pandas as pd
 import matplotlib
@@ -26,7 +26,7 @@ def get_now_wib(): return datetime.datetime.now(TIMEZONE_WIB)
 FCA_EXCLUDE={"FUTR","FITT","HOTEL","ITIC","PUDP","COIN","SHID","RELI","ASPI","MEJA","MINA","ESTA","ASLI","VKTR","IMJS","GTSI","IRSX","ATAP","RONY","BCIC","DEFI","ROCK","YPAS","NIRO","BBHA","BKSW","NAGA","BEEF","BPTR","CBMF","CPRI","CRAB","DAAZ","DEAL","DGNS","DMND","DUCK","ENRG","ENVY","ESTI","ETWA","FIRE","FORU","GAMA","GOLL","HAIS","HATM","HITS","HOMI","IATA","INPS","IPOL","JGLE","KAYU","KBAG","KIOS","KPAL","KPAS","LCGP","LPLI","LPLR","MAGP","MAMI","MARI","SINI","SKYB","SMKM","SOCI","SONA","SOSS","SUGI","TALF","TDPM","TEBE","TOPS","TRAM","TRIL","TRIO","TRUS","UFOE","WIFI-W","WOWS","YELO","ZATA","ZONE","ZINC"}
 
 def load_785():
-    for p in ['data/daytrade-observe-tickers.txt','./data/daytrade-observe-tickers.txt','/content/rafano-v3/data/daytrade-observe-tickers.txt','/content/auto-cuan/data/daytrade-observe-tickers.txt']:
+    for p in ['data/daytrade-observe-tickers.txt','./data/daytrade-observe-tickers.txt','/content/rafano-v3/data/daytrade-observe-tickers.txt','/content/auto-cuan/data/daytrade-observe-tickers.txt','/content/rafano-v3/rafano-v3/data/daytrade-observe-tickers.txt']:
         if os.path.exists(p):
             try:
                 t=[x.strip().upper() for x in open(p, encoding='utf-8').read().splitlines() if len(x.strip())==4 and x.strip().isalpha()]
