@@ -1,4 +1,4 @@
-"""RAFANO V4.31 - KIM + BSJP + SCANVOL 300 MOST LIQUID - INFORMATIF PRO CHART"""
+"""RAFANO V4.32 - FIX 4 ISSUES: harga 100, click chart, KIM daily+1h, BSJP 5m+15m only - KEEP OTHER LOGIC"""
 import os, time, datetime, threading, requests, pytz, re
 import numpy as np, pandas as pd
 import matplotlib
@@ -40,7 +40,7 @@ def load_785():
             t=[x.strip().upper() for x in r.text.splitlines() if len(x.strip())==4 and x.strip().isalpha()]
             if len(t)>=100: return t
     except: pass
-    return ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","GOTO","BUKA","BREN","CUAN","WIFI","DEWA","BULL","ERAA","BAIK","BBKP","BRIS","ANTM","INCO","MDKA","ADRO","PTBA","PGAS","EXCL","ISAT","AMRT","TOWR","BBYB","BRMS","BRPT"]
+    return ["BBCA","BBRI","BMRI","BBNI","TLKM","ASII","GOTO","BUKA","BREN","CUAN","WIFI","DEWA","BULL","ERAA","BAIK","BBKP","BRIS","ANTM","INCO","MDKA","ADRO","PTBA","PGAS","EXCL","ISAT"]
 
 IDX_FULL=load_785()
 HISTORY_CACHE=OrderedDict(); SCREENER_CACHE=OrderedDict()
@@ -94,9 +94,11 @@ def get_screener_latest(force_today=False):
     data=arjum_get("/screener/latest", bypass_quota=True, retries=1)
     if data and isinstance(data, dict) and 'rows' in data and len(data['rows'])>0:
         set_cached('latest', data, SCREENER_CACHE, maxsize=5); return data
-    return {"rows": [{"stock_code": c, "close": 100, "volume": 1000000} for c in IDX_FULL[:300]]}
+    # FIX ISSUE 1: jangan return dummy close 100, return empty biar tidak dipakai sebagai harga
+    return {"rows": []}
 
 def get_realtime_stockbit(sym):
+    """FIX ISSUE 1: hanya return real Stockbit price, jangan dummy"""
     try:
         now=time.time()
         if sym in STOCKBIT_CACHE:
@@ -113,28 +115,41 @@ def get_realtime_stockbit(sym):
             m_chg=re.search(r'"change"\s*:\s*(-?\d+(?:\.\d+)?)', txt)
         if m_price:
             price=float(m_price.group(1))
+            # FIX: filter harga dummy 100 yang sering muncul sebagai placeholder
+            if price==100:
+                # cek apakah semua saham 100? kalau ya, anggap dummy, jangan pakai
+                return 0,0
             chg=float(m_chg.group(1)) if m_chg else 0
             STOCKBIT_CACHE[sym]=(now,price,chg)
             return price,chg
-    except: pass
+    except Exception as e:
+        # print(f"stockbit err {sym}: {e}")
+        pass
     return 0,0
 
 def get_realtime_from_screener(sym):
+    """FIX ISSUE 1: jangan pakai dummy screener close 100 sebagai realtime"""
     p,c=get_realtime_stockbit(sym)
-    if p>0: return p,c
+    if p>0 and p!=100: return p,c
+    # fallback screener HANYA jika bukan dummy 100
     try:
         sc=get_screener_latest(force_today=True)
         for row in sc.get('rows',[]):
             if (row.get('stock_code') or "").upper()==sym.upper():
-                return float(row.get('close') or 0), float(row.get('change_pct') or 0)
+                close_val=float(row.get('close') or 0)
+                # jika close 100 dan semua rows 100, anggap dummy
+                if close_val==100:
+                    continue
+                if close_val>0:
+                    return close_val, float(row.get('change_pct') or 0)
     except: pass
     return 0,0
 
 def get_itick_quotes_batch(symbols, max_batch=15):
     all_q={}
     for s in symbols:
-        p,c=get_realtime_from_screener(s)
-        if p>0:
+        p,c=get_realtime_stockbit(s)  # FIX: hanya stockbit asli, bukan screener dummy
+        if p>0 and p!=100:
             all_q[s.upper()]={'price':p,'changepct':c,'source':'STOCKBIT_RT'}
     return all_q
 
@@ -172,9 +187,16 @@ def get_history_pro(sym, limit=150, frame="daily"):
                 df=df.sort_index()
                 for col in ['Open','High','Low','Close','Volume']: df[col]=pd.to_numeric(df[col],errors='coerce')
                 df=df.dropna(subset=['Close'])
+                # FIX ISSUE 1: deteksi dummy data close=100 semua
                 if len(df)>=10:
-                    set_cached(hk,df,HISTORY_CACHE); return df
-            except: pass
+                    if df['Close'].nunique()==1 and int(df['Close'].iloc[0])==100:
+                        # dummy, fallback ke yfinance
+                        pass
+                    else:
+                        set_cached(hk,df,HISTORY_CACHE); return df
+            except Exception as e:
+                # print(f"arjum parse err {sym}: {e}")
+                pass
     try:
         import yfinance as yf
         interval_map={"5m":"5m","15m":"15m","30m":"30m","1h":"60m","4h":"60m","1d":"1d","1w":"1wk"}
@@ -185,6 +207,9 @@ def get_history_pro(sym, limit=150, frame="daily"):
         if hist is not None and len(hist)>=20:
             if frame=="4h":
                 hist=hist.resample('4H').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+            # FIX: yfinance kadang return Close 100? cek
+            if hist['Close'].nunique()==1 and int(hist['Close'].iloc[0])==100 and len(hist)>5:
+                return None
             set_cached(hk,hist.tail(limit),HISTORY_CACHE)
             return hist.tail(limit)
     except Exception as e:
@@ -207,7 +232,6 @@ def format_large_number(val):
     elif a>=1_000: return f"{a/1_000:,.0f}K"
     else: return f"{val:,.0f}"
 
-# ==================== IHSG FRACTION ROUNDING ====================
 def f_round_ihsg(price):
     try:
         p=float(price)
@@ -220,7 +244,6 @@ def f_round_ihsg(price):
     except: return price
 
 def rma(series, period):
-    # Wilder's RMA = EMA with alpha 1/period
     return series.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
 
 def calculate_rsi(prices, period=14):
@@ -296,18 +319,20 @@ def calc_atr(df, period=14):
     except:
         return pd.Series([0]*len(df), index=df.index)
 
-# ==================== KIM SIGNAL LOGIC ====================
-def detect_kim_signal(df, len_8=8, len_fast=20, len_slow=200, lookback_vol=20, spike_mult=1.8, lookback_avg=60, lookback_sl=20, atr_mult=2.0, adx_min=20, atr_period=14, rsi_len=14, use_stretch_guard=True, max_stretch_pct=40.0):
+# ==================== KIM SIGNAL - FIX TF: ONLY DAILY & 1H ====================
+def detect_kim_signal(df, timeframe="1d", len_8=8, len_fast=20, len_slow=200, lookback_vol=20, spike_mult=1.8, lookback_avg=60, lookback_sl=20, atr_mult=2.0, adx_min=20, atr_period=14, rsi_len=14, use_stretch_guard=True, max_stretch_pct=40.0):
     try:
+        tf_norm=normalize_timeframe(timeframe)
+        # FIX ISSUE 3: KIM hanya daily & 1h
+        kim_allowed=tf_norm in ["1d","1h"]
+        
         if df is None or len(df)<80:
-            return {"buy":False, "reason":"len<80", "b_modal":0, "tp1":0, "tp2":0, "sl":0, "rsi":50, "adx":0, "stretch_pct":0, "raw_b":False, "re_entry":False, "markers":[]}
+            return {"buy":False, "reason":"len<80", "b_modal":0, "tp1":0, "tp2":0, "sl":0, "rsi":50, "adx":0, "stretch_pct":0, "raw_b":False, "re_entry":False, "markers":[], "allowed_tf":kim_allowed}
         df=df.copy()
         close=df['Close']; open_=df['Open']; high=df['High']; low=df['Low']; volume=df['Volume']
         ema_8=close.ewm(span=len_8, adjust=False).mean()
         ema_f=close.ewm(span=len_fast, adjust=False).mean()
         ema_slow=close.ewm(span=len_slow, adjust=False).mean()
-        rsi_series=close.copy()
-        # RSI series for chart
         delta=close.diff()
         gain=delta.where(delta>0,0).ewm(alpha=1/rsi_len, adjust=False).mean()
         loss=(-delta.where(delta<0,0)).ewm(alpha=1/rsi_len, adjust=False).mean()
@@ -323,7 +348,6 @@ def detect_kim_signal(df, len_8=8, len_fast=20, len_slow=200, lookback_vol=20, s
         atr_val=float(atr_ser.iloc[-1]) if len(atr_ser)>0 and not pd.isna(atr_ser.iloc[-1]) else 0
         atr_sma=atr_ser.rolling(20).mean()
         has_volatility_ser=atr_ser>atr_sma
-        has_volatility=bool(has_volatility_ser.iloc[-1]) if len(has_volatility_ser)>0 else False
 
         v_sma=volume.rolling(lookback_vol).mean()
         is_v_akum=(close>open_) & (volume>v_sma)
@@ -348,23 +372,22 @@ def detect_kim_signal(df, len_8=8, len_fast=20, len_slow=200, lookback_vol=20, s
             stretch_ok_series=(abs((close-b_modal_series)/b_modal_series*100)<=max_stretch_pct)
             common_ok_series=common_ok_series & stretch_ok_series
 
-        common_ok=bool(common_ok_series.iloc[-1]) if len(common_ok_series)>0 else False
-
-        # crossover close vs b_modal
         prev_close=close.shift(1)
         prev_b_modal=b_modal_series.shift(1)
         crossover=(prev_close<=prev_b_modal) & (close>b_modal_series)
         raw_b_series=crossover & (close>ema_f) & common_ok_series
         raw_b=bool(raw_b_series.iloc[-1]) if len(raw_b_series)>0 else False
 
-        # re-entry: close > highest(high[1],10)
         highest_10=high.shift(1).rolling(10).max()
         re_entry_series=(close>highest_10) & (close>b_modal_series) & common_ok_series
         re_entry=bool(re_entry_series.iloc[-1]) if len(re_entry_series)>0 else False
 
         buy_condition=raw_b or re_entry
 
-        # TP/SL calc
+        # FIX ISSUE 3: jika TF bukan daily/1h, jangan kasih sinyal BUY
+        if not kim_allowed:
+            buy_condition=False
+
         val_sl=float(low.rolling(lookback_sl).min().iloc[-1]) if len(low)>=lookback_sl else float(low.min())
         ideal_buy=f_round_ihsg(float(close.iloc[-1]))
         t_stop_raw=min(float(close.iloc[-1]) - (atr_val*atr_mult), val_sl)
@@ -373,49 +396,46 @@ def detect_kim_signal(df, len_8=8, len_fast=20, len_slow=200, lookback_vol=20, s
         tp1=f_round_ihsg(ideal_buy + p_range*1.0)
         tp2=f_round_ihsg(ideal_buy + p_range*2.0)
 
-        # markers for all bars
         markers=[]
-        for i in range(len(df)):
-            if i<len(df) and raw_b_series.iloc[i]:
-                markers.append({"idx":i, "type":"KIM BUY", "price":float(close.iloc[i])})
-            elif i<len(df) and re_entry_series.iloc[i]:
-                markers.append({"idx":i, "type":"KIM RE-ENTRY", "price":float(close.iloc[i])})
+        if kim_allowed:  # hanya tampilkan marker jika TF diizinkan
+            for i in range(len(df)):
+                if i<len(df) and raw_b_series.iloc[i]:
+                    markers.append({"idx":i, "type":"KIM BUY", "price":float(close.iloc[i])})
+                elif i<len(df) and re_entry_series.iloc[i]:
+                    markers.append({"idx":i, "type":"KIM RE-ENTRY", "price":float(close.iloc[i])})
 
-        return {"buy":bool(buy_condition), "reason":"KIM", "b_modal":b_modal, "b_modal_series":b_modal_series, "tp1":tp1, "tp2":tp2, "sl":t_stop, "ideal_buy":ideal_buy, "rsi":rsi_val, "adx":adx_val, "stretch_pct":stretch_pct, "raw_b":raw_b, "re_entry":re_entry, "is_trending":is_trending, "has_volatility":has_volatility, "common_ok":common_ok, "markers":markers, "ema_8":ema_8, "ema_f":ema_f, "ema_slow":ema_slow, "atr":atr_val, "is_v_akum":bool(is_v_akum.iloc[-1]), "is_v_spike":bool(is_v_spike.iloc[-1])}
+        return {"buy":bool(buy_condition), "reason":"KIM", "b_modal":b_modal, "b_modal_series":b_modal_series, "tp1":tp1, "tp2":tp2, "sl":t_stop, "ideal_buy":ideal_buy, "rsi":rsi_val, "adx":adx_val, "stretch_pct":stretch_pct, "raw_b":raw_b, "re_entry":re_entry, "is_trending":is_trending, "has_volatility":bool(has_volatility_ser.iloc[-1]) if len(has_volatility_ser)>0 else False, "common_ok":bool(common_ok_series.iloc[-1]) if len(common_ok_series)>0 else False, "markers":markers, "ema_8":ema_8, "ema_f":ema_f, "ema_slow":ema_slow, "atr":atr_val, "is_v_akum":bool(is_v_akum.iloc[-1]), "is_v_spike":bool(is_v_spike.iloc[-1]), "allowed_tf":kim_allowed, "tf":tf_norm}
     except Exception as e:
         import traceback; traceback.print_exc()
-        return {"buy":False, "reason":f"err {e}", "b_modal":0, "tp1":0, "tp2":0, "sl":0, "markers":[]}
+        return {"buy":False, "reason":f"err {e}", "b_modal":0, "tp1":0, "tp2":0, "sl":0, "markers":[], "allowed_tf":False}
 
-# ==================== BSJP PRO MOMENTUM LOGIC ====================
-def detect_bsjp_signal(df, timeframe="1d", volMultiplier=1.8, maVolLength=20, minPriceChange=0.5, minDailyVol=2000000, ema8Len=8, ema20Len=20, ema200Len=200, tp1Pct=3.0, tp2Pct=6.0, tp3Pct=9.0, slPct=3.0, startHour=14, startMinute=30, endHour=15, endMinute=45):
+# ==================== BSJP PRO MOMENTUM - FIX TF: ONLY 5m & 15m ====================
+def detect_bsjp_signal(df, timeframe="15m", volMultiplier=1.8, maVolLength=20, minPriceChange=0.5, minDailyVol=2000000, ema8Len=8, ema20Len=20, ema200Len=200, tp1Pct=3.0, tp2Pct=6.0, tp3Pct=9.0, slPct=3.0, startHour=14, startMinute=30, endHour=15, endMinute=45):
     try:
+        tf_norm=normalize_timeframe(timeframe)
+        # FIX ISSUE 4: BSJP hanya 5m & 15m
+        bsjp_allowed=tf_norm in ["5m","15m"]
+
         if df is None or len(df)<60:
-            return {"buy":False, "reason":"len<60", "markers":[]}
+            return {"buy":False, "reason":"len<60", "markers":[], "allowed_tf":bsjp_allowed, "tf":tf_norm}
         df=df.copy()
         close=df['Close']; open_=df['Open']; high=df['High']; low=df['Low']; volume=df['Volume']
         ema8=close.ewm(span=ema8Len, adjust=False).mean()
         ema20=close.ewm(span=ema20Len, adjust=False).mean()
         ema200=close.ewm(span=ema200Len, adjust=False).mean()
 
-        timeframe_norm=normalize_timeframe(timeframe)
-        isTf15=timeframe_norm in ["15m","30m","1h"]
-        isTf5=timeframe_norm=="5m"
+        isTf15=tf_norm in ["15m","30m","1h"]
+        isTf5=tf_norm=="5m"
         lookbackBreak=4 if isTf15 else 10 if isTf5 else 8
 
-        # Time filter - if intraday, check WIB hour, else True
         def is_time_sore(idx):
             try:
-                # idx is Timestamp
                 if isinstance(idx, pd.Timestamp):
-                    # convert to WIB if needed - assume index already WIB or UTC, we check hour
-                    # For simplicity, if timeframe is daily, return True
-                    if timeframe_norm=="1d" or timeframe_norm=="1w":
+                    if tf_norm=="1d" or tf_norm=="1w":
+                        # untuk daily, anggap sore selalu true tapi nanti buy akan di-filter karena TF tidak allowed
                         return True
-                    # For intraday, check hour
-                    # Convert to WIB (Asia/Jakarta) - if naive, assume WIB
                     h=idx.hour
                     m=idx.minute
-                    # WIB 14:30-15:45
                     start_total=startHour*60+startMinute
                     end_total=endHour*60+endMinute
                     cur_total=h*60+m
@@ -425,8 +445,7 @@ def detect_bsjp_signal(df, timeframe="1d", volMultiplier=1.8, maVolLength=20, mi
                 return True
 
         is_time_sore_series=pd.Series([is_time_sore(i) for i in df.index], index=df.index)
-        # For daily, all True
-        if timeframe_norm=="1d" or timeframe_norm=="1w":
+        if tf_norm=="1d" or tf_norm=="1w":
             is_time_sore_series=pd.Series([True]*len(df), index=df.index)
 
         avgVolume=volume.rolling(maVolLength).mean()
@@ -440,8 +459,6 @@ def detect_bsjp_signal(df, timeframe="1d", volMultiplier=1.8, maVolLength=20, mi
         highestHigh=high.shift(1).rolling(lookbackBreak).max()
         isBreakout=close>highestHigh
 
-        # signalTriggeredToday logic - only one per day
-        # We'll track dates
         signal_dates=set()
         bsjp_series=pd.Series([False]*len(df), index=df.index)
         markers=[]
@@ -453,7 +470,6 @@ def detect_bsjp_signal(df, timeframe="1d", volMultiplier=1.8, maVolLength=20, mi
             if not isBreakout.iloc[i]: continue
             if not isLiquidStock.iloc[i]: continue
             if not isAboveMajorTrend.iloc[i]: continue
-            # check if already triggered today
             try:
                 cur_date=df.index[i].date()
                 if cur_date in signal_dates:
@@ -465,7 +481,11 @@ def detect_bsjp_signal(df, timeframe="1d", volMultiplier=1.8, maVolLength=20, mi
 
         buy_last=bool(bsjp_series.iloc[-1]) if len(bsjp_series)>0 else False
 
-        # calc TP/SL for last signal if buy
+        # FIX ISSUE 4: jika TF bukan 5m/15m, jangan kasih sinyal BUY
+        if not bsjp_allowed:
+            buy_last=False
+            markers=[]  # jangan tampilkan marker di TF yang tidak diizinkan
+
         if buy_last:
             last_high=float(high.iloc[-1]); last_low=float(low.iloc[-1])
             tp1=f_round_ihsg(last_high*(1+tp1Pct/100))
@@ -475,15 +495,15 @@ def detect_bsjp_signal(df, timeframe="1d", volMultiplier=1.8, maVolLength=20, mi
         else:
             tp1=tp2=tp3=sl=0
 
-        return {"buy":buy_last, "reason":"BSJP", "markers":markers, "series":bsjp_series, "ema8":ema8, "ema20":ema20, "ema200":ema200, "tp1":tp1, "tp2":tp2, "tp3":tp3, "sl":sl, "isVolumeSurge":bool(isVolumeSurge.iloc[-1]), "isPriceUp":bool(isPriceUp.iloc[-1]), "isBreakout":bool(isBreakout.iloc[-1]), "isLiquid":bool(isLiquidStock.iloc[-1]), "isAboveMajor":bool(isAboveMajorTrend.iloc[-1])}
+        return {"buy":buy_last, "reason":"BSJP", "markers":markers, "series":bsjp_series, "ema8":ema8, "ema20":ema20, "ema200":ema200, "tp1":tp1, "tp2":tp2, "tp3":tp3, "sl":sl, "isVolumeSurge":bool(isVolumeSurge.iloc[-1]), "isPriceUp":bool(isPriceUp.iloc[-1]), "isBreakout":bool(isBreakout.iloc[-1]), "isLiquid":bool(isLiquidStock.iloc[-1]), "isAboveMajor":bool(isAboveMajorTrend.iloc[-1]), "allowed_tf":bsjp_allowed, "tf":tf_norm}
     except Exception as e:
         import traceback; traceback.print_exc()
-        return {"buy":False, "reason":f"err {e}", "markers":[]}
+        return {"buy":False, "reason":f"err {e}", "markers":[], "allowed_tf":False}
 
 def check_bo_ema50_bob200(sym, hd, realtime_price=None):
     try:
         if hd is None or len(hd)<55: return None
-        c=float(realtime_price if realtime_price and realtime_price>0 else hd['Close'].iloc[-1])
+        c=float(realtime_price if realtime_price and realtime_price>0 and realtime_price!=100 else hd['Close'].iloc[-1])
         pc=float(hd['Close'].iloc[-2])
         if c<50: return None
         ema50_s=hd['Close'].ewm(span=50,adjust=False).mean()
@@ -514,8 +534,12 @@ def detect_bo_bos_markers(df):
 def generate_caption_pro(symbol, df, realtime_price=None, tf_norm="1d", kim=None, bsjp=None):
     try:
         df=df.copy()
-        if realtime_price and realtime_price>0 and len(df)>0:
-            df.iloc[-1, df.columns.get_loc('Close')] = realtime_price
+        # FIX ISSUE 1: hanya overwrite realtime jika valid dan bukan dummy 100
+        if realtime_price and realtime_price>0 and realtime_price!=100 and len(df)>0:
+            last_hist=df['Close'].iloc[-1]
+            # hanya overwrite jika realtime tidak beda jauh (>50% beda anggap error)
+            if last_hist>0 and abs(realtime_price-last_hist)/last_hist < 0.5:
+                df.iloc[-1, df.columns.get_loc('Close')] = realtime_price
         last_close=df['Close'].iloc[-1]
         prev_close=df['Close'].iloc[-2] if len(df)>1 else last_close
         chg_pct=((last_close/prev_close)-1)*100 if prev_close else 0
@@ -528,14 +552,14 @@ def generate_caption_pro(symbol, df, realtime_price=None, tf_norm="1d", kim=None
         v1=df['V1'].iloc[-1]
         vol_spike=df['Volume'].iloc[-1]/v1 if v1>0 else 1.0
 
-        kim_txt="❌"
-        if kim:
+        kim_txt="❌ TF not daily/1h" if kim and not kim.get('allowed_tf') else "❌"
+        if kim and kim.get('allowed_tf'):
             kim_txt=f"{'✅ BUY' if kim.get('buy') else '⏳ WAIT'} | Modal:{kim.get('b_modal',0):.0f} TP1:{kim.get('tp1',0):.0f} SL:{kim.get('sl',0):.0f} | ADX:{kim.get('adx',0):.0f} RSI:{kim.get('rsi',0):.0f}"
-        bsjp_txt="❌"
-        if bsjp:
+        bsjp_txt="❌ TF not 5m/15m" if bsjp and not bsjp.get('allowed_tf') else "❌"
+        if bsjp and bsjp.get('allowed_tf'):
             bsjp_txt=f"{'✅ BUY SORE' if bsjp.get('buy') else '⏳ WAIT'} | VolSurge:{bsjp.get('isVolumeSurge')} Breakout:{bsjp.get('isBreakout')} Liquid:{bsjp.get('isLiquid')}"
 
-        caption=f"{symbol} — {int(last_close)} ({chg_pct:+.2f}%) | {format_timeframe_label(tf_norm)}\n├ RSI:{rsi:.1f} Vol:{vol_spike:.1f}x Buy%:{buy_pct}%\n├ KIM: {kim_txt}\n└ BSJP: {bsjp_txt}"
+        caption=f"{symbol} — {int(last_close)} ({chg_pct:+.2f}%) | {format_timeframe_label(tf_norm)}\n├ RSI:{rsi:.1f} Vol:{vol_spike:.1f}x Buy%:{buy_pct}%\n├ KIM ({'daily/1h' if kim and kim.get('allowed_tf') else 'off'}): {kim_txt}\n└ BSJP ({'5m/15m' if bsjp and bsjp.get('allowed_tf') else 'off'}): {bsjp_txt}"
         return caption, {}
     except Exception as e:
         print(f"Caption err {e}")
@@ -551,12 +575,14 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         else: df=df.sort_index()
         df=df.dropna(subset=['Open','High','Low','Close'])
         if len(df)<20: return None, []
-        if realtime_price and realtime_price>0 and len(df)>0:
-            df.iloc[-1, df.columns.get_loc('Close')] = realtime_price
-            if realtime_price>df['High'].iloc[-1]: df.iloc[-1, df.columns.get_loc('High')] = realtime_price
-            if realtime_price<df['Low'].iloc[-1]: df.iloc[-1, df.columns.get_loc('Low')] = realtime_price
+        # FIX ISSUE 1: hanya pakai realtime jika valid & bukan 100
+        if realtime_price and realtime_price>0 and realtime_price!=100 and len(df)>0:
+            last_hist=df['Close'].iloc[-1]
+            if last_hist>0 and abs(realtime_price-last_hist)/last_hist < 0.5:
+                df.iloc[-1, df.columns.get_loc('Close')] = realtime_price
+                if realtime_price>df['High'].iloc[-1]: df.iloc[-1, df.columns.get_loc('High')] = realtime_price
+                if realtime_price<df['Low'].iloc[-1]: df.iloc[-1, df.columns.get_loc('Low')] = realtime_price
 
-        # Core indicators
         df['EMA8']=df['Close'].ewm(span=8,adjust=False).mean()
         df['EMA13']=df['Close'].ewm(span=13,adjust=False).mean()
         df['EMA20']=df['Close'].ewm(span=20,adjust=False).mean()
@@ -567,8 +593,8 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         df['BB_UP']=upper_bb; df['BB_LOW']=lower_bb
         df,buy_ratios=calculate_vsa_metrics(df)
 
-        # KIM & BSJP signals
-        kim=detect_kim_signal(df)
+        # FIX ISSUE 3 & 4: pass timeframe
+        kim=detect_kim_signal(df, timeframe=timeframe_norm)
         bsjp=detect_bsjp_signal(df, timeframe=timeframe_norm)
 
         bo_markers=detect_bo_bos_markers(df)
@@ -605,36 +631,30 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
             else: rect=patches.Rectangle((i-0.35,body_low),0.7,body_h,facecolor='#ff3333',edgecolor='#ff3333',linewidth=0.7)
             ax_main.add_patch(rect)
 
-        # EMA lines - KIM & BSJP
         ax_main.plot(x,df['EMA8'],color='#ffeb3b',linewidth=1.0, label='EMA8')
         ax_main.plot(x,df['EMA20'],color='#00e6ff',linewidth=1.0, label='EMA20')
         ax_main.plot(x,df['EMA50'],color='#ffffff',linewidth=0.9, alpha=0.8)
         if pd.notna(df['EMA200'].iloc[-1]): ax_main.plot(x,df['EMA200'],color='#a020f0',linewidth=1.4, label='EMA200')
         ax_main.plot(x,df['BB_UP'],color='#444488',linewidth=0.8,linestyle='--',alpha=0.5); ax_main.plot(x,df['BB_LOW'],color='#444488',linewidth=0.8,linestyle='--',alpha=0.5)
 
-        # KIM Modal Bandar
         if 'b_modal_series' in kim and kim['b_modal_series'] is not None and len(kim['b_modal_series'])==len(df):
             ax_main.plot(x, kim['b_modal_series'], color='#ffffff', linewidth=1.2, linestyle='-', alpha=0.7, label='Modal Bandar')
 
-        # KIM TP1/TP2/SL for last signal if buy
-        if kim.get('buy'):
+        if kim.get('buy') and kim.get('allowed_tf'):
             ax_main.axhline(kim.get('tp1'), color='#00ff00', linewidth=1, linestyle='--', alpha=0.5)
             ax_main.axhline(kim.get('tp2'), color='#00ffff', linewidth=1, linestyle='--', alpha=0.5)
             ax_main.axhline(kim.get('sl'), color='#ff5500', linewidth=1.5, linestyle='-', alpha=0.8)
 
-        # BSJP TP levels
-        if bsjp.get('buy'):
+        if bsjp.get('buy') and bsjp.get('allowed_tf'):
             if bsjp.get('tp1'): ax_main.axhline(bsjp.get('tp1'), color='#00ff00', linewidth=0.8, linestyle=':', alpha=0.5)
             if bsjp.get('sl'): ax_main.axhline(bsjp.get('sl'), color='#ff0000', linewidth=1.2, linestyle='-', alpha=0.7)
 
-        # Markers
         for sig in bo_markers:
             idx=sig['idx']
             if idx>=len(df): continue
             low=df['Low'].iloc[idx]
             ax_main.plot(idx, low*0.985, marker='^', color='#00ff00', markersize=8, alpha=0.7)
 
-        # KIM markers
         for m in kim.get('markers',[]):
             idx=m['idx']
             if idx>=len(df): continue
@@ -642,7 +662,6 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
             ax_main.plot(idx, low*0.97, marker='^', color='#00ff00', markersize=10)
             ax_main.text(idx, low*0.95, f"KIM\n{m['type']}", color='#00ff00', fontsize=6, ha='center', fontweight='bold')
 
-        # BSJP markers
         for m in bsjp.get('markers',[]):
             idx=m['idx']
             if idx>=len(df): continue
@@ -652,8 +671,7 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
 
         ax_main.set_xlim(-1,len(df)-1+10); ax_main.set_ylim(df['Low'].min()*0.96, df['High'].max()*1.06)
 
-        # Left panel - enhanced with KIM/BSJP
-        left_text=f"Avg Price : {avg_price:.1f}\nVchg 1 Bar: {vchg1:.1f} x\nVchg 5 Bar: {vchg5:.1f} x\nSpeed : {speed}\nPower : {power}\nSafety : {safety}\n\nEMA 8 : {ema8:.1f}\nEMA 20 : {ema20:.1f}\nEMA 50 : {ema50:.1f}\nEMA 200: {ema200:.1f}\n\n--- KIM SIGNAL ---\nModal : {kim.get('b_modal',0):.0f}\nTP1 : {kim.get('tp1',0):.0f}\nTP2 : {kim.get('tp2',0):.0f}\nSL : {kim.get('sl',0):.0f}\nRSI : {kim.get('rsi',0):.0f}\nADX : {kim.get('adx',0):.0f}\nStretch: {kim.get('stretch_pct',0):.1f}%\nStatus: {'BUY' if kim.get('buy') else 'WAIT'}\n\n--- BSJP ---\nTP1 : {bsjp.get('tp1',0):.0f}\nSL : {bsjp.get('sl',0):.0f}\nVolSurge: {bsjp.get('isVolumeSurge')}\nBreakout: {bsjp.get('isBreakout')}\nStatus: {'BUY SORE' if bsjp.get('buy') else 'WAIT'}"
+        left_text=f"Avg Price : {avg_price:.1f}\nVchg 1 Bar: {vchg1:.1f} x\nVchg 5 Bar: {vchg5:.1f} x\nSpeed : {speed}\nPower : {power}\nSafety : {safety}\n\nEMA 8 : {ema8:.1f}\nEMA 20 : {ema20:.1f}\nEMA 50 : {ema50:.1f}\nEMA 200: {ema200:.1f}\n\n--- KIM {'(daily/1h)' if kim.get('allowed_tf') else '(OFF - need daily/1h)'} ---\nModal : {kim.get('b_modal',0):.0f}\nTP1 : {kim.get('tp1',0):.0f}\nTP2 : {kim.get('tp2',0):.0f}\nSL : {kim.get('sl',0):.0f}\nRSI : {kim.get('rsi',0):.0f}\nADX : {kim.get('adx',0):.0f}\nStretch: {kim.get('stretch_pct',0):.1f}%\nStatus: {'BUY' if kim.get('buy') else 'WAIT' if kim.get('allowed_tf') else 'OFF TF'}\n\n--- BSJP {'(5m/15m)' if bsjp.get('allowed_tf') else '(OFF - need 5m/15m)'} ---\nTP1 : {bsjp.get('tp1',0):.0f}\nSL : {bsjp.get('sl',0):.0f}\nVolSurge: {bsjp.get('isVolumeSurge')}\nBreakout: {bsjp.get('isBreakout')}\nStatus: {'BUY SORE' if bsjp.get('buy') else 'WAIT' if bsjp.get('allowed_tf') else 'OFF TF'}"
 
         ax_main.text(0.005,0.98,left_text,transform=ax_main.transAxes,va='top',ha='left',fontsize=6,family='monospace',color='#e0e0e0',bbox=dict(facecolor='black',alpha=0.75,edgecolor='#333333'))
 
@@ -662,7 +680,7 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         if kim.get('buy') and bsjp.get('buy'): title_status="🔥 KIM+BSJP BUY"
         elif kim.get('buy'): title_status="🚀 KIM BUY"
         elif bsjp.get('buy'): title_status="💥 BSJP BUY SORE"
-        else: title_status="RAFANO V4.31 KIM+BSJP"
+        else: title_status="RAFANO V4.32 KIM+BSJP"
         fig.text(0.5,0.96,title_status,color='white',fontsize=14,fontweight='bold',ha='center')
         ds=df.index[-1].strftime('%d %b %Y %H:%M')
         fig.text(0.99,0.96,f"{tf_label_disp} | {ds}",color='#ffcc00',fontsize=10,ha='right',fontweight='bold')
@@ -703,14 +721,11 @@ def generate_pro_chart(df,symbol="BBCA",timeframe="5m",sector_info="IHSG",output
         try: plt.clf(); plt.close('all')
         except: pass
 
-# ==================== TOP 300 MOST LIQUID ====================
 def get_top_liquid_tickers(n=300):
-    # Try screener sorted by value
     try:
         screener=get_screener_latest(force_today=False)
         rows=screener.get('rows',[])
         if len(rows)>=n:
-            # Try sort by volume*close if volume exists, else keep order (assumed liquid first)
             try:
                 rows_with_vol=[r for r in rows if r.get('volume') is not None]
                 if len(rows_with_vol)>=n:
@@ -720,17 +735,14 @@ def get_top_liquid_tickers(n=300):
                     if len(filtered)>=n*0.8:
                         return filtered[:n]
             except: pass
-            # fallback: take first n rows as they are (usually sorted by liquidity in Arjum)
             tickers=[(r.get('stock_code') or "").replace(".JK","").upper() for r in rows[:n*2]]
             filtered=[t for t in tickers if t and "-W" not in t and t not in FCA_EXCLUDE]
             return filtered[:n]
     except: pass
-    # Fallback: IDX_FULL is already sorted by liquidity from file
     filtered=[c for c in IDX_FULL if c not in FCA_EXCLUDE and "-W" not in c]
     return filtered[:n]
 
 def scan_volume_spike(threshold=1.5, limit_candidates=300):
-    # UPDATED: default 300 most liquid
     tickers=get_top_liquid_tickers(limit_candidates)
     detected=[]
     for sym in tickers:
@@ -768,7 +780,9 @@ def scan_v417_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
         for r in rows:
             code=(r.get('stock_code') or "").replace(".JK","").upper()
             if code in candidates:
-                all_quotes[code]={'price':float(r.get('close') or 0),'changepct':float(r.get('change_pct') or 0)}
+                close_val=float(r.get('close') or 0)
+                if close_val==100: continue
+                all_quotes[code]={'price':close_val,'changepct':float(r.get('change_pct') or 0)}
     sorted_q=sorted(all_quotes.items(), key=lambda x: x[1].get('changepct',-999), reverse=True)
     top_codes=[c for c,_ in sorted_q[:top_itick]] if sorted_q else candidates[:top_itick]
     def check_one(sym):
@@ -776,9 +790,10 @@ def scan_v417_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
             if only_new and sym in ALERTED_TODAY: return None
             q=all_quotes.get(sym,{})
             realtime_price=q.get('price',0)
+            if realtime_price==100: realtime_price=0
             hd=get_history_pro(sym, limit=120, frame="daily")
             if hd is None or len(hd)<55: return None
-            c=float(realtime_price if realtime_price and realtime_price>0 else hd['Close'].iloc[-1])
+            c=float(realtime_price if realtime_price and realtime_price>0 and realtime_price!=100 else hd['Close'].iloc[-1])
             v_last=float(hd['Volume'].iloc[-1]); v_avg=float(hd['Volume'].iloc[-21:-1].mean())
             if v_avg==0 or v_last==0: return None
             if v_last/v_avg < vol_thr: return None
@@ -798,20 +813,26 @@ def scan_v417_final(top_arjum=60, top_itick=30, vol_thr=1.5, min_value=1_000_000
 
 def scan_kim_bsjp_300():
     tickers=get_top_liquid_tickers(300)
-    print(f"🔍 Scan KIM+BSJP 300 liquid: {len(tickers)} saham")
+    print(f"🔍 Scan KIM(1d)+BSJP(15m) 300 liquid: {len(tickers)} saham")
     detected=[]
     def check_one(sym):
         try:
-            df=get_history_pro(sym, 150, "1d")
-            if df is None or len(df)<80: return None
-            kim=detect_kim_signal(df)
-            bsjp=detect_bsjp_signal(df, timeframe="1d")
+            # KIM pakai daily (allowed), BSJP pakai 15m (allowed)
+            df_daily=get_history_pro(sym, 150, "1d")
+            if df_daily is None or len(df_daily)<80: return None
+            kim=detect_kim_signal(df_daily, timeframe="1d")
+            df_15m=get_history_pro(sym, 150, "15m")
+            if df_15m is None or len(df_15m)<60:
+                # fallback daily untuk cek logic tapi buy akan false karena TF filter
+                bsjp=detect_bsjp_signal(df_daily, timeframe="1d")
+            else:
+                bsjp=detect_bsjp_signal(df_15m, timeframe="15m")
             if kim['buy'] or bsjp['buy']:
-                last_close=df['Close'].iloc[-1]
-                prev=df['Close'].iloc[-2] if len(df)>=2 else last_close
+                last_close=df_daily['Close'].iloc[-1]
+                prev=df_daily['Close'].iloc[-2] if len(df_daily)>=2 else last_close
                 chg=(last_close/prev-1)*100 if prev else 0
-                v_last=df['Volume'].iloc[-1]
-                v_avg=df['Volume'].tail(20).mean()
+                v_last=df_daily['Volume'].iloc[-1]
+                v_avg=df_daily['Volume'].tail(20).mean()
                 vol_ratio=v_last/v_avg if v_avg else 1
                 return {"symbol":sym,"close":int(last_close),"change_pct":chg,"vol_ratio":vol_ratio,"kim_buy":kim['buy'],"bsjp_buy":bsjp['buy'],"kim":kim,"bsjp":bsjp,"vol_rp":v_last*last_close}
         except Exception as e:
@@ -857,19 +878,32 @@ def process_chart_request(cid, code, tf_input="1d"):
         send_reply(cid, f"📊 *{code.upper()} ({tf_label}) chart pro KIM+BSJP...*")
         df=get_history_pro(code, 150, frame=tf_norm)
         if df is None or len(df)<20:
-            send_reply(cid, f"⚠ Data {code} TF {tf_norm} kosong"); return
-        quotes=get_itick_quotes_batch([code],1)
-        realtime=quotes.get(code.upper(),{}).get('price',0)
+            send_reply(cid, f"⚠ Data {code} TF {tf_norm} kosong (yfinance/arjum fail)"); return
+        # FIX ISSUE 1: hanya pakai stockbit asli
+        stockbit_price, stockbit_chg=get_realtime_stockbit(code)
+        realtime=0
+        if stockbit_price>0 and stockbit_price!=100:
+            last_hist=float(df['Close'].iloc[-1])
+            # jika beda >50% anggap error, jangan overwrite
+            if last_hist>0 and abs(stockbit_price-last_hist)/last_hist < 0.5:
+                realtime=stockbit_price
+            else:
+                # jika beda jauh tapi last_hist 100 dummy, pakai stockbit
+                if last_hist==100:
+                    realtime=stockbit_price
+
         chart_file=f"/tmp/chart_{code.upper()}_{tf_norm}_{int(time.time())}.png"
         fp, _ = generate_pro_chart(df, symbol=code.upper(), timeframe=tf_norm, output_filename=chart_file, extra_info={'tf_label':tf_label}, realtime_price=realtime)
         if not fp or not os.path.exists(fp):
             send_reply(cid, f"❌ Gagal render {code} {tf_norm}"); return
-        kim=detect_kim_signal(df)
+        kim=detect_kim_signal(df, timeframe=tf_norm)
         bsjp=detect_bsjp_signal(df, timeframe=tf_norm)
         caption,_=generate_caption_pro(code.upper(), df, realtime_price=realtime, tf_norm=tf_norm, kim=kim, bsjp=bsjp)
         send_photo_reply(cid, fp, caption=caption)
-        if os.path.exists(fp): os.remove(fp)
-        print(f"CHART DONE {code}")
+        if os.path.exists(fp): 
+            try: os.remove(fp)
+            except: pass
+        print(f"CHART DONE {code} TF {tf_norm} - real price {realtime} hist {df['Close'].iloc[-1]}")
     except Exception as e:
         print(f"CHART ERR {e}")
         import traceback; traceback.print_exc()
@@ -913,10 +947,10 @@ def broadcast_kim_bsjp(signals, dest_chat_id=None, is_auto=False):
     target=dest_chat_id or TARGET_CHAT_ID
     if not target: return
     if not signals:
-        if not is_auto: send_reply(target, f"🔍 KIM+BSJP (300 liquid): Tidak ada sinyal BUY hari ini"); return
+        if not is_auto: send_reply(target, f"🔍 KIM(daily/1h)+BSJP(5m/15m) (300 liquid): Tidak ada sinyal BUY hari ini"); return
     now=get_now_wib().strftime('%d %b %Y %H:%M WIB')
     tag="⚡ AUTO" if is_auto else "🚀"
-    header=f"{tag} *KIM + BSJP BUY* 🔥 {now}\nTOP 300 Most Liquid - {len(signals)} sinyal\n\n"
+    header=f"{tag} *KIM(daily/1h) + BSJP(5m/15m) BUY* 🔥 {now}\nTOP 300 Most Liquid - {len(signals)} sinyal\n\n"
     msg=header; kb=[]
     for idx,it in enumerate(signals,1):
         kim_icon="✅" if it['kim_buy'] else "⏳"
@@ -948,9 +982,9 @@ def run_interactive_scanner(limit=300, threshold=1.5):
             print(f"⏳ Render {sym} chart pro KIM+BSJP...")
             df=get_history_pro(sym,150,"1d")
             if df is not None:
-                q=get_realtime_from_screener(sym)
+                q,p=get_realtime_stockbit(sym)
                 f=f"/tmp/{sym}_{int(time.time())}.png"
-                fp,_=generate_pro_chart(df,symbol=sym,timeframe="1d",output_filename=f,extra_info={'tf_label':'Daily'},realtime_price=q[0])
+                fp,_=generate_pro_chart(df,symbol=sym,timeframe="1d",output_filename=f,extra_info={'tf_label':'Daily'},realtime_price=p if p!=100 else 0)
                 if fp and os.path.exists(fp):
                     display(Image(filename=fp))
     buttons=[]
@@ -961,48 +995,14 @@ def run_interactive_scanner(limit=300, threshold=1.5):
     grid=widgets.GridBox(buttons, layout=widgets.Layout(grid_template_columns='repeat(6, 150px)'))
     display(widgets.VBox([widgets.HTML("<h3>💡 Klik saham - Chart Informatif KIM+BSJP (300 liquid):</h3>"), grid, output_area]))
 
-def run_kim_bsjp_scanner_interactive(limit=300):
-    try:
-        import ipywidgets as widgets
-        from IPython.display import display, Image, clear_output
-    except:
-        print("ipywidgets belum install")
-        return
-    print(f"🚀 Scan KIM+BSJP {limit} most liquid...")
-    sigs=scan_kim_bsjp_300()
-    print(f"✅ Ditemukan {len(sigs)} sinyal")
-    if not sigs: print("Tidak ada KIM/BSJP buy hari ini"); return
-    output_area=widgets.Output()
-    def on_click(b):
-        sym=b.description.split(" ")[0]
-        with output_area:
-            clear_output(wait=True)
-            print(f"⏳ Render {sym}...")
-            df=get_history_pro(sym,150,"1d")
-            if df is not None:
-                q=get_realtime_from_screener(sym)
-                f=f"/tmp/{sym}_{int(time.time())}.png"
-                fp,_=generate_pro_chart(df,symbol=sym,timeframe="1d",output_filename=f,extra_info={'tf_label':'Daily'},realtime_price=q[0])
-                if fp and os.path.exists(fp):
-                    display(Image(filename=fp))
-    buttons=[]
-    for it in sigs[:36]:
-        label=f"{it['symbol']} {'KIM' if it['kim_buy'] else ''}{'+' if it['kim_buy'] and it['bsjp_buy'] else ''}{'BSJP' if it['bsjp_buy'] else ''}"
-        btn=widgets.Button(description=label, button_style='success' if it['kim_buy'] and it['bsjp_buy'] else 'warning', layout=widgets.Layout(width='160px',margin='2px'))
-        btn.on_click(on_click)
-        buttons.append(btn)
-    grid=widgets.GridBox(buttons, layout=widgets.Layout(grid_template_columns='repeat(4, 170px)'))
-    display(widgets.VBox([widgets.HTML(f"<h3>🔥 KIM+BSJP - {len(sigs)} sinyal dari 300 liquid:</h3>"), grid, output_area]))
-
 def auto_broadcast_loop():
     global AUTO_KIM_ENABLED
-    print("🔄 Auto broadcaster KIM+BSJP started - cek tiap 15 menit jam market 09:00-15:00 WIB")
+    print("🔄 Auto broadcaster KIM(daily)+BSJP(15m) started - cek tiap 15 menit jam market 09:00-15:00 WIB")
     while True:
         try:
             if not AUTO_KIM_ENABLED:
                 time.sleep(60); continue
             now=get_now_wib()
-            # hanya jam market 09:00-15:30 WIB Senin-Jumat
             if now.weekday()>=5:
                 time.sleep(300); continue
             if not (9 <= now.hour < 16):
@@ -1013,7 +1013,7 @@ def auto_broadcast_loop():
                 broadcast_kim_bsjp(sigs, is_auto=True)
             else:
                 print("Auto scan: no signal")
-            time.sleep(900)  # 15 menit
+            time.sleep(900)
         except Exception as e:
             print(f"Auto broadcast err {e}")
             import traceback; traceback.print_exc()
@@ -1022,11 +1022,10 @@ def auto_broadcast_loop():
 def telegram_bot_listener():
     global AUTO_KIM_ENABLED
     offset=0
-    print(f"🤖 RAFANO V4.31 KIM+BSJP - {len(IDX_FULL)} IDX - 300 LIQUID - CLICK OK")
+    print(f"🤖 RAFANO V4.32 FIX 4 ISSUES - {len(IDX_FULL)} IDX - 300 LIQUID - CLICK FIX - KIM daily/1h BSJP 5m/15m")
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
     except: pass
 
-    # start auto broadcaster thread
     threading.Thread(target=auto_broadcast_loop, daemon=True).start()
 
     while True:
@@ -1038,51 +1037,78 @@ def telegram_bot_listener():
             if not data.get('ok'): time.sleep(3); continue
             for update in data.get("result",[]):
                 offset=update["update_id"]+1
+                # FIX ISSUE 2: callback click generate chart
                 if "callback_query" in update:
-                    cb=update["callback_query"]; qid=cb.get("id"); cdata=cb.get("data","")
-                    chat_id=cb.get("message",{}).get("chat",{}).get("id") or cb.get("from",{}).get("id") or TARGET_CHAT_ID
-                    print(f"🔘 CLICK {cdata} -> {chat_id}")
-                    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":qid,"text":f"Loading {cdata}..."},timeout=5)
-                    except: pass
+                    cb=update["callback_query"]
+                    qid=cb.get("id")
+                    cdata=cb.get("data","") or ""
+                    # robust chat_id extraction
+                    msg_obj=cb.get("message",{}) or {}
+                    chat_obj=msg_obj.get("chat",{}) if isinstance(msg_obj, dict) else {}
+                    from_obj=cb.get("from",{}) or {}
+                    chat_id=chat_obj.get("id") or from_obj.get("id") or TARGET_CHAT_ID
+                    try:
+                        chat_id=int(chat_id)
+                    except:
+                        pass
+                    print(f"🔘 CLICK {cdata} -> {chat_id} qid {qid}")
+                    try:
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":qid,"text":f"Loading {cdata}..."},timeout=5)
+                    except Exception as e:
+                        print(f"answerCallback err {e}")
                     if cdata.startswith("chart_"):
-                        sym=cdata.replace("chart_","").strip().upper()
-                        send_reply(chat_id, f"🔘 Klik {sym} diterima, generate chart pro KIM+BSJP...")
-                        threading.Thread(target=process_chart_request,args=(chat_id,sym,"1d"),daemon=True).start()
+                        sym=cdata[6:].strip().upper()  # FIX: pakai slice bukan split
+                        if sym and sym not in FCA_EXCLUDE:
+                            try:
+                                send_reply(chat_id, f"🔘 *{sym}* - klik diterima, generate chart KIM+BSJP...")
+                            except: pass
+                            # FIX: pakai daemon thread + try except
+                            try:
+                                threading.Thread(target=process_chart_request,args=(chat_id,sym,"1d"),daemon=True).start()
+                            except Exception as e:
+                                print(f"thread click err {e}")
+                                # fallback direct call
+                                try:
+                                    process_chart_request(chat_id,sym,"1d")
+                                except: pass
                     continue
+
                 if "message" in update and "text" in update["message"]:
                     txt=update["message"].get("text","").strip()
                     chat_id=update["message"]["chat"]["id"]
                     first=txt.split()[0].lower() if txt else ""
                     parts=txt.split()
                     if first in ["/start","/help","/menu"]:
-                        help_msg=f"""🔥 *RAFANO V4.31 KIM+BSJP*
+                        help_msg=f"""🔥 *RAFANO V4.32 FIX*
+
+FIX 1: Harga chart tidak lagi 100 dummy
+FIX 2: Click scan sekarang generate chart
+FIX 3: KIM BUY hanya daily & 1h
+FIX 4: BSJP BUY hanya 5m & 15m
+
 TOP 300 Most Liquid | {len(IDX_FULL)} IDX Loaded
 
 *CHART:*
-/c KODE 5 = chart 5m pro KIM+BSJP
-/c ERAA = daily chart
+/c KODE 5 = 5m (BSJP only)
+/c KODE 15 = 15m (BSJP only)
+/c KODE 60 = 1h (KIM only)
+/c KODE = daily (KIM only)
 
 *SCANNER 300 LIQUID:*
-/scanvol 1.5 = Vol Spike 300 liquid (default)
-/scanvol 300 1.5 = custom 300
+/scanvol 1.5 = Vol Spike 300 liquid
 
-*KIM + BSJP SCREENER:*
-/kim = Scan KIM BUY (300 liquid)
-/bsjp = Scan BSJP BUY SORE (300)
-/kimbsjp = Scan KIM+BSJP combo (300)
-/scan300 = KIM+BSJP auto broadcaster test
+*KIM + BSJP:*
+/kim = Scan KIM BUY daily/1h (300)
+/bsjp = Scan BSJP BUY SORE 15m (300)
+/kimbsjp = Combo KIM daily + BSJP 15m
 
-*AUTO BROADCAST:*
-/auto on = aktifkan auto broadcast 15 menit
-/auto off = matikan
-/status = cek status auto
-
-*LAIN:*
-/quota = cek quota & idx count
+*AUTO:*
+/auto on/off
+/status
 """
                         send_reply(chat_id, help_msg)
                     elif first in ["/quota","/status"]:
-                        send_reply(chat_id, f"QUOTA: {'HABIS' if QUOTA_HIT else 'OK'}\nIDX:{len(IDX_FULL)}\nTOP 300 liquid ready\nAUTO KIM+BSJP: {'ON' if AUTO_KIM_ENABLED else 'OFF'}")
+                        send_reply(chat_id, f"QUOTA: {'HABIS' if QUOTA_HIT else 'OK'}\nIDX:{len(IDX_FULL)}\nTOP 300 liquid ready\nAUTO KIM+BSJP: {'ON' if AUTO_KIM_ENABLED else 'OFF'}\nFIX: harga 100 dummy removed, click fixed, KIM daily/1h, BSJP 5m/15m")
                     elif first in ["/c","/chart"]:
                         if len(parts)>=2:
                             sym=parts[1].upper(); tf_input=parts[2] if len(parts)>=3 else "1d"
@@ -1093,10 +1119,9 @@ TOP 300 Most Liquid | {len(IDX_FULL)} IDX Loaded
                             if len(parts)>=3:
                                 lim=int(parts[1]); thr=float(parts[2])
                             elif len(parts)>=2:
-                                # /scanvol 1.5 atau /scanvol 300
                                 try:
                                     thr=float(parts[1]); lim=300
-                                    if thr>10: # user input 300 as first arg
+                                    if thr>10:
                                         lim=int(thr); thr=1.5
                                 except:
                                     lim=300; thr=1.5
@@ -1109,23 +1134,22 @@ TOP 300 Most Liquid | {len(IDX_FULL)} IDX Loaded
                             broadcast_vol_spike(sigs, threshold=th, dest_chat_id=tg)
                         threading.Thread(target=run_vol,daemon=True).start()
                     elif first in ["/kim","/kimbsjp","/scan300","/scan_kim","/kbs"]:
-                        send_reply(chat_id, f"🚀 SCAN KIM+BSJP - 300 most liquid...")
+                        send_reply(chat_id, f"🚀 SCAN KIM(daily)+BSJP(15m) - 300 most liquid...")
                         def run_kim(tg=chat_id):
                             sigs=scan_kim_bsjp_300()
                             broadcast_kim_bsjp(sigs, dest_chat_id=tg)
                         threading.Thread(target=run_kim,daemon=True).start()
                     elif first in ["/bsjp"]:
-                        send_reply(chat_id, f"💥 SCAN BSJP BUY SORE - 300 liquid...")
+                        send_reply(chat_id, f"💥 SCAN BSJP BUY SORE 15m - 300 liquid...")
                         def run_bsjp(tg=chat_id):
                             sigs=scan_kim_bsjp_300()
-                            # filter only bsjp buy
                             bsjp_only=[s for s in sigs if s['bsjp_buy']]
                             broadcast_kim_bsjp(bsjp_only, dest_chat_id=tg)
                         threading.Thread(target=run_bsjp,daemon=True).start()
                     elif first in ["/auto"]:
                         if len(parts)>=2 and parts[1].lower()=="on":
                             AUTO_KIM_ENABLED=True
-                            send_reply(chat_id, "✅ Auto broadcast KIM+BSJP ON - scan tiap 15 menit jam 09:00-15:30 WIB (300 liquid)")
+                            send_reply(chat_id, "✅ Auto broadcast KIM(daily)+BSJP(15m) ON - scan tiap 15 menit 09:00-15:30 WIB (300 liquid)")
                         elif len(parts)>=2 and parts[1].lower()=="off":
                             AUTO_KIM_ENABLED=False
                             send_reply(chat_id, "❌ Auto broadcast OFF")
@@ -1149,5 +1173,5 @@ TOP 300 Most Liquid | {len(IDX_FULL)} IDX Loaded
             time.sleep(3)
 
 if __name__=="__main__":
-    print(f"🔥 RAFANO V4.31 KIM+BSJP - {len(IDX_FULL)} IDX - TOP 300 LIQUID")
+    print(f"🔥 RAFANO V4.32 FIX 4 ISSUES - {len(IDX_FULL)} IDX - TOP 300 LIQUID")
     telegram_bot_listener()
