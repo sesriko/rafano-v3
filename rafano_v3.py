@@ -142,7 +142,7 @@ def get_history_pro(sym, limit=150, frame="daily"):
     # ===== 1. Coba Arjum dulu untuk daily =====
     if frame=="1d":
         try:
-            data=arjum_get(f"/history/{sym}",params={"limit":limit,"frame":"daily"}, bypass_quota=False, retries=1)
+            data=arjum_get(f"/history/{sym}",params={"limit":limit,"frame":"daily"}, bypass_quota=True, retries=1)
             rows=[]
             if data:
                 if isinstance(data,dict): rows=data.get('data') or data.get('history') or []
@@ -2719,57 +2719,139 @@ def process_chart_request(cid, code, tf_input="1d"):
         print(f"=== CHART REQ START {code} {tf_input} -> {cid} ===")
         tf_norm=normalize_timeframe(tf_input)
         tf_label=format_timeframe_label(tf_norm)
-        send_reply(cid, f"📊 *{code.upper()} ({tf_label}) chart pro...*")
+        # FIX V4.44: pakai plain text tanpa markdown biar pasti sampai
+        try:
+            url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id":cid, "text": f"{code.upper()} ({tf_label}) chart pro..."}, timeout=10)
+        except:
+            try: send_reply(cid, f"{code.upper()} ({tf_label}) chart pro...")
+            except: pass
         df=get_history_pro(code, 150, frame=tf_norm)
         print(f"get_history {code} {tf_norm} rows={len(df) if df is not None else 'None'}")
 
-        # FIX V4.41: Kalau daily gagal, coba bersihkan cache suspend & retry YF langsung
-        if (df is None or len(df)<10) and tf_norm=="1d":
-            print(f"⚠ {code} daily fail, coba clear SUSPEND_CACHE & retry YF")
+        # FIX V4.44: retry super agresif kalau daily gagal
+        if (df is None or len(df)<10):
+            print(f"Daily fail {code}, coba clear & retry YF multi period")
+            for k in list(HISTORY_CACHE.keys()):
+                if code.upper() in k:
+                    HISTORY_CACHE.pop(k, None)
             SUSPEND_CACHE.pop(code.upper(), None)
-            HISTORY_CACHE.pop(f"{code.upper()}_{tf_norm}_150", None)
-            # retry langsung YF 1y
+            # retry YF dengan banyak period
             try:
                 import yfinance as yf
-                hist=yf.Ticker(f"{code.upper()}.JK").history(period="1y", interval="1d", timeout=20, auto_adjust=False)
-                if hist is not None and len(hist)>=10:
-                    last_close=float(hist['Close'].iloc[-1])
-                    if last_close>=MIN_PRICE and not (hist['Close'].nunique()==1 and int(hist['Close'].iloc[0])==100):
-                        df=hist
-                        set_cached(f"{code.upper()}_{tf_norm}_150", df, HISTORY_CACHE)
-                        print(f"✅ Retry YF 1y success {code} len={len(df)}")
+                for per in ["1y","6mo","3mo","1mo","2y"]:
+                    try:
+                        hist=yf.Ticker(f"{code.upper()}.JK").history(period=per, interval="1d", timeout=20, auto_adjust=False)
+                        if hist is not None and len(hist)>=10:
+                            last_close=float(hist['Close'].iloc[-1])
+                            if last_close>=MIN_PRICE and not (hist['Close'].nunique()==1 and int(hist['Close'].iloc[0])==100):
+                                df=hist
+                                set_cached(f"{code.upper()}_{tf_norm}_150", df, HISTORY_CACHE)
+                                print(f"Retry YF {per} success {code} len={len(df)}")
+                                break
+                    except Exception as e:
+                        print(f"Retry YF {per} err {code}: {e}")
+                        continue
+                # coba yf.download
+                if (df is None or len(df)<10):
+                    try:
+                        df_dl=yf.download(f"{code.upper()}.JK", period="1y", interval="1d", progress=False, timeout=20, auto_adjust=False)
+                        if df_dl is not None and len(df_dl)>=10:
+                            last_close=float(df_dl['Close'].iloc[-1])
+                            if last_close>=MIN_PRICE:
+                                df=df_dl
+                                print(f"yf.download success {code}")
+                    except Exception as e:
+                        print(f"yf.download err {code}: {e}")
             except Exception as e:
                 print(f"Retry YF err {code}: {e}")
 
         if df is None or len(df)<10:
-            # Cek apakah memang suspend beneran
-            if code.upper() in SUSPEND_CACHE:
-                send_reply(cid, f"⚠ {code.upper()} terdeteksi SUSPEND (vol 0 / harga 100) - coba TF 5m/15m yang tadi berhasil\nGunakan /c {code.upper()} 5 untuk intraday")
-            else:
-                send_reply(cid, f"⚠ Data {code} TF {tf_norm} kosong (Arjum/YF fail) - YF lagi gangguan, coba TF 5m/15m atau tunggu 1 menit\nGunakan /c {code.upper()} 5")
-            print(f"CHART ABORT no data {code} {tf_norm}")
-            return
+            # Fallback ke TF 5m kalau daily benar-benar gagal
+            if tf_norm=="1d":
+                print(f"Trying 5m fallback for {code}")
+                df_5m=get_history_pro(code, 150, frame="5m")
+                if df_5m is not None and len(df_5m)>=20:
+                    try:
+                        url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                        requests.post(url, json={"chat_id":cid, "text": f"Daily fail, pakai 5m chart untuk {code.upper()}"}, timeout=10)
+                    except: pass
+                    df=df_5m
+                    tf_norm="5m"
+                    tf_label=format_timeframe_label(tf_norm)
+            if df is None or len(df)<10:
+                try:
+                    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                    requests.post(url, json={"chat_id":cid, "text": f"Data {code} TF {tf_norm} kosong - YF/Arjum fail, coba /c {code.upper()} 5"}, timeout=10)
+                except:
+                    send_reply(cid, f"Data {code} TF {tf_norm} kosong - coba /c {code.upper()} 5")
+                print(f"CHART ABORT no data {code} {tf_norm}")
+                return
 
         stockbit_price,_=get_realtime_stockbit(code)
         realtime=stockbit_price if stockbit_price>=MIN_PRICE else 0
         print(f"realtime={realtime} hist={df['Close'].iloc[-1]}")
         chart_file=f"/tmp/chart_{code.upper()}_{tf_norm}_{int(time.time())}.png"
-        fp,_=generate_pro_chart(df, symbol=code.upper(), timeframe=tf_norm, output_filename=chart_file, extra_info={'tf_label':tf_label}, realtime_price=realtime)
+        try:
+            fp,_=generate_pro_chart(df, symbol=code.upper(), timeframe=tf_norm, output_filename=chart_file, extra_info={'tf_label':tf_label}, realtime_price=realtime)
+        except Exception as e:
+            print(f"generate_pro_chart err {e}, try simple")
+            fp=None
         print(f"generate_pro_chart fp={fp} exists={os.path.exists(fp) if fp else False}")
         if not fp or not os.path.exists(fp):
-            send_reply(cid, f"❌ Gagal render {code} {tf_norm} - file tidak ada")
-            return
-        caption,_=generate_caption_pro(code.upper(), df, realtime_price=realtime, tf_norm=tf_norm)
+            # FALLBACK SIMPLE CHART
+            print(f"Trying simple chart fallback for {code}")
+            try:
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(12,6), facecolor='black')
+                plt.style.use('dark_background')
+                closes=df['Close'].tail(100)
+                plt.plot(closes.values, color='#00ff88', linewidth=1.5)
+                plt.title(f"{code.upper()} {tf_label} - {int(closes.iloc[-1])}", color='white')
+                plt.grid(True, alpha=0.2)
+                plt.tight_layout()
+                plt.savefig(chart_file, facecolor='black')
+                plt.close()
+                fp=chart_file
+                print(f"Simple chart created {fp}")
+            except Exception as e:
+                print(f"Simple chart err {e}")
+                try:
+                    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                    requests.post(url, json={"chat_id":cid, "text": f"Gagal render {code} {tf_norm} - file tidak ada: {e}"}, timeout=10)
+                except:
+                    send_reply(cid, f"Gagal render {code} {tf_norm}")
+                return
+        try:
+            caption,_=generate_caption_pro(code.upper(), df, realtime_price=realtime, tf_norm=tf_norm)
+        except:
+            caption=f"{code.upper()} {int(df['Close'].iloc[-1])} Daily"
         print(f"caption {caption[:100]} -> send photo to {cid}")
-        send_photo_reply(cid, fp, caption=caption)
+        try:
+            send_photo_reply(cid, fp, caption=caption)
+        except Exception as e:
+            print(f"send_photo err {e}, try plain")
+            # fallback kirim tanpa caption markdown
+            try:
+                url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+                with open(fp,'rb') as ph:
+                    requests.post(url,data={'chat_id':cid,'caption':caption},files={'photo':ph},timeout=40)
+            except Exception as e2:
+                print(f"send_photo plain err {e2}")
         try: os.remove(fp)
         except: pass
         print(f"=== CHART DONE {code} ===")
     except Exception as e:
         print(f"CHART ERR {code} {e}")
         import traceback; traceback.print_exc()
-        try: send_reply(cid, f"❌ Err chart {code}: {e}")
-        except: pass
+        try: 
+            url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id":cid, "text": f"Err chart {code}: {e}"}, timeout=10)
+        except:
+            try: send_reply(cid, f"Err chart {code}: {e}")
+            except: pass
 
 def broadcast_vol_spike(signals, threshold=1.5, dest_chat_id=None):
     target=dest_chat_id or TARGET_CHAT_ID
@@ -2833,7 +2915,7 @@ def auto_broadcast_loop():
 
 def telegram_bot_listener():
     offset=0
-    print(f"🤖 RAFANO V4.43 EMA+PATTERN+CLICK FIX - RAFANO TRADER + ALL SCANNER ANTI KOSONG - {len(IDX_FULL)} IDX")
+    print(f"🤖 RAFANO V4.44 CLICK FINAL FIX EMA+PATTERN+CLICK FIX - RAFANO TRADER + ALL SCANNER ANTI KOSONG - {len(IDX_FULL)} IDX")
     try:
         r=requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",timeout=10)
         print(f"deleteWebhook {r.text[:200]}")
@@ -2853,7 +2935,7 @@ def telegram_bot_listener():
             results=data.get("result",[])
             for update in results:
                 offset=update["update_id"]+1
-                # ===== CLICK HANDLER SUPER ROBUST V4.42 - FIX SUSPEND & CHAT_ID =====
+                # ===== CLICK HANDLER SUPER ROBUST V4.44 - FINAL FIX =====
                 if "callback_query" in update:
                     try:
                         cb=update["callback_query"]
@@ -2862,21 +2944,31 @@ def telegram_bot_listener():
                         msg_obj=cb.get("message") or {}
                         chat_obj=msg_obj.get("chat") if isinstance(msg_obj, dict) else {}
                         from_obj=cb.get("from") or {}
-                        # FIX: Prioritas chat_id dari message, bukan from user
+                        # Ambil chat_id dengan 5 fallback
                         chat_id = None
                         if chat_obj and chat_obj.get("id"):
                             chat_id = chat_obj.get("id")
-                        elif msg_obj and isinstance(msg_obj, dict) and msg_obj.get("chat",{}).get("id"):
-                            chat_id = msg_obj.get("chat",{}).get("id")
-                        else:
-                            chat_id = from_obj.get("id") or TARGET_CHAT_ID
-                        try: chat_id=int(chat_id)
-                        except: pass
-                        print(f"🔘 CLICK DETECTED cdata={cdata} chat_id={chat_id} qid={qid} full_cb={str(cb)[:500]}")
-                        # wajib answer biar loading hilang + log
+                        if not chat_id and msg_obj and isinstance(msg_obj, dict):
+                            mc=msg_obj.get("chat") or {}
+                            if mc.get("id"): chat_id=mc.get("id")
+                        if not chat_id and from_obj.get("id"):
+                            # kalau group, jangan pakai user id, pakai TARGET_CHAT_ID
+                            chat_id = TARGET_CHAT_ID or from_obj.get("id")
+                        if not chat_id:
+                            chat_id = TARGET_CHAT_ID
+                        try: 
+                            chat_id=int(chat_id)
+                        except: 
+                            print(f"CLICK chat_id parse fail raw={chat_id}")
+                        # Log ke file biar bisa debug
                         try:
-                            ans=requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":qid,"text":f"Loading {cdata}..."},timeout=5)
-                            print(f"answerCallback ok={ans.json().get('ok')}")
+                            with open("/tmp/rafano_click.log","a") as lf:
+                                lf.write(f"{get_now_wib()} CLICK cdata={cdata} chat_id={chat_id} qid={qid} user={from_obj.get('id')}\n")
+                        except: pass
+                        print(f"CLICK DETECTED cdata={cdata} chat_id={chat_id} qid={qid} user={from_obj.get('id')}")
+                        # Answer callback - tanpa text panjang biar tidak error
+                        try:
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":qid},timeout=5)
                         except Exception as e:
                             print(f"answerCallback err {e}")
                         if cdata.startswith("chart_"):
@@ -2884,27 +2976,37 @@ def telegram_bot_listener():
                             if not sym or len(sym)>6 or sym in FCA_EXCLUDE:
                                 print(f"click invalid sym {sym}")
                                 continue
-                            # FIX V4.42: clear SUSPEND_CACHE biar chart tidak diblokir saat klik
-                            if sym in SUSPEND_CACHE:
-                                print(f"🔘 CLICK {sym} was in SUSPEND_CACHE, clearing for chart")
-                                SUSPEND_CACHE.pop(sym, None)
-                                HISTORY_CACHE.pop(f"{sym}_1d_150", None)
-                            print(f"🔘 CHART CLICK {sym} -> {chat_id}")
+                            # CLEAR SEMUA CACHE VARIANT - FIX UTAMA
+                            for key in [f"{sym}_1d_150", f"{sym}_1d_150".upper(), f"{sym}_daily_150", f"{sym}_1d_150", f"{sym.upper()}_1d_150", f"{sym}_1d_150"]:
+                                HISTORY_CACHE.pop(key, None)
+                            SUSPEND_CACHE.pop(sym, None)
+                            SUSPEND_CACHE.pop(sym.upper(), None)
+                            print(f"CHART CLICK {sym} -> {chat_id} cache cleared")
+                            # Kirim ack plain tanpa markdown biar pasti sampai
                             try:
-                                send_reply(chat_id, f"🔘 *{sym}* klik diterima - generate chart...")
+                                url_ack=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                                requests.post(url_ack, json={"chat_id":chat_id, "text": f"{sym} klik diterima - generate chart..."}, timeout=10)
                             except Exception as e:
-                                print(f"ack err {e}")
+                                print(f"ack plain err {e}")
+                                try: send_reply(chat_id, f"{sym} klik diterima - generate chart...")
+                                except: pass
+                            # PRIMARY: direct call (block) biar pasti jalan, bukan thread
                             try:
-                                # Non-daemon biar tidak mati saat main loop lanjut
-                                t=threading.Thread(target=process_chart_request,args=(chat_id,sym,"1d"),daemon=False)
-                                t.start()
-                                print(f"thread chart {sym} started tid={t.ident}")
+                                print(f"Direct process_chart_request {sym} -> {chat_id}")
+                                process_chart_request(chat_id, sym, "1d")
+                                print(f"Direct chart done {sym}")
                             except Exception as e:
-                                print(f"thread start err {e}, fallback direct")
+                                print(f"Direct chart err {sym}: {e}")
+                                import traceback; traceback.print_exc()
+                                # Fallback thread
                                 try:
-                                    process_chart_request(chat_id,sym,"1d")
+                                    t=threading.Thread(target=process_chart_request,args=(chat_id,sym,"1d"),daemon=True)
+                                    t.start()
+                                    print(f"Fallback thread started {sym}")
                                 except Exception as e2:
-                                    print(f"direct err {e2}")
+                                    print(f"Fallback thread err {e2}")
+                                    try: send_reply(chat_id, f"Gagal generate {sym}: {e}")
+                                    except: pass
                         else:
                             print(f"unknown callback {cdata}")
                     except Exception as e:
@@ -2919,7 +3021,7 @@ def telegram_bot_listener():
                     first=txt.split()[0].lower() if txt else ""
                     parts=txt.split()
                     if first in ["/start","/help","/menu"]:
-                        help_msg=f"""🔥 *RAFANO V4.43 - CONFLUENCE + SAFETY/POWER + OB/FVG*
+                        help_msg=f"""🔥 *RAFANO V4.44 - CLICK FINAL FIX + CONFLUENCE + OB/FVG*
 
 400 BY VALUE (volume*close) BUKAN ALPHABET
 FILTER: no suspend, no FCA, price>=50
@@ -3429,5 +3531,5 @@ Shortcut: /breakout /doublebottom /hammer /flag
             time.sleep(3)
 
 if __name__=="__main__":
-    print(f"🔥 RAFANO V4.43 CONFLUENCE + SAFETY/POWER + OB/FVG - {len(IDX_FULL)} IDX")
+    print(f"🔥 RAFANO V4.44 CLICK FINAL FIX + CONFLUENCE + OB/FVG - {len(IDX_FULL)} IDX")
     telegram_bot_listener()
