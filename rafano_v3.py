@@ -1,5 +1,16 @@
-"""RAFANO V4.43 FIX - EMA50/200 + CHART PATTERN + CLICK FIX - CHART DAILY ANTI GAGAL VKTR/BMTR + RAFANO TRADER TITLE + ALL SCANNER FIX"""
-import os, time, datetime, threading, requests, pytz, re
+"""RAFANO V4.46 FULL - 3000 LINES + OPTIMAL WORKERS + CLICK FIX + COLAB LOG FIX"""
+import os, sys
+IS_COLAB = False
+userdata = None
+try:
+    from google.colab import userdata as colab_userdata
+    userdata = colab_userdata
+    IS_COLAB = True
+    print("Colab detected - Secrets will override .env", flush=True)
+except:
+    IS_COLAB = False
+
+import time, datetime, threading, requests, pytz, re, multiprocessing
 import numpy as np, pandas as pd
 import matplotlib
 matplotlib.use('Agg')
@@ -10,10 +21,53 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 
+# ==================== COLAB LOG + OPTIMAL WORKERS V4.46 ====================
+LOG_FILE = "/content/rafano_debug.log" if os.path.exists("/content") else "/tmp/rafano_debug.log"
+CLICK_LOG = "/content/rafano_click.log" if os.path.exists("/content") else "/tmp/rafano_click.log"
+OPTIMAL_WORKERS = min(32, (multiprocessing.cpu_count() or 4) * 5)  # 20-32 untuk Colab IO-bound
+CHART_WORKERS = 4
+SCAN_WORKERS = OPTIMAL_WORKERS
+
+def clog(msg):
+    try:
+        print(msg, flush=True)
+        sys.stdout.flush()
+    except:
+        print(msg)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as lf:
+            lf.write(f"{datetime.datetime.now().strftime('%H:%M:%S')} {msg}\n")
+    except: pass
+
+def get_last_logs(n=50):
+    try:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                return "".join(f.readlines()[-n:])
+        return "Log file kosong"
+    except Exception as e:
+        return f"Err baca log: {e}"
+
+print(f"⚙️ V4.46 OPTIMAL_WORKERS={OPTIMAL_WORKERS} SCAN={SCAN_WORKERS} CHART={CHART_WORKERS} IS_COLAB={IS_COLAB}", flush=True)
+
+# Load .env dulu
 for p in ['/content/rafano-v3/.env','./.env','.env','/content/.env','/content/rafano-v3/rafano-v3/.env']:
     if os.path.exists(p):
         load_dotenv(p, override=True)
+        print(f"Loaded .env from {p}", flush=True)
         break
+
+# Lalu override dengan Colab Secrets (biar Secret menang)
+if IS_COLAB and userdata:
+    for k in ["TELEGRAM_BOT_TOKEN","TARGET_CHAT_ID","ARJUM_API_KEY","ITICK_TOKEN","ITICK_API_KEY"]:
+        try:
+            v=userdata.get(k)
+            if v:
+                os.environ[k]=v
+                print(f"Colab Secret loaded: {k}", flush=True)
+        except: pass
+# ==================== END COLAB FIX ====================
+
 
 TIMEZONE_WIB=pytz.timezone('Asia/Jakarta')
 TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN") or ""
@@ -46,7 +100,7 @@ def load_785():
 IDX_FULL=load_785()
 HISTORY_CACHE=OrderedDict(); SCREENER_CACHE=OrderedDict()
 QUOTA_HIT=False; LAST_429_TIME=0; LAST_ARJUM_REQUEST=0
-ARJUM_MIN_INTERVAL=1.2
+ARJUM_MIN_INTERVAL=0.8  # lebih cepat dari 1.2
 STOCKBIT_CACHE={}
 AUTO_KIM_ENABLED=False
 
@@ -673,7 +727,7 @@ def scan_kim_bsjp_400():
                 vol_ratio=v_last/v_avg if v_avg else 1
                 return {"symbol":sym,"close":int(last_close),"change_pct":chg,"vol_ratio":vol_ratio,"kim_buy":kim['buy'],"bsjp_buy":bsjp['buy'],"kim":kim,"bsjp":bsjp}
         except: return None
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers}
         for f in as_completed(futs):
             r=f.result()
@@ -1023,7 +1077,7 @@ def scan_bandarmology_top_akum(period="daily", limit_candidates=400, top_n=30, m
             print(f"scan akum err {sym}: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers}
         for f in as_completed(futs):
             r=f.result()
@@ -1116,7 +1170,7 @@ def scan_bandarmology_top_distribusi(period="daily", limit_candidates=400, top_n
             print(f"scan dist err {sym}: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers}
         for f in as_completed(futs):
             r=f.result()
@@ -1230,7 +1284,7 @@ def scan_bandarmology_akum_dist_combined(period="daily", limit_candidates=400, t
             print(f"scan combined err {sym}: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers}
         for f in as_completed(futs):
             r=f.result()
@@ -1503,7 +1557,7 @@ def scan_whale_accum(period="daily", limit_candidates=400, top_n=30):
             print(f"scan whale err {sym}: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers}
         for f in as_completed(futs):
             r=f.result()
@@ -1594,7 +1648,7 @@ def scan_insider_accum(period="daily", limit_candidates=400, top_n=30):
             print(f"scan insider err {sym}: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers}
         for f in as_completed(futs):
             r=f.result()
@@ -2202,7 +2256,7 @@ def scan_confluence(min_score=6, limit_candidates=400, top_n=30, mode="all"):
         except Exception as e:
             print(f"confluence check err {sym}: {e}")
             return None
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers[:limit_candidates]}
         for f in as_completed(futs):
             r=f.result()
@@ -2370,7 +2424,7 @@ def scan_safety_power(min_safety=6, min_power=5, limit_candidates=400, top_n=30,
         except Exception as e:
             print(f"safety_power err {sym}: {e}")
             return None
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers[:limit_candidates]}
         for f in as_completed(futs):
             r=f.result()
@@ -2560,7 +2614,7 @@ def scan_order_block(limit_candidates=400, top_n=30, mode="bullish", threshold_p
         except Exception as e:
             print(f"OB scan err {sym}: {e}")
             return None
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers[:limit_candidates]}
         for f in as_completed(futs):
             r=f.result()
@@ -2617,7 +2671,7 @@ def scan_fvg(limit_candidates=400, top_n=30, mode="bullish", threshold_pct=5.0):
         except Exception as e:
             print(f"FVG scan err {sym}: {e}")
             return None
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         futs={ex.submit(check_one,s):s for s in tickers[:limit_candidates]}
         for f in as_completed(futs):
             r=f.result()
@@ -2935,7 +2989,7 @@ def telegram_bot_listener():
             results=data.get("result",[])
             for update in results:
                 offset=update["update_id"]+1
-                # ===== CLICK HANDLER SUPER ROBUST V4.44 - FINAL FIX =====
+                # ===== CLICK HANDLER V4.46 OPTIMAL WORKERS + CLOG =====
                 if "callback_query" in update:
                     try:
                         cb=update["callback_query"]
@@ -2944,73 +2998,59 @@ def telegram_bot_listener():
                         msg_obj=cb.get("message") or {}
                         chat_obj=msg_obj.get("chat") if isinstance(msg_obj, dict) else {}
                         from_obj=cb.get("from") or {}
-                        # Ambil chat_id dengan 5 fallback
                         chat_id = None
-                        if chat_obj and chat_obj.get("id"):
-                            chat_id = chat_obj.get("id")
+                        if chat_obj and chat_obj.get("id"): chat_id=chat_obj.get("id")
                         if not chat_id and msg_obj and isinstance(msg_obj, dict):
                             mc=msg_obj.get("chat") or {}
                             if mc.get("id"): chat_id=mc.get("id")
-                        if not chat_id and from_obj.get("id"):
-                            # kalau group, jangan pakai user id, pakai TARGET_CHAT_ID
-                            chat_id = TARGET_CHAT_ID or from_obj.get("id")
-                        if not chat_id:
-                            chat_id = TARGET_CHAT_ID
-                        try: 
-                            chat_id=int(chat_id)
-                        except: 
-                            print(f"CLICK chat_id parse fail raw={chat_id}")
-                        # Log ke file biar bisa debug
-                        try:
-                            with open("/tmp/rafano_click.log","a") as lf:
-                                lf.write(f"{get_now_wib()} CLICK cdata={cdata} chat_id={chat_id} qid={qid} user={from_obj.get('id')}\n")
+                        if not chat_id: chat_id=TARGET_CHAT_ID or from_obj.get("id")
+                        if not chat_id: chat_id=TARGET_CHAT_ID
+                        try: chat_id=int(chat_id)
                         except: pass
-                        print(f"CLICK DETECTED cdata={cdata} chat_id={chat_id} qid={qid} user={from_obj.get('id')}")
-                        # Answer callback - tanpa text panjang biar tidak error
+                        clog(f"🔘 CLICK DETECTED cdata={cdata} chat_id={chat_id} qid={qid} user={from_obj.get('id')} workers={CHART_WORKERS}")
                         try:
-                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":qid},timeout=5)
+                            with open(CLICK_LOG, "a") as lf:
+                                lf.write(f"{get_now_wib()} CLICK {cdata} -> {chat_id} user={from_obj.get('id')}\n")
+                        except: pass
+                        try:
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",json={"callback_query_id":qid, "text": f"Loading {cdata}..."},timeout=5)
                         except Exception as e:
-                            print(f"answerCallback err {e}")
+                            clog(f"answerCallback err {e}")
                         if cdata.startswith("chart_"):
                             sym=cdata[6:].strip().upper()
                             if not sym or len(sym)>6 or sym in FCA_EXCLUDE:
-                                print(f"click invalid sym {sym}")
+                                clog(f"click invalid sym {sym}")
                                 continue
-                            # CLEAR SEMUA CACHE VARIANT - FIX UTAMA
-                            for key in [f"{sym}_1d_150", f"{sym}_1d_150".upper(), f"{sym}_daily_150", f"{sym}_1d_150", f"{sym.upper()}_1d_150", f"{sym}_1d_150"]:
-                                HISTORY_CACHE.pop(key, None)
+                            for k in list(HISTORY_CACHE.keys()):
+                                if sym in k: HISTORY_CACHE.pop(k, None)
                             SUSPEND_CACHE.pop(sym, None)
                             SUSPEND_CACHE.pop(sym.upper(), None)
-                            print(f"CHART CLICK {sym} -> {chat_id} cache cleared")
-                            # Kirim ack plain tanpa markdown biar pasti sampai
+                            clog(f"🔘 CHART CLICK {sym} -> {chat_id} workers={CHART_WORKERS} cache cleared")
                             try:
-                                url_ack=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                                requests.post(url_ack, json={"chat_id":chat_id, "text": f"{sym} klik diterima - generate chart..."}, timeout=10)
+                                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id":chat_id, "text": f"🔘 {sym} klik diterima - generate chart (workers={CHART_WORKERS})..."}, timeout=10)
                             except Exception as e:
-                                print(f"ack plain err {e}")
-                                try: send_reply(chat_id, f"{sym} klik diterima - generate chart...")
-                                except: pass
-                            # PRIMARY: direct call (block) biar pasti jalan, bukan thread
-                            try:
-                                print(f"Direct process_chart_request {sym} -> {chat_id}")
-                                process_chart_request(chat_id, sym, "1d")
-                                print(f"Direct chart done {sym}")
-                            except Exception as e:
-                                print(f"Direct chart err {sym}: {e}")
-                                import traceback; traceback.print_exc()
-                                # Fallback thread
+                                clog(f"ack err {e}")
+                            def chart_task():
                                 try:
-                                    t=threading.Thread(target=process_chart_request,args=(chat_id,sym,"1d"),daemon=True)
-                                    t.start()
-                                    print(f"Fallback thread started {sym}")
-                                except Exception as e2:
-                                    print(f"Fallback thread err {e2}")
-                                    try: send_reply(chat_id, f"Gagal generate {sym}: {e}")
+                                    process_chart_request(chat_id, sym, "1d")
+                                    clog(f"✅ Chart task done {sym} -> {chat_id}")
+                                except Exception as e:
+                                    clog(f"❌ Chart task err {sym}: {e}")
+                                    import traceback; traceback.print_exc()
+                                    try:
+                                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id":chat_id, "text": f"Gagal chart {sym}: {e}"}, timeout=10)
                                     except: pass
+                            try:
+                                t=threading.Thread(target=chart_task, daemon=True)
+                                t.start()
+                                clog(f"Chart thread started {sym} tid={t.ident}")
+                            except Exception as e:
+                                clog(f"Thread start err {e}, fallback direct")
+                                chart_task()
                         else:
-                            print(f"unknown callback {cdata}")
+                            clog(f"unknown callback {cdata}")
                     except Exception as e:
-                        print(f"callback handler err {e}")
+                        clog(f"callback handler err {e}")
                         import traceback; traceback.print_exc()
                     continue
 
